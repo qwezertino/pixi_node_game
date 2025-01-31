@@ -78,6 +78,8 @@ export class AnimationController {
         };
     }
     handleAttack() {
+        if (this.currentState === PlayerState.ATTACKING) return false;
         this.setState(PlayerState.ATTACKING);
+        return true;
     }
 }

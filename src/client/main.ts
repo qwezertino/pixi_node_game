@@ -1,6 +1,48 @@
 
+// Establish WebSocket connection
+
+
+// export class GameClient {
+//     ws: WebSocket;
+
+//     constructor() {
+//         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+//         const host = window.location.host;
+//         const wsUrl = `${protocol}//${host}/ws`;
+
+//         this.ws = new WebSocket(wsUrl);
+//     }
+// }
+
+// document.addEventListener("DOMContentLoaded", () => {
+//     new GameClient();
+// });
+
+const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+const host = 'localhost:8108'//window.location.host;
+const wsUrl = `${protocol}//${host}/ws`;
+
+const socket = new WebSocket(wsUrl);
+
+socket.addEventListener("open", () => {
+    console.log("Connected to WebSocket server");
+    socket.send(JSON.stringify({ type: "hello", message: "Hello from client!" }));
+});
+
+socket.addEventListener("message", (event) => {
+    console.log("Message from server:", event.data);
+});
+
+socket.addEventListener("close", () => {
+    console.log("WebSocket connection closed");
+});
+
+socket.addEventListener("error", (error) => {
+    console.error("WebSocket error:", error);
+});
+
 import { Application } from "pixi.js";
-import { SpriteLoader } from "./spriteLoader";
+import { SpriteLoader } from "./utils/spriteLoader";
 import { FpsDisplay } from "./utils/fpsDisplay";
 import { InputManager } from "./utils/inputManager";
 import { MovementController } from "./controllers/movementController";
@@ -17,6 +59,8 @@ import { AnimationController, PlayerState } from "./controllers/animationControl
 
     const container = document.getElementById("pixi-container")!;
     container.appendChild(app.canvas);
+
+
 
     // Initialize modules
     const fpsDisplay = new FpsDisplay(app);
@@ -38,7 +82,11 @@ import { AnimationController, PlayerState } from "./controllers/animationControl
     // Attack handling
     app.canvas.addEventListener("mousedown", (e) => {
         if (e.button === 0 && animationController.handleAttack()) {
+            console.log("Attacking 123");
             animationController.setAnimation("attack");
+            // Send WebSocket message when player attacks
+            let plPositionXY = { x: playerSprite.position.x, y: playerSprite.position.y };
+            socket.send(JSON.stringify({ type: "attack", position: plPositionXY }));
         }
     });
 
@@ -48,6 +96,7 @@ import { AnimationController, PlayerState } from "./controllers/animationControl
 
         const deltaTime = time.deltaTime;
         if (animationController.playerState === PlayerState.ATTACKING) {
+            console.log("Attacking");
             return;
         }
         const isMoving = movementController.update(deltaTime);
