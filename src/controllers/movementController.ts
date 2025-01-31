@@ -18,7 +18,7 @@ export class MovementController {
     constructor(
         private input: InputManager,
         private position: Point,
-        scale: Point
+        scale: Point,
     ) {
         this._scale = scale;
     }
