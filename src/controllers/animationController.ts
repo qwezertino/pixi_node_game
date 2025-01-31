@@ -1,4 +1,4 @@
-import { AnimatedSprite } from "pixi.js";
+import { AnimatedSprite, Texture } from "pixi.js";
 
 declare module "pixi.js" {
     interface AnimatedSprite {
@@ -9,44 +9,41 @@ declare module "pixi.js" {
 export class AnimationController {
     private currentAnimation: string = "idle";
     private attackCooldown = false;
+    private playerSprite: AnimatedSprite;
 
     constructor(
-        private animations: Map<string, AnimatedSprite>,
-        private player: AnimatedSprite
-    ) {}
+        private animations: Map<string, Texture[]>,
+        initialPlayer: AnimatedSprite
+    ) {
+        this.playerSprite = initialPlayer;
+        this.playerSprite.currentAnimation = this.currentAnimation;
+    }
 
     setAnimation(name: string, isMoving: boolean) {
-        if (this.player.currentAnimation === name) return;
+        if (this.playerSprite.playing && this.playerSprite.currentAnimation === name) return;
 
         const textures = this.animations.get(name);
         if (!textures) return;
 
-        const newAnim = new AnimatedSprite(textures);
-        this.transferState(newAnim);
-        this.handleAttackCompletion(newAnim, isMoving);
+        console.log("animation to set:" + name + " | player playing: ", this.playerSprite.playing + " | current animation: " + this.playerSprite.currentAnimation);
+        this.handleAttackCompletion(this.playerSprite, isMoving);
 
-        this.player.destroy();
-        this.player = newAnim;
+        this.playerSprite.textures = textures;
+
+        this.playerSprite.play();
         this.currentAnimation = name;
+        this.playerSprite.currentAnimation = name;
     }
-
-    private transferState(newAnim: AnimatedSprite) {
-        newAnim.position.copyFrom(this.player.position);
-        newAnim.scale.copyFrom(this.player.scale);
-        newAnim.animationSpeed = this.player.animationSpeed;
-        newAnim.anchor.set(0.5);
-        newAnim.play();
-    }
-
-    private handleAttackCompletion(newAnim: AnimatedSprite, isMoving: boolean) {
-        if (newAnim.currentAnimation === "attack") {
-            newAnim.loop = false;
-            newAnim.onComplete = () => {
+    private handleAttackCompletion(playerSprite: AnimatedSprite, isMoving: boolean) {
+        if (playerSprite.currentAnimation === "attack") {
+            playerSprite.loop = false;
+            console.log("handle attack: " + playerSprite.currentAnimation, );
+            playerSprite.onComplete = () => {
                 this.attackCooldown = false;
                 this.setAnimation(isMoving ? "run" : "idle", isMoving);
             };
         } else {
-            newAnim.loop = true;
+            playerSprite.loop = true;
         }
     }
 
@@ -60,6 +57,6 @@ export class AnimationController {
     }
 
     get playerRef() {
-        return this.player;
+        return this.playerSprite;
     }
 }

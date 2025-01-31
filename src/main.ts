@@ -21,22 +21,19 @@ import { AnimationController } from "./controllers/animationController";
     // Initialize modules
     const fpsDisplay = new FpsDisplay(app);
     const input = new InputManager(app.canvas);
-    const character = await SpriteLoader.loadCharacter("/assets/16x16_knight_3_v3.png");
+    const characterVisual = await SpriteLoader.loadCharacterVisual("/assets/16x16_knight_3_v3.png");
 
     // Setup player
     const baseScale = 2;
-    const initialPlayer = character.getAnimation("idle")!;
-    initialPlayer.position.set(app.screen.width / 2, app.screen.height / 2);
-    initialPlayer.scale.set(baseScale);
-    initialPlayer.animationSpeed = 0.1;
-    app.stage.addChild(initialPlayer);
+    const playerSprite = characterVisual.getAnimation("idle")!;
+    playerSprite.position.set(app.screen.width / 2, app.screen.height / 2);
+    playerSprite.scale.set(baseScale);
+    playerSprite.animationSpeed = 0.1;
+    playerSprite.play();
+    app.stage.addChild(playerSprite);
 
-    const animationController = new AnimationController(character.animations, initialPlayer);
-    const movementController = new MovementController(
-        input,
-        initialPlayer.position,
-        initialPlayer.scale
-    );
+    const animationController = new AnimationController(characterVisual.animations, playerSprite);
+    const movementController = new MovementController(input, playerSprite.position, playerSprite.scale);
 
     // Attack handling
     app.canvas.addEventListener("mousedown", (e) => {
@@ -53,10 +50,7 @@ import { AnimationController } from "./controllers/animationController";
         const isMoving = movementController.update(deltaTime);
         movementController.updateScale(input.mousePosition.x);
 
-        animationController.setAnimation(
-            isMoving ? "run" : "idle",
-            isMoving
-        );
+        animationController.setAnimation(isMoving ? "run" : "idle", isMoving);
 
         // Update scale reference for mouse flipping
         animationController.playerRef.scale.copyFrom(movementController.scale);

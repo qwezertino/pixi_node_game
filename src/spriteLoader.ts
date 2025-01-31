@@ -13,7 +13,7 @@ const ANIMATIONS_CONFIG = [
 ];
 
 export class SpriteLoader {
-    static async loadCharacter(spritesheetPath: string) {
+    static async loadCharacterVisual(spritesheetPath: string) {
         const sheetTexture = await Assets.load(spritesheetPath);
         const animations = new Map<string, Texture[]>();
 

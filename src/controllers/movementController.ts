@@ -2,7 +2,7 @@ import { Point } from "pixi.js";
 import { InputManager } from "../utils/inputManager";
 
 export class MovementController {
-    private speed = 5;
+    private _speed = 5;
 
     private _isMoving = false;
     private _scale: Point;
@@ -24,6 +24,7 @@ export class MovementController {
     }
 
     update(deltaTime: number) {
+        this._isMoving = false;
         let movementX = 0;
         let movementY = 0;
 
@@ -37,11 +38,11 @@ export class MovementController {
             const normalizedX = movementX / totalMovement;
             const normalizedY = movementY / totalMovement;
 
-            this.position.x += normalizedX * this.speed * deltaTime;
-            this.position.y += normalizedY * this.speed * deltaTime;
+            this.position.x += normalizedX * this._speed * deltaTime;
+            this.position.y += normalizedY * this._speed * deltaTime;
             this._isMoving = true;
         } else {
-            this._isMoving = true;
+            this._isMoving = false;
         }
 
         return this._isMoving;
@@ -50,12 +51,4 @@ export class MovementController {
     updateScale(mouseX: number) {
         this.scale.x = mouseX < this.position.x ? -Math.abs(this.scale.x) : Math.abs(this.scale.x);
     }
-
-    // public getIsMoving(): boolean {
-    //     return this.isMoving;
-    // }
-
-    // public getScale(): Point {
-    //     return this.scale;
-    // }
 }
