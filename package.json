@@ -1,0 +1,21 @@
+{
+  "name": "pixi_node_game",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run dev",
+    "build": "tsc && vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@pixi/devtools": "^2.0.1",
+    "pixi.js": "^8.6.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.16.0",
+    "eslint": "^9.16.0",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.2"
+  }
+}
