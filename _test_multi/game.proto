@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+message PlayerInput {
+  uint32 seq = 1;
+  sint32 dx = 2;
+  sint32 dy = 3;
+}
+
+message GameSnapshot {
+  uint64 timestamp = 1;
+  repeated PlayerUpdate players = 2;
+
+  message PlayerUpdate {
+    uint32 id = 1;
+    sint32 x = 2;
+    sint32 y = 3;
+  }
+}
