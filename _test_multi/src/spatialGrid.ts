@@ -1,1 +1,0 @@
-export type SpatialGrid = Map<string, Set<number>>;

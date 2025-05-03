@@ -1,0 +1,113 @@
+
+## Project Requirements
+Create a simple 2D game with the following networking capabilities:
+Scan all current project files and only then do all below
+
+1. Support for 1000+ concurrent players
+2. Multi-threading for handling concurrency
+3. Lag compensation and interpolation for smooth gameplay
+4. Responsive movement and attacks with no perceived delay
+5. Efficient WebSocket communication
+6. Integer-based grid movement system
+7. Server-side and client-side world state synchronization
+8. 60 Hz tickrate
+9. Full world state sync every 30 seconds to prevent desyncs
+10. Debug logging for connections/disconnections
+
+## Technical Stack
+- Server: Implement using Bun.js for superior performance and WebSocket support
+- Client: Implement using PixiJS for efficient WebGL rendering
+- Communication: WebSockets for real-time data transfer
+
+## Data Optimization Requirements
+To minimize bandwidth usage:
+- Use binary data format for all network communication (NOT JSON)
+- Send delta movement (dx, dy) instead of absolute positions
+- Use simple numeric values for player states (idle=0, move=1, attack=2)
+- Implement binary facing direction (-1=left, 1=right) separate from movement
+- Batch player actions and send together rather than immediately
+- Only send data when player state changes
+- Use bit packing techniques to minimize message size
+
+## Networking Architecture
+Implement the following architecture:
+
+1. **Client-Side**:
+   - Capture and process player input
+   - Apply input locally for immediate feedback
+   - Queue inputs for sending to server in batches
+   - Apply server corrections when received
+   - Implement interpolation for smooth rendering
+   - Allow players to move in one direction while facing another
+   - Use PixiJS for efficient rendering
+
+2. **Server-Side**:
+   - Run game loop at 60Hz (every 16.7ms)
+   - Process all game logic authoritatively
+   - Distribute processing across multiple worker threads
+   - Send updates only when player states change
+   - Send complete world state every 30 seconds
+   - Validate and sanitize client inputs
+   - Log connections and disconnections
+
+3. **Binary Data Format**:
+   - Client input format (binary structure):
+     ```
+     [2 bytes] Player ID
+     [1 byte] Action count
+     For each action:
+       [3 bits] Action type (0=idle, 1=move, 2=attack)
+       [2 bits] dx (-1, 0, 1)
+       [2 bits] dy (-1, 0, 1)
+       [1 bit] facing (0=left, 1=right)
+       [2 bytes] Client timestamp
+     ```
+   - Server update format (binary structure):
+     ```
+     [4 bytes] Server timestamp
+     [2 bytes] Entity count
+     For each entity:
+       [2 bytes] Entity ID
+       [1 bit] Is full update flag
+       If full update:
+         [2 bytes] x position
+         [2 bytes] y position
+       Else (delta update):
+         [2 bits] dx
+         [2 bits] dy
+       [1 bit] facing
+       [3 bits] state
+     [1 byte] Event count
+     For each event:
+       [1 byte] Event type
+       [2 bytes] Source ID
+       [2 bytes] Target ID
+       [1 byte] Additional data (damage, etc)
+     ```
+
+## Implementation Priorities
+1. Set up Bun.js server with binary WebSocket support
+2. Implement basic client-side rendering with PixiJS
+3. Create binary serialization/deserialization functions
+4. Establish binary WebSocket communication between client and server
+5. Create player movement with client-side prediction
+6. Implement server-side validation and state management
+7. Add multi-threading for physics and game logic
+8. Optimize binary data transmission and add batching
+9. Implement complete state sync mechanism (every 30 seconds)
+10. Add debug logging and monitoring
+11. Add support for lag compensation and interpolation
+12. Scale test with simulated 1000+ players
+
+## Technical Implementation Notes
+- Use binary WebSocket messages (NOT text/JSON) for all network communication
+- Implement efficient binary serialization/deserialization
+- Use integers for all position values
+- Handle network jitter with smoothing algorithms
+- Implement interest management to only send relevant updates to each player
+- Add debug visualization options for development
+- Create configurable network parameters (tick rate, update frequency)
+- Implement reconnection handling for client disconnects
+- Use bit-level operations for packing/unpacking data
+
+Please implement this architecture to create a high-performance 2D multiplayer game capable of handling 1000+ concurrent players with smooth, responsive gameplay.
