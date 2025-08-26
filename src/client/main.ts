@@ -8,6 +8,7 @@ import { NetworkManager } from "./network/networkManager";
 import { PlayerManager } from "./game/playerManager";
 import { TICK_RATE } from "../protocol/messages";
 import { PLAYER } from "../common/gameSettings";
+import { BinaryProtocol } from "../protocol/binaryProtocol";
 
 (async () => {
     const app = new Application();
@@ -73,14 +74,16 @@ import { PLAYER } from "../common/gameSettings";
             console.log("Attacking");
             animationController.setAnimation("attack");
 
-            // Send attack to server as JSON (attacks are less frequent)
+            // Send attack in binary format
             const position = { x: playerSprite.position.x, y: playerSprite.position.y };
-            const attackMsg = JSON.stringify({
-                type: "attack",
+            const attackMsg = {
+                type: 'attack' as const,
                 position
-            });
+            };
 
-            // We could switch to binary protocol later if needed
+            // Use binary protocol for attack
+            const binaryData = BinaryProtocol.encodeAttack(attackMsg);
+            networkManager.sendAttack(binaryData);
         }
     });
 

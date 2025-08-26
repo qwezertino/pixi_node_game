@@ -2,6 +2,7 @@ import { ServerWebSocket } from "bun";
 import { GameWorld } from "../game/gameWorld";
 import { BinaryProtocol } from "../../protocol/binaryProtocol";
 import { v4 as uuidv4 } from 'uuid';
+import { InitialStateMessage } from "../../protocol/messages";
 
 // Create a single game world instance
 const gameWorld = new GameWorld();
@@ -24,16 +25,17 @@ export function handleWebSocket() {
             // Add player to game world and get initial state
             const playerState = gameWorld.addPlayer(playerId, ws);
 
-            // Send initial game state to the new player
-            const initialState = {
+            // Create initial state message
+            const initialState: InitialStateMessage = {
                 type: 'initialState',
                 player: playerState,
                 players: gameWorld.getAllPlayersState(),
                 timestamp: Date.now()
             };
 
-            // Send as JSON (initial state is only sent once)
-            ws.send(JSON.stringify(initialState));
+            // Send as binary data
+            const binaryData = BinaryProtocol.encodeInitialState(initialState);
+            ws.send(binaryData);
         },
 
         // Message received from client
@@ -54,6 +56,10 @@ export function handleWebSocket() {
 
                             case 'direction':
                                 gameWorld.updatePlayerDirection(playerId, decodedMsg.direction);
+                                break;
+
+                            case 'attack':
+                                gameWorld.handlePlayerAttack(playerId, decodedMsg.position);
                                 break;
                         }
                     }

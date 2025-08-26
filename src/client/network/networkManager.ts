@@ -8,6 +8,7 @@ export type OnPlayerMovementCallback = (playerId: string, dx: number, dy: number
 export type OnPlayerDirectionCallback = (playerId: string, direction: -1 | 1) => void;
 export type OnGameStateCallback = (players: Record<string, PlayerState>) => void;
 export type OnCorrectionCallback = (position: PlayerPosition) => void;
+export type OnPlayerAttackCallback = (playerId: string, position: PlayerPosition) => void;
 
 export class NetworkManager {
     private socket: WebSocket;
@@ -22,6 +23,7 @@ export class NetworkManager {
     private onPlayerDirectionCallbacks: OnPlayerDirectionCallback[] = [];
     private onGameStateCallbacks: OnGameStateCallback[] = [];
     private onCorrectionCallbacks: OnCorrectionCallback[] = [];
+    private onPlayerAttackCallbacks: OnPlayerAttackCallback[] = [];
 
     constructor() {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -95,6 +97,25 @@ export class NetworkManager {
                         );
                         break;
 
+                    case 'initialState':
+                        this.playerId = message.player.id;
+                        this.initialPosition = message.player.position;
+                        this.players = message.players;
+
+                        // Notify about initial game state
+                        this.onGameStateCallbacks.forEach(callback => callback(message.players));
+                        break;
+
+                    case 'playerJoined':
+                        this.players[message.player.id] = message.player;
+                        this.onPlayerJoinedCallbacks.forEach(callback => callback(message.player));
+                        break;
+
+                    case 'playerLeft':
+                        delete this.players[message.playerId];
+                        this.onPlayerLeftCallbacks.forEach(callback => callback(message.playerId));
+                        break;
+
                     case 'gameState':
                         this.players = message.players;
                         this.onGameStateCallbacks.forEach(callback => callback(message.players));
@@ -105,27 +126,30 @@ export class NetworkManager {
                             this.onCorrectionCallbacks.forEach(callback => callback(message.position));
                         }
                         break;
+
+                    case 'playerAttack':
+                        this.onPlayerAttackCallbacks.forEach(callback =>
+                            callback(message.playerId, message.position)
+                        );
+                        break;
                 }
             }
-            // Handle JSON message
+            // Handle JSON message (for backward compatibility, may be removed later)
             else {
-                // Добавляем проверку, является ли строка валидным JSON
-                // и логирование для отладки
-                if (typeof data !== 'string') {
-                    console.warn("Received non-string data:", data);
+                // Skip if empty or non-string
+                if (typeof data !== 'string' || !data) {
+                    console.debug("Ignoring empty message");
                     return;
                 }
 
-                // Выводим полученные данные для отладки
-                console.debug("Received string data:", data.substring(0, 100) + (data.length > 100 ? "...": ""));
-
-                // Проверка на пустые сообщения или сообщения-пинги
-                if (!data || data === 'ping') {
-                    console.debug("Ignoring empty or ping message");
+                // Skip ping messages
+                if (data === 'ping') {
+                    console.debug("Ignoring ping message");
                     return;
                 }
 
                 try {
+                    console.warn("Received JSON message - should be migrated to binary:", data.substring(0, 50));
                     const message = JSON.parse(data);
 
                     if (!message.type) {
@@ -133,30 +157,7 @@ export class NetworkManager {
                         return;
                     }
 
-                    switch (message.type) {
-                        case 'initialState':
-                            this.playerId = message.player.id;
-                            this.initialPosition = message.player.position;
-                            this.players = message.players;
-
-                            // Notify about initial game state
-                            this.onGameStateCallbacks.forEach(callback => callback(message.players));
-                            break;
-
-                        case 'playerJoined':
-                            this.players[message.player.id] = message.player;
-                            this.onPlayerJoinedCallbacks.forEach(callback => callback(message.player));
-                            break;
-
-                        case 'playerLeft':
-                            delete this.players[message.playerId];
-                            this.onPlayerLeftCallbacks.forEach(callback => callback(message.playerId));
-                            break;
-
-                        default:
-                            console.debug("Unknown message type:", message.type);
-                            break;
-                    }
+                    console.warn("JSON message type should be migrated to binary:", message.type);
                 } catch (parseError) {
                     console.error("Failed to parse JSON:", parseError);
                     console.error("Raw data causing the error:", data);
@@ -192,6 +193,10 @@ export class NetworkManager {
         this.onCorrectionCallbacks.push(callback);
     }
 
+    public onPlayerAttack(callback: OnPlayerAttackCallback): void {
+        this.onPlayerAttackCallbacks.push(callback);
+    }
+
     // Send movement to server
     public sendMovement(dx: number, dy: number): void {
         if (this.socket.readyState !== WebSocket.OPEN) return;
@@ -217,6 +222,12 @@ export class NetworkManager {
 
         // Use binary protocol for frequent updates
         const binaryData = BinaryProtocol.encodeDirection(dirMsg);
+        this.socket.send(binaryData);
+    }
+
+    // Send attack to server
+    public sendAttack(binaryData: Uint8Array): void {
+        if (this.socket.readyState !== WebSocket.OPEN) return;
         this.socket.send(binaryData);
     }
 

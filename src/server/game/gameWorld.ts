@@ -149,36 +149,50 @@ export class GameWorld {
         return true;
     }
 
+    // Handle player attack
+    public handlePlayerAttack(playerId: string, position: PlayerPosition): boolean {
+        const player = this.players.get(playerId);
+        if (!player) return false;
+
+        // Update player position (could be slightly different due to lag)
+        player.position = position;
+
+        // Broadcast attack to other players
+        this.broadcastPlayerAttack(playerId, position);
+
+        return true;
+    }
+
     // Broadcasting methods
     private broadcastPlayerJoined(playerState: PlayerState) {
         const joinedMsg = {
-            type: 'playerJoined',
+            type: 'playerJoined' as const,
             player: playerState
         };
 
-        // For now, use JSON for the join message (it's less frequent)
-        const message = JSON.stringify(joinedMsg);
+        // Encode as binary
+        const binaryData = BinaryProtocol.encodePlayerJoined(joinedMsg);
 
         // Send to all players except the one who joined
         for (const [id, ws] of this.connections.entries()) {
             if (id !== playerState.id) {
-                ws.send(message);
+                ws.send(binaryData);
             }
         }
     }
 
     private broadcastPlayerLeft(playerId: string) {
         const leftMsg = {
-            type: 'playerLeft',
+            type: 'playerLeft' as const,
             playerId
         };
 
-        // For now, use JSON for the leave message (it's less frequent)
-        const message = JSON.stringify(leftMsg);
+        // Encode as binary
+        const binaryData = BinaryProtocol.encodePlayerLeft(leftMsg);
 
         // Send to all remaining players
         for (const ws of this.connections.values()) {
-            ws.send(message);
+            ws.send(binaryData);
         }
     }
 
@@ -211,6 +225,25 @@ export class GameWorld {
         const binaryData = BinaryProtocol.encodePlayerDirection(dirMsg);
 
         // Send to all players except the one who changed direction
+        for (const [id, ws] of this.connections.entries()) {
+            if (id !== playerId) {
+                ws.send(binaryData);
+            }
+        }
+    }
+
+    // Broadcast player attack
+    private broadcastPlayerAttack(playerId: string, position: PlayerPosition) {
+        const attackMsg = {
+            type: 'playerAttack' as const,
+            playerId,
+            position
+        };
+
+        // Encode as binary
+        const binaryData = BinaryProtocol.encodePlayerAttack(attackMsg);
+
+        // Send to all players except the attacker
         for (const [id, ws] of this.connections.entries()) {
             if (id !== playerId) {
                 ws.send(binaryData);

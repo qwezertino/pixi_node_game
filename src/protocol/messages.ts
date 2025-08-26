@@ -51,6 +51,13 @@ export interface ServerMessage {
     type: string;
 }
 
+export interface InitialStateMessage extends ServerMessage {
+    type: 'initialState';
+    player: PlayerState;
+    players: Record<string, PlayerState>;
+    timestamp: number;
+}
+
 export interface PlayerJoinedMessage extends ServerMessage {
     type: 'playerJoined';
     player: PlayerState;
@@ -103,4 +110,7 @@ export enum MessageType {
     ATTACK = 5,
     GAME_STATE = 6,
     CORRECTION = 7,
+    INITIAL_STATE = 8,
+    PLAYER_JOINED = 9,
+    PLAYER_LEFT = 10,
 }
