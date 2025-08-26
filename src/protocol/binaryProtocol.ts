@@ -149,36 +149,49 @@ export class BinaryProtocol {
         return u8;
     }
 
-    // New methods for additional message types
+        // New methods for additional message types
     static encodeInitialState(msg: InitialStateMessage): Uint8Array {
         const encoder = new TextEncoder();
         const playerIdBytes = encoder.encode(msg.player.id);
 
-        // Calculate size: type(1) + timestamp(4) + playerIdLength(1) +
-        // playerId(n) + direction(1) + moving(1) + posX(4) + posY(4) + playerCount(1) + [players data]
-        let totalSize = 16 + playerIdBytes.length;
+        // Calculate size more carefully
+        // Header: type(1) + timestamp(4) = 5
+        // Main player: playerIdLength(1) + playerId(n) + direction(1) + moving(1) + posX(4) + posY(4) = 11 + n
+        // Other players count: playerCount(1) = 1
+        // Each other player: idLength(1) + id(n) + direction(1) + moving(1) + x(4) + y(4) = 11 + n
 
-        // Pre-encode player IDs to get their lengths
+        let totalSize = 5; // Header
+        totalSize += 1 + playerIdBytes.length + 10; // Main player data
+        totalSize += 1; // Player count
+
+        // Pre-encode other player IDs to get their lengths
         const playerIds = Object.keys(msg.players);
         const playerIdBuffers = playerIds.map(id => encoder.encode(id));
 
-        // Each player entry: id length(1) + id bytes + direction(1) + moving(1) + x(4) + y(4)
+        // Each other player entry: id length(1) + id bytes + direction(1) + moving(1) + x(4) + y(4)
         for (let i = 0; i < playerIdBuffers.length; i++) {
             totalSize += 1 + playerIdBuffers[i].length + 10;
         }
+
+        console.log(`InitialState buffer size calculation: ${totalSize} bytes for ${playerIds.length} other players`);
 
         const buffer = new ArrayBuffer(totalSize);
         const view = new DataView(buffer);
         const u8 = new Uint8Array(buffer);
 
+        let offset = 0;
+
         // Message type and timestamp
-        view.setUint8(0, MessageType.INITIAL_STATE);
-        view.setUint32(1, msg.timestamp, true);
+        view.setUint8(offset, MessageType.INITIAL_STATE);
+        offset++;
+        view.setUint32(offset, msg.timestamp, true);
+        offset += 4;
 
         // Main player data
-        view.setUint8(5, playerIdBytes.length);
-        u8.set(playerIdBytes, 6);
-        let offset = 6 + playerIdBytes.length;
+        view.setUint8(offset, playerIdBytes.length);
+        offset++;
+        u8.set(playerIdBytes, offset);
+        offset += playerIdBytes.length;
         view.setInt8(offset, msg.player.direction);
         offset++;
         view.setUint8(offset, msg.player.moving ? 1 : 0);
@@ -188,11 +201,11 @@ export class BinaryProtocol {
         view.setFloat32(offset, msg.player.position.y, true);
         offset += 4;
 
-        // Other players
+        // Other players count
         view.setUint8(offset, playerIds.length);
         offset++;
 
-        // Encode each player
+        // Encode each other player
         for (let i = 0; i < playerIds.length; i++) {
             const playerId = playerIds[i];
             const playerData = msg.players[playerId];
@@ -215,6 +228,7 @@ export class BinaryProtocol {
             offset += 4;
         }
 
+        console.log(`InitialState encoded successfully, final offset: ${offset}, buffer size: ${totalSize}`);
         return u8;
     }
 
