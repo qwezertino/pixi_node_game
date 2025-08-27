@@ -16,6 +16,7 @@ export class AnimationController {
     private currentAnimation: string = "idle";
     private currentState: PlayerState = PlayerState.IDLE;
     private attackAnimationPlaying = false;
+    private onAttackEndCallback: (() => void) | null = null;
 
     private playerSprite: AnimatedSprite;
 
@@ -74,8 +75,17 @@ export class AnimationController {
         this.playerSprite.loop = false;
         this.playerSprite.onComplete = () => {
             this.attackAnimationPlaying = false;
-            this.setState(PlayerState.IDLE); // or PlayerState.MOVING if you want to continue moving after attack
+            this.setState(PlayerState.IDLE);
+
+            // Notify movement controller that attack ended
+            if (this.onAttackEndCallback) {
+                this.onAttackEndCallback();
+            }
         };
+    }
+
+    public onAttackEnd(callback: () => void) {
+        this.onAttackEndCallback = callback;
     }
     handleAttack() {
         if (this.currentState === PlayerState.ATTACKING) return false;

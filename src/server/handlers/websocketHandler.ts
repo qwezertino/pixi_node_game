@@ -22,14 +22,17 @@ export function handleWebSocket() {
 
             console.log(`New player connected: ${playerId}`);
 
+            // Get existing players before adding the new one
+            const existingPlayers = gameWorld.getAllPlayersState();
+
             // Add player to game world and get initial state
             const playerState = gameWorld.addPlayer(playerId, ws);
 
-            // Create initial state message
+            // Create initial state message with only existing players (not including self)
             const initialState: InitialStateMessage = {
                 type: 'initialState',
                 player: playerState,
-                players: gameWorld.getAllPlayersState(),
+                players: existingPlayers, // Only existing players, not including the new one
                 timestamp: Date.now()
             };
 
@@ -51,6 +54,7 @@ export function handleWebSocket() {
                         switch (decodedMsg.type) {
                             case 'move':
                                 const { dx, dy } = decodedMsg.movementVector;
+                                console.log(`📨 [SERVER] Received movement from ${playerId}: dx=${dx}, dy=${dy}`);
                                 gameWorld.updatePlayerMovement(playerId, dx, dy);
                                 break;
 

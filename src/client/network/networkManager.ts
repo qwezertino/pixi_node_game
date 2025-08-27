@@ -4,15 +4,27 @@ import { PlayerState, PlayerPosition } from "../../protocol/messages";
 // Callback types
 export type OnPlayerJoinedCallback = (player: PlayerState) => void;
 export type OnPlayerLeftCallback = (playerId: string) => void;
-export type OnPlayerMovementCallback = (playerId: string, dx: number, dy: number) => void;
-export type OnPlayerDirectionCallback = (playerId: string, direction: -1 | 1) => void;
-export type OnGameStateCallback = (players: Record<string, PlayerState>) => void;
+export type OnPlayerMovementCallback = (
+    playerId: string,
+    dx: number,
+    dy: number
+) => void;
+export type OnPlayerDirectionCallback = (
+    playerId: string,
+    direction: -1 | 1
+) => void;
+export type OnGameStateCallback = (
+    players: Record<string, PlayerState>
+) => void;
 export type OnCorrectionCallback = (position: PlayerPosition) => void;
-export type OnPlayerAttackCallback = (playerId: string, position: PlayerPosition) => void;
+export type OnPlayerAttackCallback = (
+    playerId: string,
+    position: PlayerPosition
+) => void;
 
 export class NetworkManager {
     private socket: WebSocket;
-    private playerId: string = '';
+    private playerId: string = "";
     private initialPosition: PlayerPosition = { x: 0, y: 0 };
     private players: Record<string, PlayerState> = {};
 
@@ -27,7 +39,7 @@ export class NetworkManager {
 
     constructor() {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const host = 'localhost:8108'; // Change to window.location.host in production
+        const host = "localhost:8108"; // Change to window.location.host in production
         const wsUrl = `${protocol}//${host}/ws`;
 
         this.socket = new WebSocket(wsUrl);
@@ -48,7 +60,6 @@ export class NetworkManager {
 
                 // Handle Blob data
                 if (processedData instanceof Blob) {
-                    console.log("Received blob data, size:", processedData.size);
                     // Convert Blob to ArrayBuffer
                     processedData = await processedData.arrayBuffer();
                 }
@@ -74,61 +85,109 @@ export class NetworkManager {
         try {
             // Handle binary message
             if (data instanceof ArrayBuffer) {
-                console.log("Processing ArrayBuffer data, size:", data.byteLength);
-                const message = BinaryProtocol.decodeMessage(new Uint8Array(data));
+                const message = BinaryProtocol.decodeMessage(
+                    new Uint8Array(data)
+                );
 
                 if (!message) {
                     console.warn("Failed to decode binary message");
                     return;
                 }
 
-                console.log("Decoded message type:", message.type);
+                // Debug logging for movement data from other players only
+                // if (message.type === 'playerMovement' && message.playerId !== this.playerId) {
+                //     console.log(`📨 Received movement: dx=${message.movementVector?.dx}, dy=${message.movementVector?.dy}`);
+                // }
 
                 switch (message.type) {
-                    case 'playerMovement':
-                        this.onPlayerMovementCallbacks.forEach(callback =>
-                            callback(message.playerId, message.movementVector.dx, message.movementVector.dy)
-                        );
+                    case "playerMovement":
+                        // Only process movement updates for other players, not ourselves
+                        if (
+                            message.movementVector &&
+                            message.playerId !== this.playerId
+                        ) {
+                            this.onPlayerMovementCallbacks.forEach((callback) =>
+                                callback(
+                                    message.playerId,
+                                    message.movementVector.dx,
+                                    message.movementVector.dy
+                                )
+                            );
+                        }
                         break;
 
-                    case 'playerDirection':
-                        this.onPlayerDirectionCallbacks.forEach(callback =>
-                            callback(message.playerId, message.direction)
-                        );
+                    case "playerDirection":
+                        // Only process direction updates for other players, not ourselves
+                        if (message.playerId !== this.playerId) {
+                            this.onPlayerDirectionCallbacks.forEach(
+                                (callback) =>
+                                    callback(
+                                        message.playerId,
+                                        message.direction
+                                    )
+                            );
+                        }
                         break;
 
-                    case 'initialState':
+                    case "initialState":
+                        console.log(
+                            `Received initialState: myId=${
+                                message.player.id
+                            }, otherPlayers=${
+                                Object.keys(message.players).length
+                            }`
+                        );
                         this.playerId = message.player.id;
                         this.initialPosition = message.player.position;
                         this.players = message.players;
 
+                        // Log other players
+                        Object.keys(message.players).forEach((id) => {
+                            console.log(`Other player in initialState: ${id}`);
+                        });
+
                         // Notify about initial game state
-                        this.onGameStateCallbacks.forEach(callback => callback(message.players));
+                        this.onGameStateCallbacks.forEach((callback) =>
+                            callback(message.players)
+                        );
                         break;
 
-                    case 'playerJoined':
+                    case "playerJoined":
                         this.players[message.player.id] = message.player;
-                        this.onPlayerJoinedCallbacks.forEach(callback => callback(message.player));
+                        this.onPlayerJoinedCallbacks.forEach((callback) =>
+                            callback(message.player)
+                        );
                         break;
 
-                    case 'playerLeft':
+                    case "playerLeft":
                         delete this.players[message.playerId];
-                        this.onPlayerLeftCallbacks.forEach(callback => callback(message.playerId));
+                        this.onPlayerLeftCallbacks.forEach((callback) =>
+                            callback(message.playerId)
+                        );
                         break;
 
-                    case 'gameState':
+                    case "gameState":
+                        console.log(`🌍 [CLIENT] Received gameState with ${Object.keys(message.players).length} players`);
+                        for (const [playerId, playerState] of Object.entries(message.players)) {
+                            const typedPlayerState = playerState as PlayerState;
+                            console.log(`📥 [CLIENT] GameState player ${playerId}: discrete pos=(${typedPlayerState.position.x}, ${typedPlayerState.position.y}), moving=${typedPlayerState.moving}`);
+                        }
                         this.players = message.players;
-                        this.onGameStateCallbacks.forEach(callback => callback(message.players));
+                        this.onGameStateCallbacks.forEach((callback) =>
+                            callback(message.players)
+                        );
                         break;
 
-                    case 'correction':
+                    case "correction":
                         if (message.playerId === this.playerId) {
-                            this.onCorrectionCallbacks.forEach(callback => callback(message.position));
+                            this.onCorrectionCallbacks.forEach((callback) =>
+                                callback(message.position)
+                            );
                         }
                         break;
 
-                    case 'playerAttack':
-                        this.onPlayerAttackCallbacks.forEach(callback =>
+                    case "playerAttack":
+                        this.onPlayerAttackCallbacks.forEach((callback) =>
                             callback(message.playerId, message.position)
                         );
                         break;
@@ -137,19 +196,22 @@ export class NetworkManager {
             // Handle JSON message (for backward compatibility, may be removed later)
             else {
                 // Skip if empty or non-string
-                if (typeof data !== 'string' || !data) {
+                if (typeof data !== "string" || !data) {
                     console.debug("Ignoring empty message");
                     return;
                 }
 
                 // Skip ping messages
-                if (data === 'ping') {
+                if (data === "ping") {
                     console.debug("Ignoring ping message");
                     return;
                 }
 
                 try {
-                    console.warn("Received JSON message - should be migrated to binary:", data.substring(0, 50));
+                    console.warn(
+                        "Received JSON message - should be migrated to binary:",
+                        data.substring(0, 50)
+                    );
                     const message = JSON.parse(data);
 
                     if (!message.type) {
@@ -157,7 +219,10 @@ export class NetworkManager {
                         return;
                     }
 
-                    console.warn("JSON message type should be migrated to binary:", message.type);
+                    console.warn(
+                        "JSON message type should be migrated to binary:",
+                        message.type
+                    );
                 } catch (parseError) {
                     console.error("Failed to parse JSON:", parseError);
                     console.error("Raw data causing the error:", data);
@@ -201,9 +266,11 @@ export class NetworkManager {
     public sendMovement(dx: number, dy: number): void {
         if (this.socket.readyState !== WebSocket.OPEN) return;
 
+        console.log(`📤 [CLIENT] Sending movement: dx=${dx}, dy=${dy}`);
+
         const moveMsg = {
-            type: 'move' as const,
-            movementVector: { dx, dy }
+            type: "move" as const,
+            movementVector: { dx, dy },
         };
 
         // Use binary protocol for frequent updates
@@ -216,8 +283,8 @@ export class NetworkManager {
         if (this.socket.readyState !== WebSocket.OPEN) return;
 
         const dirMsg = {
-            type: 'direction' as const,
-            direction
+            type: "direction" as const,
+            direction,
         };
 
         // Use binary protocol for frequent updates

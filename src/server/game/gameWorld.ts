@@ -6,10 +6,7 @@ import {
     SYNC_INTERVAL
 } from "../../protocol/messages";
 import { BinaryProtocol } from "../../protocol/binaryProtocol";
-import { MOVEMENT, WORLD } from "../../common/gameSettings";
-
-// Используем настройки из файла gameSettings
-const PLAYER_SPEED = MOVEMENT.PLAYER_SPEED;
+import { WORLD, MOVEMENT } from "../../common/gameSettings";
 
 export class GameWorld {
     private players: Map<string, PlayerState> = new Map();
@@ -41,30 +38,58 @@ export class GameWorld {
         }, tickMs) as unknown as Timer;
     }
 
-    private update(deltaTime: number) {
+    private update(_deltaTime: number) {
         // Update all player movements based on their movement vectors
-        for (const [_, playerState] of this.players.entries()) {
+        for (const [playerId, playerState] of this.players.entries()) {
             if (playerState.moving && playerState.movementVector) {
                 const { dx, dy } = playerState.movementVector;
+                const prevX = playerState.position.x;
+                const prevY = playerState.position.y;
 
-                // Calculate the distance to move this tick
-                const moveX = dx * PLAYER_SPEED * deltaTime;
-                const moveY = dy * PLAYER_SPEED * deltaTime;
+                // Use FIXED tick time for consistent movement calculation
+                // All clients and server must use the same tick duration
+                const tickSeconds = 1 / TICK_RATE;  // Fixed: 1/32 = 0.03125 seconds per tick
+                const moveDistance = MOVEMENT.PLAYER_SPEED * tickSeconds;
 
-                // Update player position
-                playerState.position.x += moveX;
-                playerState.position.y += moveY;
+                console.log(`🎯 [SERVER] Updating position for ${playerId}: moveDistance=${moveDistance.toFixed(3)}, vector=(${dx.toFixed(3)}, ${dy.toFixed(3)})`);
+
+                // Apply movement in virtual world coordinates
+                if (dx !== 0) {
+                    playerState.position.x += (dx > 0 ? moveDistance : -moveDistance);
+                }
+                if (dy !== 0) {
+                    playerState.position.y += (dy > 0 ? moveDistance : -moveDistance);
+                }
+
+                // Round to discrete positions for consistency with Int16 protocol
+                playerState.position.x = Math.round(playerState.position.x);
+                playerState.position.y = Math.round(playerState.position.y);
+
+                console.log(`📍 [SERVER] Position changed: ${playerId} from (${prevX.toFixed(2)}, ${prevY.toFixed(2)}) to discrete (${playerState.position.x}, ${playerState.position.y})`);
+
+                // Keep player within world boundaries
+                playerState.position.x = Math.max(WORLD.BOUNDARIES.MIN_X,
+                    Math.min(WORLD.BOUNDARIES.MAX_X, playerState.position.x));
+                playerState.position.y = Math.max(WORLD.BOUNDARIES.MIN_Y,
+                    Math.min(WORLD.BOUNDARIES.MAX_Y, playerState.position.y));
             }
         }
     }
 
     private sendFullSync() {
+        console.log(`🌍 [SERVER] Sending full sync to ${this.connections.size} players`);
+
         // Create a full game state snapshot
         const gameStateMsg = {
             type: 'gameState' as const,
             players: Object.fromEntries(this.players.entries()),
             timestamp: Date.now()
         };
+
+        // Log all player positions being sent
+        for (const [playerId, playerState] of this.players.entries()) {
+            console.log(`📤 [SERVER] Full sync sending player ${playerId}: discrete pos=(${playerState.position.x}, ${playerState.position.y}), moving=${playerState.moving}`);
+        }
 
         // Encode as binary
         const binaryData = BinaryProtocol.encodeGameState(gameStateMsg);
@@ -80,10 +105,20 @@ export class GameWorld {
         // Create random spawn position
         const spawnPosition = this.getRandomSpawnPosition();
 
+        console.log(`🎯 [SERVER] Spawning player ${playerId} at random position: (${spawnPosition.x.toFixed(2)}, ${spawnPosition.y.toFixed(2)})`);
+
+        // Round spawn position to discrete coordinates
+        const discreteSpawnPosition = {
+            x: Math.round(spawnPosition.x),
+            y: Math.round(spawnPosition.y)
+        };
+
+        console.log(`🎯 [SERVER] Rounded spawn position: (${spawnPosition.x.toFixed(2)}, ${spawnPosition.y.toFixed(2)}) -> discrete (${discreteSpawnPosition.x}, ${discreteSpawnPosition.y})`);
+
         // Create player state
         const playerState: PlayerState = {
             id: playerId,
-            position: spawnPosition,
+            position: discreteSpawnPosition,
             direction: 1, // Default facing right
             moving: false
         };
@@ -91,6 +126,8 @@ export class GameWorld {
         // Store player and connection
         this.players.set(playerId, playerState);
         this.connections.set(playerId, ws);
+
+        console.log(`✅ [SERVER] Player ${playerId} added with position: (${playerState.position.x.toFixed(2)}, ${playerState.position.y.toFixed(2)})`);
 
         // Notify all existing players about the new player
         this.broadcastPlayerJoined(playerState);
@@ -112,21 +149,22 @@ export class GameWorld {
         const player = this.players.get(playerId);
         if (!player) return false;
 
-        // Normalize the movement vector if needed
-        const magnitude = Math.sqrt(dx * dx + dy * dy);
+        console.log(`🏃 [SERVER] updatePlayerMovement: playerId=${playerId}, input dx=${dx}, dy=${dy}, current world pos=(${player.position.x.toFixed(2)}, ${player.position.y.toFixed(2)})`);
 
-        if (magnitude > 0) {
-            // Only normalize if there's actual movement
-            const normalizedDx = dx / magnitude;
-            const normalizedDy = dy / magnitude;
+        // DON'T normalize! Keep integer values for consistency with client
+        // Client already sends normalized integers (-1, 0, 1)
+        if (dx !== 0 || dy !== 0) {
+            // Use the exact same integer values as client sends
+            console.log(`🔄 [SERVER] Using integer movement: dx=${dx}, dy=${dy} (NO normalization)`);
 
             player.movementVector = {
-                dx: normalizedDx,
-                dy: normalizedDy
+                dx: dx,  // Keep original integer values
+                dy: dy
             };
 
             player.moving = true;
         } else {
+            console.log(`⏸️ [SERVER] Player stopped moving`);
             player.moving = false;
             player.movementVector = { dx: 0, dy: 0 };
         }
@@ -154,11 +192,14 @@ export class GameWorld {
         const player = this.players.get(playerId);
         if (!player) return false;
 
-        // Update player position (could be slightly different due to lag)
-        player.position = position;
+        console.log(`⚔️ [SERVER] Player ${playerId} attack: received pos (${position.x.toFixed(2)}, ${position.y.toFixed(2)}), current server pos (${player.position.x.toFixed(2)}, ${player.position.y.toFixed(2)})`);
 
-        // Broadcast attack to other players
-        this.broadcastPlayerAttack(playerId, position);
+        // DON'T update player position from attack - this could overwrite with screen coordinates!
+        // Server should maintain authoritative position
+        // player.position = position;
+
+        // Broadcast attack to other players using server's authoritative position
+        this.broadcastPlayerAttack(playerId, player.position);
 
         return true;
     }
@@ -196,12 +237,14 @@ export class GameWorld {
         }
     }
 
-    private broadcastPlayerMovement(playerId: string, movementVector: { dx: number; dy: number }) {
+        private broadcastPlayerMovement(playerId: string, movementVector: { dx: number; dy: number }) {
         const moveMsg = {
             type: 'playerMovement' as const,
             playerId,
             movementVector
         };
+
+        console.log(`Broadcasting movement from ${playerId}: dx=${movementVector.dx}, dy=${movementVector.dy}`);
 
         // Encode as binary
         const binaryData = BinaryProtocol.encodePlayerMovement(moveMsg);

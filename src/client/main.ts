@@ -9,6 +9,7 @@ import { PlayerManager } from "./game/playerManager";
 import { TICK_RATE } from "../protocol/messages";
 import { PLAYER } from "../common/gameSettings";
 import { BinaryProtocol } from "../protocol/binaryProtocol";
+import { CoordinateConverter } from "./utils/coordinateConverter";
 
 (async () => {
     const app = new Application();
@@ -29,7 +30,15 @@ import { BinaryProtocol } from "../protocol/binaryProtocol";
     // Initialize modules
     const fpsDisplay = new FpsDisplay(app);
     const input = new InputManager(app.canvas);
+
+    // Create NetworkManager but don't connect yet
     const networkManager = new NetworkManager();
+
+    // Setup coordinate converter for virtual world coordinates
+    const coordinateConverter = new CoordinateConverter(app.screen.width, app.screen.height);
+
+    // Setup player manager BEFORE connecting to handle initialState
+    const playerManager = new PlayerManager(playerContainer, networkManager, coordinateConverter);
 
     // Setup player
     const characterVisual = await SpriteLoader.loadCharacterVisual("/assets/16x16_knight_3_v3.png");
@@ -39,18 +48,22 @@ import { BinaryProtocol } from "../protocol/binaryProtocol";
     playerSprite.animationSpeed = PLAYER.ANIMATION_SPEED; // Используем настройки из gameSettings
     playerSprite.play();
 
-    // Set initial player position (will be updated when connected to server)
-    playerSprite.position.set(app.screen.width / 2, app.screen.height / 2);
+    // Set initial player position at world center (will be updated when connected to server)
+    const worldCenter = coordinateConverter.getWorldCenter();
+    const screenCenter = coordinateConverter.worldToScreen(worldCenter.x, worldCenter.y);
+    playerSprite.position.set(screenCenter.x, screenCenter.y);
     playerContainer.addChild(playerSprite);
 
     const animationController = new AnimationController(characterVisual.animations, playerSprite);
     const movementController = new MovementController(input, playerSprite.position, playerSprite.scale);
 
-    // Connect movement controller to network manager
+    // Connect movement controller to network manager, animation controller, and coordinate converter
     movementController.setNetworkManager(networkManager);
+    movementController.setAnimationController(animationController);
+    movementController.setCoordinateConverter(coordinateConverter);
 
-    // Setup player manager to handle other players
-    const playerManager = new PlayerManager(playerContainer, networkManager);
+    // Connect player manager to movement controller for server corrections
+    playerManager.setMovementController(movementController);
 
     // Wait for network connection and initial position
     await new Promise<void>((resolve) => {
@@ -59,22 +72,24 @@ import { BinaryProtocol } from "../protocol/binaryProtocol";
             if (networkManager.getPlayerId()) {
                 clearInterval(checkInterval);
 
-                // Set player position from server
+                                // Set player position from server (server sends world coordinates)
                 const initialPosition = networkManager.getInitialPosition();
-                playerSprite.position.set(initialPosition.x, initialPosition.y);
+
+                // Only set the movement controller - it will handle coordinate conversion
+                movementController.setInitialPosition(initialPosition.x, initialPosition.y);
 
                 resolve();
             }
         }, 100);
     });
 
-    // Attack handling
+        // Attack handling with immediate feedback
     app.canvas.addEventListener("mousedown", (e) => {
         if (e.button === 0 && animationController.handleAttack()) {
-            console.log("Attacking");
+            // Immediate visual feedback - play attack animation instantly
             animationController.setAnimation("attack");
 
-            // Send attack in binary format
+            // Send attack to server in binary format
             const position = { x: playerSprite.position.x, y: playerSprite.position.y };
             const attackMsg = {
                 type: 'attack' as const,

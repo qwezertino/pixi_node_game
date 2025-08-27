@@ -11,19 +11,29 @@ import {
     PlayerLeftMessage,
     AttackMessage,
     InitialStateMessage,
-    PlayerAttackMessage
-} from './messages';
+    PlayerAttackMessage,
+} from "./messages";
 
 // Binary message format to reduce network traffic
 export class BinaryProtocol {
-    // Encode client messages
+    // Encode client messages with bit packing optimization
     static encodeMove(moveMsg: MoveMessage): Uint8Array {
-        // Format: [MessageType.MOVE(1), dx(4), dy(4)]
-        const buffer = new ArrayBuffer(9);
+        // Optimized Format: [MessageType.MOVE(1), packed_movement(1)]
+        // Pack dx(-1,0,1) and dy(-1,0,1) into 2 bits each, total 4 bits + 4 spare bits
+        const buffer = new ArrayBuffer(2);
         const view = new DataView(buffer);
         view.setUint8(0, MessageType.MOVE);
-        view.setFloat32(1, moveMsg.movementVector.dx, true);
-        view.setFloat32(5, moveMsg.movementVector.dy, true);
+
+        // Convert float movement to integers (-1, 0, 1)
+        const dx = Math.sign(moveMsg.movementVector.dx) || 0;
+        const dy = Math.sign(moveMsg.movementVector.dy) || 0;
+
+        // Pack movement: dx in bits 0-1, dy in bits 2-3
+        let packed = 0;
+        packed |= (dx + 1) & 0x03; // dx: -1->0, 0->1, 1->2 (2 bits)
+        packed |= ((dy + 1) & 0x03) << 2; // dy: same, shifted 2 bits
+
+        view.setUint8(1, packed);
         return new Uint8Array(buffer);
     }
 
@@ -36,13 +46,13 @@ export class BinaryProtocol {
         return new Uint8Array(buffer);
     }
 
-    // Encode server messages
+    // Encode server messages with optimization
     static encodePlayerMovement(moveMsg: PlayerMovementMessage): Uint8Array {
-        // Format: [MessageType.MOVE(1), playerIdLength(1), playerId(n), dx(4), dy(4)]
+        // Optimized Format: [MessageType.MOVE(1), playerIdLength(1), playerId(n), packed_movement(1)]
         const encoder = new TextEncoder();
         const playerIdBytes = encoder.encode(moveMsg.playerId);
 
-        const buffer = new ArrayBuffer(10 + playerIdBytes.length);
+        const buffer = new ArrayBuffer(3 + playerIdBytes.length);
         const view = new DataView(buffer);
         view.setUint8(0, MessageType.MOVE);
         view.setUint8(1, playerIdBytes.length);
@@ -51,9 +61,15 @@ export class BinaryProtocol {
         const u8 = new Uint8Array(buffer);
         u8.set(playerIdBytes, 2);
 
-        // Set movement vector
-        view.setFloat32(2 + playerIdBytes.length, moveMsg.movementVector.dx, true);
-        view.setFloat32(6 + playerIdBytes.length, moveMsg.movementVector.dy, true);
+        // Pack movement vector (same bit packing as client)
+        const dx = Math.sign(moveMsg.movementVector.dx) || 0;
+        const dy = Math.sign(moveMsg.movementVector.dy) || 0;
+
+        let packed = 0;
+        packed |= (dx + 1) & 0x03; // dx: -1->0, 0->1, 1->2 (2 bits)
+        packed |= ((dy + 1) & 0x03) << 2; // dy: same, shifted 2 bits
+
+        view.setUint8(2 + playerIdBytes.length, packed);
 
         return u8;
     }
@@ -100,17 +116,19 @@ export class BinaryProtocol {
     }
 
     static encodeGameState(msg: GameStateMessage): Uint8Array {
-        // Calculate the total buffer size
+        // Optimized game state with integer positions and bit packing
         const encoder = new TextEncoder();
         let totalSize = 6; // 1 byte for type, 4 bytes for timestamp, 1 byte for player count
 
         // Pre-encode player IDs to get their lengths
         const playerIds = Object.keys(msg.players);
-        const playerIdBuffers = playerIds.map(id => encoder.encode(id));
+        const playerIdBuffers = playerIds.map((id) => encoder.encode(id));
 
-        // Each player entry: id length(1) + id bytes + direction(1) + moving(1) + x(4) + y(4)
+        // Optimized: Each player entry: id length(1) + id bytes + packed_flags(1) + x(2) + y(2)
+        // packed_flags: direction(1bit) + moving(1bit) + 6 spare bits
+        // Use Int16 for discrete positions (perfect for integer movement system)
         for (let i = 0; i < playerIdBuffers.length; i++) {
-            totalSize += 1 + playerIdBuffers[i].length + 10;
+            totalSize += 1 + playerIdBuffers[i].length + 5; // 1 flag byte + 2 bytes x + 2 bytes y
         }
 
         const buffer = new ArrayBuffer(totalSize);
@@ -135,21 +153,34 @@ export class BinaryProtocol {
             u8.set(playerIdBytes, offset);
             offset += playerIdBytes.length;
 
-            // Player data
-            view.setInt8(offset, playerData.direction);
+            // Pack direction and moving into a single byte
+            let packedFlags = 0;
+            packedFlags |= playerData.direction === 1 ? 1 : 0; // 1 bit for direction (0=left, 1=right)
+            packedFlags |= (playerData.moving ? 1 : 0) << 1; // 1 bit for moving
+            view.setUint8(offset, packedFlags);
             offset++;
-            view.setUint8(offset, playerData.moving ? 1 : 0);
-            offset++;
-            view.setFloat32(offset, playerData.position.x, true);
-            offset += 4;
-            view.setFloat32(offset, playerData.position.y, true);
-            offset += 4;
+
+            // Use Int16 positions for discrete movement system
+            const discreteX = Math.round(playerData.position.x);
+            const discreteY = Math.round(playerData.position.y);
+            console.log(
+                `📦 [PROTOCOL] Encoding gameState player ${playerId}: float pos (${playerData.position.x.toFixed(
+                    2
+                )}, ${playerData.position.y.toFixed(
+                    2
+                )}) -> discrete int16 (${discreteX}, ${discreteY})`
+            );
+
+            view.setInt16(offset, discreteX, true);
+            offset += 2;
+            view.setInt16(offset, discreteY, true);
+            offset += 2;
         }
 
         return u8;
     }
 
-        // New methods for additional message types
+    // New methods for additional message types
     static encodeInitialState(msg: InitialStateMessage): Uint8Array {
         const encoder = new TextEncoder();
         const playerIdBytes = encoder.encode(msg.player.id);
@@ -166,14 +197,12 @@ export class BinaryProtocol {
 
         // Pre-encode other player IDs to get their lengths
         const playerIds = Object.keys(msg.players);
-        const playerIdBuffers = playerIds.map(id => encoder.encode(id));
+        const playerIdBuffers = playerIds.map((id) => encoder.encode(id));
 
         // Each other player entry: id length(1) + id bytes + direction(1) + moving(1) + x(4) + y(4)
         for (let i = 0; i < playerIdBuffers.length; i++) {
             totalSize += 1 + playerIdBuffers[i].length + 10;
         }
-
-        console.log(`InitialState buffer size calculation: ${totalSize} bytes for ${playerIds.length} other players`);
 
         const buffer = new ArrayBuffer(totalSize);
         const view = new DataView(buffer);
@@ -228,7 +257,6 @@ export class BinaryProtocol {
             offset += 4;
         }
 
-        console.log(`InitialState encoded successfully, final offset: ${offset}, buffer size: ${totalSize}`);
         return u8;
     }
 
@@ -322,29 +350,55 @@ export class BinaryProtocol {
 
         switch (messageType) {
             case MessageType.MOVE: {
-                if (data.length === 9) {
-                    // Client message
-                    return {
-                        type: 'move',
-                        movementVector: {
-                            dx: view.getFloat32(1, true),
-                            dy: view.getFloat32(5, true)
-                        }
-                    };
-                } else {
-                    // Server message (player movement)
-                    const playerIdLength = view.getUint8(1);
-                    const decoder = new TextDecoder();
-                    const playerId = decoder.decode(data.subarray(2, 2 + playerIdLength));
+                if (data.length === 2) {
+                    // Optimized client message
+                    const packed = view.getUint8(1);
+                    const dx = (packed & 0x03) - 1; // Extract bits 0-1, convert back to -1,0,1
+                    const dy = ((packed >> 2) & 0x03) - 1; // Extract bits 2-3, convert back to -1,0,1
 
                     return {
-                        type: 'playerMovement',
-                        playerId,
-                        movementVector: {
-                            dx: view.getFloat32(2 + playerIdLength, true),
-                            dy: view.getFloat32(6 + playerIdLength, true)
-                        }
+                        type: "move",
+                        movementVector: { dx, dy },
                     };
+                } else if (data.length === 9) {
+                    // Legacy client message (for backward compatibility)
+                    return {
+                        type: "move",
+                        movementVector: {
+                            dx: view.getFloat32(1, true),
+                            dy: view.getFloat32(5, true),
+                        },
+                    };
+                } else {
+                    // Server message (player movement) - check if optimized or legacy
+                    const playerIdLength = view.getUint8(1);
+                    const decoder = new TextDecoder();
+                    const playerId = decoder.decode(
+                        data.subarray(2, 2 + playerIdLength)
+                    );
+
+                    if (data.length === 3 + playerIdLength) {
+                        // Optimized server message
+                        const packed = view.getUint8(2 + playerIdLength);
+                        const dx = (packed & 0x03) - 1; // Extract bits 0-1
+                        const dy = ((packed >> 2) & 0x03) - 1; // Extract bits 2-3
+
+                        return {
+                            type: "playerMovement",
+                            playerId,
+                            movementVector: { dx, dy },
+                        };
+                    } else {
+                        // Legacy server message
+                        return {
+                            type: "playerMovement",
+                            playerId,
+                            movementVector: {
+                                dx: view.getFloat32(2 + playerIdLength, true),
+                                dy: view.getFloat32(6 + playerIdLength, true),
+                            },
+                        };
+                    }
                 }
             }
 
@@ -352,19 +406,21 @@ export class BinaryProtocol {
                 if (data.length === 2) {
                     // Client message
                     return {
-                        type: 'direction',
-                        direction: view.getInt8(1) as -1 | 1
+                        type: "direction",
+                        direction: view.getInt8(1) as -1 | 1,
                     };
                 } else {
                     // Server message
                     const playerIdLength = view.getUint8(1);
                     const decoder = new TextDecoder();
-                    const playerId = decoder.decode(data.subarray(2, 2 + playerIdLength));
+                    const playerId = decoder.decode(
+                        data.subarray(2, 2 + playerIdLength)
+                    );
 
                     return {
-                        type: 'playerDirection',
+                        type: "playerDirection",
                         playerId,
-                        direction: view.getInt8(2 + playerIdLength) as -1 | 1
+                        direction: view.getInt8(2 + playerIdLength) as -1 | 1,
                     };
                 }
             }
@@ -372,19 +428,28 @@ export class BinaryProtocol {
             case MessageType.CORRECTION: {
                 const playerIdLength = view.getUint8(1);
                 const decoder = new TextDecoder();
-                const playerId = decoder.decode(data.subarray(2, 2 + playerIdLength));
+                const playerId = decoder.decode(
+                    data.subarray(2, 2 + playerIdLength)
+                );
 
                 return {
-                    type: 'correction',
+                    type: "correction",
                     playerId,
                     position: {
                         x: view.getFloat32(2 + playerIdLength, true),
-                        y: view.getFloat32(6 + playerIdLength, true)
-                    }
+                        y: view.getFloat32(6 + playerIdLength, true),
+                    },
                 };
             }
 
             case MessageType.GAME_STATE: {
+                if (data.length < 6) {
+                    console.error(
+                        "GameState decode error: insufficient data for header"
+                    );
+                    return null;
+                }
+
                 const timestamp = view.getUint32(1, true);
                 const playerCount = view.getUint8(5);
 
@@ -393,67 +458,105 @@ export class BinaryProtocol {
 
                 let offset = 6;
                 for (let i = 0; i < playerCount; i++) {
+                    // Bounds check for player ID length
+                    if (offset >= data.length) {
+                        console.error(
+                            "GameState decode error: insufficient data for player ID length"
+                        );
+                        break;
+                    }
+
                     const playerIdLength = view.getUint8(offset);
                     offset++;
 
-                    const playerId = decoder.decode(data.subarray(offset, offset + playerIdLength));
+                    // Bounds check for player ID
+                    if (offset + playerIdLength > data.length) {
+                        console.error(
+                            `GameState decode error: insufficient data for player ID. Need ${playerIdLength} bytes, have ${
+                                data.length - offset
+                            }`
+                        );
+                        break;
+                    }
+
+                    const playerId = decoder.decode(
+                        data.subarray(offset, offset + playerIdLength)
+                    );
                     offset += playerIdLength;
 
-                    const direction = view.getInt8(offset) as -1 | 1;
+                    // GameState format: packed_flags(1) + x(2) + y(2) = 5 bytes per player
+                    const remainingData = data.length - offset;
+
+                    if (remainingData < 5) {
+                        console.error(
+                            `GameState decode error: insufficient data for player ${playerId}, need 5 bytes, have ${remainingData}`
+                        );
+                        break;
+                    }
+
+                    const packedFlags = view.getUint8(offset);
                     offset++;
 
-                    const moving = view.getUint8(offset) === 1;
-                    offset++;
+                    const direction = packedFlags & 0x01 ? 1 : -1;
+                    const moving = (packedFlags >> 1) & 0x01 ? true : false;
 
-                    const x = view.getFloat32(offset, true);
-                    offset += 4;
+                    const x = view.getInt16(offset, true);
+                    offset += 2;
 
-                    const y = view.getFloat32(offset, true);
-                    offset += 4;
+                    const y = view.getInt16(offset, true);
+                    offset += 2;
+
+                    console.log(
+                        `📦 [PROTOCOL] Decoding gameState player ${playerId}: discrete int16 (${x}, ${y}) -> discrete pos (${x}, ${y})`
+                    );
 
                     players[playerId] = {
                         id: playerId,
                         direction,
                         moving,
-                        position: { x, y }
+                        position: { x, y },
                     };
                 }
 
                 return {
-                    type: 'gameState',
+                    type: "gameState",
                     players,
-                    timestamp
+                    timestamp,
                 };
             }
 
             case MessageType.PLAYER_JOINED: {
                 const playerIdLength = view.getUint8(1);
                 const decoder = new TextDecoder();
-                const playerId = decoder.decode(data.subarray(2, 2 + playerIdLength));
+                const playerId = decoder.decode(
+                    data.subarray(2, 2 + playerIdLength)
+                );
                 let offset = 2 + playerIdLength;
 
                 return {
-                    type: 'playerJoined',
+                    type: "playerJoined",
                     player: {
                         id: playerId,
                         direction: view.getInt8(offset++) as -1 | 1,
                         moving: view.getUint8(offset++) === 1,
                         position: {
                             x: view.getFloat32(offset, true),
-                            y: view.getFloat32(offset + 4, true)
-                        }
-                    }
+                            y: view.getFloat32(offset + 4, true),
+                        },
+                    },
                 };
             }
 
             case MessageType.PLAYER_LEFT: {
                 const playerIdLength = view.getUint8(1);
                 const decoder = new TextDecoder();
-                const playerId = decoder.decode(data.subarray(2, 2 + playerIdLength));
+                const playerId = decoder.decode(
+                    data.subarray(2, 2 + playerIdLength)
+                );
 
                 return {
-                    type: 'playerLeft',
-                    playerId
+                    type: "playerLeft",
+                    playerId,
                 };
             }
 
@@ -461,25 +564,27 @@ export class BinaryProtocol {
                 // Check if it's a client message (9 bytes) or server message (longer)
                 if (data.length === 9) {
                     return {
-                        type: 'attack',
+                        type: "attack",
                         position: {
                             x: view.getFloat32(1, true),
-                            y: view.getFloat32(5, true)
-                        }
+                            y: view.getFloat32(5, true),
+                        },
                     };
                 } else {
                     const playerIdLength = view.getUint8(1);
                     const decoder = new TextDecoder();
-                    const playerId = decoder.decode(data.subarray(2, 2 + playerIdLength));
+                    const playerId = decoder.decode(
+                        data.subarray(2, 2 + playerIdLength)
+                    );
                     const offset = 2 + playerIdLength;
 
                     return {
-                        type: 'playerAttack',
+                        type: "playerAttack",
                         playerId,
                         position: {
                             x: view.getFloat32(offset, true),
-                            y: view.getFloat32(offset + 4, true)
-                        }
+                            y: view.getFloat32(offset + 4, true),
+                        },
                     };
                 }
             }
@@ -490,7 +595,9 @@ export class BinaryProtocol {
 
                 // Main player
                 const playerIdLength = view.getUint8(5);
-                const playerId = decoder.decode(data.subarray(6, 6 + playerIdLength));
+                const playerId = decoder.decode(
+                    data.subarray(6, 6 + playerIdLength)
+                );
                 let offset = 6 + playerIdLength;
 
                 const direction = view.getInt8(offset++) as -1 | 1;
@@ -504,7 +611,7 @@ export class BinaryProtocol {
                     id: playerId,
                     direction,
                     moving,
-                    position: { x, y }
+                    position: { x, y },
                 };
 
                 // Other players
@@ -513,7 +620,9 @@ export class BinaryProtocol {
 
                 for (let i = 0; i < playerCount; i++) {
                     const playerIdLength = view.getUint8(offset++);
-                    const playerId = decoder.decode(data.subarray(offset, offset + playerIdLength));
+                    const playerId = decoder.decode(
+                        data.subarray(offset, offset + playerIdLength)
+                    );
                     offset += playerIdLength;
 
                     const direction = view.getInt8(offset++) as -1 | 1;
@@ -527,15 +636,15 @@ export class BinaryProtocol {
                         id: playerId,
                         direction,
                         moving,
-                        position: { x, y }
+                        position: { x, y },
                     };
                 }
 
                 return {
-                    type: 'initialState',
+                    type: "initialState",
                     player,
                     players,
-                    timestamp
+                    timestamp,
                 };
             }
 
