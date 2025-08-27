@@ -1,11 +1,8 @@
-// Protocol messages between client and server
 import { NETWORK } from '../common/gameSettings';
 
-// Game constants - импортируем из gameSettings
 export const TICK_RATE = NETWORK.TICK_RATE;
 export const SYNC_INTERVAL = NETWORK.SYNC_INTERVAL;
 
-// Player related
 export interface PlayerPosition {
     x: number;
     y: number;
@@ -16,10 +13,11 @@ export interface PlayerState {
     position: PlayerPosition;
     direction: -1 | 1;  // -1 for left, 1 for right
     moving: boolean;
+    attacking?: boolean;
     movementVector?: { dx: number; dy: number };
+    inputSequence?: number;
 }
 
-// Client to Server messages
 export interface ClientMessage {
     type: string;
 }
@@ -34,6 +32,7 @@ export interface MoveMessage extends ClientMessage {
         dx: number;
         dy: number;
     };
+    inputSequence: number;
 }
 
 export interface DirectionChangeMessage extends ClientMessage {
@@ -44,6 +43,10 @@ export interface DirectionChangeMessage extends ClientMessage {
 export interface AttackMessage extends ClientMessage {
     type: 'attack';
     position: PlayerPosition;
+}
+
+export interface AttackEndMessage extends ClientMessage {
+    type: 'attackEnd';
 }
 
 // Server to Client messages
@@ -95,22 +98,31 @@ export interface GameStateMessage extends ServerMessage {
     timestamp: number;
 }
 
+export interface MovementAcknowledgmentMessage extends ServerMessage {
+    type: 'movementAck';
+    playerId: string;
+    acknowledgedPosition: PlayerPosition;
+    inputSequence: number;
+    timestamp: number;
+}
+
 export interface ServerCorrectionMessage extends ServerMessage {
     type: 'correction';
     playerId: string;
     position: PlayerPosition;
 }
 
-// Compact binary protocol helpers
 export enum MessageType {
     JOIN = 1,
     LEAVE = 2,
     MOVE = 3,
     DIRECTION = 4,
     ATTACK = 5,
-    GAME_STATE = 6,
-    CORRECTION = 7,
-    INITIAL_STATE = 8,
-    PLAYER_JOINED = 9,
-    PLAYER_LEFT = 10,
+    ATTACK_END = 6,
+    GAME_STATE = 7,
+    MOVEMENT_ACK = 8,
+    CORRECTION = 9,
+    INITIAL_STATE = 10,
+    PLAYER_JOINED = 11,
+    PLAYER_LEFT = 12,
 }

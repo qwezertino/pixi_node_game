@@ -19,5 +19,3 @@ const server = Bun.serve({
       },
     websocket: handleWebSocket(),
 });
-//
-console.log(`Server running on http://localhost:${PORT}`, server);

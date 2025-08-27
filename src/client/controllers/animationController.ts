@@ -17,6 +17,7 @@ export class AnimationController {
     private currentState: PlayerState = PlayerState.IDLE;
     private attackAnimationPlaying = false;
     private onAttackEndCallback: (() => void) | null = null;
+    private onAttackStartCallback: (() => void) | null = null;
 
     private playerSprite: AnimatedSprite;
 
@@ -37,7 +38,6 @@ export class AnimationController {
 
     public setState(state: PlayerState) {
         if (this.attackAnimationPlaying && state !== PlayerState.ATTACKING) {
-            // Block state changes while attack animation is playing
             return;
         }
 
@@ -87,8 +87,21 @@ export class AnimationController {
     public onAttackEnd(callback: () => void) {
         this.onAttackEndCallback = callback;
     }
+
+    public onAttackStart(callback: () => void) {
+        this.onAttackStartCallback = callback;
+    }
+
     handleAttack() {
-        if (this.currentState === PlayerState.ATTACKING) return false;
+        if (this.currentState === PlayerState.ATTACKING) {
+            return false;
+        }
+
+        // Вызовем callback начала атаки
+        if (this.onAttackStartCallback) {
+            this.onAttackStartCallback();
+        }
+
         this.setState(PlayerState.ATTACKING);
         return true;
     }

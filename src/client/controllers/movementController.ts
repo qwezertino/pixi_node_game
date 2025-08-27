@@ -1,27 +1,40 @@
 import { Point } from "pixi.js";
 import { InputManager } from "../utils/inputManager";
 import { NetworkManager } from "../network/networkManager";
-import { TICK_RATE } from "../../protocol/messages";
 import { AnimationController, PlayerState } from "./animationController";
 import { CoordinateConverter } from "../utils/coordinateConverter";
 import { MOVEMENT } from "../../common/gameSettings";
 
+/**
+ * Контроллер движения для локального игрока с client-side prediction
+ *
+ * Принцип работы:
+ * 1. При нажатии клавиш определяем вектор движения (-1, 0, 1)
+ * 2. Отправляем вектор движения на сервер
+ * 3. Локально предсказываем движение для плавности (client-side prediction)
+ * 4. Сервер рассчитывает позицию и рассылает обновления
+ * 5. При получении gameState корректируем позицию (server reconciliation)
+ *
+ * Client-side prediction + Server reconciliation = плавное движение без лагов!
+ * Виртуальный мир: 1000x1000 целочисленных единиц
+ * Экран: адаптируется к размеру экрана клиента
+ */
 export class MovementController {
     private _isMoving = false;
     private _scale: Point;
     private _networkManager: NetworkManager | null = null;
     private _animationController: AnimationController | null = null;
-    private _lastMovementVector = { dx: 0, dy: 0 };
     private _coordinateConverter: CoordinateConverter | null = null;
-    private _worldPosition: Point = new Point(0, 0); // Position in world coordinates
 
-    // Client-side prediction state
-    private _predictedPosition: Point;
-    private _confirmedPosition: Point;
-    private _positionHistory: Array<{ position: Point; timestamp: number; inputId: number }> = [];
-    private _currentInputId = 0;
-    private _predictionFrames = 0; // Track prediction frames since last send
-    private _correctionSmoothing = 0.1; // How fast to correct prediction errors
+    private _virtualPosition = { x: 0, y: 0 };
+
+    private _currentMovementVector = { dx: 0, dy: 0 };
+
+    private _inputSequence = 0;
+    private _pendingInputs: Array<{sequence: number, dx: number, dy: number, timestamp: number}> = [];
+
+    // Флаг для отслеживания начала атаки
+    private _attackJustStarted = false;
 
     get isMoving() {
         return this._isMoving;
@@ -31,293 +44,293 @@ export class MovementController {
         return this._scale;
     }
 
+    /**
+     * Получить текущую виртуальную позицию игрока
+     */
+    getVirtualPosition(): { x: number, y: number } {
+        return { ...this._virtualPosition };
+    }
+
+    /**
+     * Применить движение локально (client-side prediction)
+     */
+    private applyMovement(dx: number, dy: number): void {
+        const moveDistance = MOVEMENT.PLAYER_SPEED_PER_TICK;
+
+        if (dx !== 0) {
+            this._virtualPosition.x += dx * moveDistance;
+        }
+        if (dy !== 0) {
+            this._virtualPosition.y += dy * moveDistance;
+        }
+
+        if (this._coordinateConverter) {
+            const clampedPos = this._coordinateConverter.clampToVirtualBounds(
+                this._virtualPosition.x, this._virtualPosition.y
+            );
+            this._virtualPosition.x = clampedPos.x;
+            this._virtualPosition.y = clampedPos.y;
+        }
+
+
+
+        if (this._coordinateConverter) {
+            const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
+            this.position.x = screenPos.x;
+            this.position.y = screenPos.y;
+        }
+    }
+
+    /**
+     * Обработать acknowledgment от сервера (server authoritative confirmation)
+     */
+    handleMovementAcknowledgment(acknowledgedPosition: {x: number, y: number}, inputSequence: number): void {
+        this._pendingInputs = this._pendingInputs.filter(input => input.sequence !== inputSequence);
+
+        const deltaX = acknowledgedPosition.x - this._virtualPosition.x;
+        const deltaY = acknowledgedPosition.y - this._virtualPosition.y;
+        const distanceSquared = deltaX * deltaX + deltaY * deltaY;
+
+        if (distanceSquared > 4) {
+            this.reconcilePosition(acknowledgedPosition, inputSequence);
+        } else if (distanceSquared > 0.25) {
+            const lerpFactor = 0.4;
+            this._virtualPosition.x += deltaX * lerpFactor;
+            this._virtualPosition.y += deltaY * lerpFactor;
+        }
+
+        if (this._coordinateConverter) {
+            const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
+            this.position.x = screenPos.x;
+            this.position.y = screenPos.y;
+        }
+    }
+
+    /**
+     * Пересчет позиции на основе server acknowledgment (server reconciliation)
+     */
+    private reconcilePosition(serverPosition: {x: number, y: number}, lastAckedSequence: number): void {
+
+        this._virtualPosition.x = serverPosition.x;
+        this._virtualPosition.y = serverPosition.y;
+
+        const futureInputs = this._pendingInputs.filter(input => input.sequence > lastAckedSequence);
+
+        if (futureInputs.length > 0) {
+            for (const input of futureInputs) {
+                const moveDistance = MOVEMENT.PLAYER_SPEED_PER_TICK;
+                this._virtualPosition.x += input.dx * moveDistance;
+                this._virtualPosition.y += input.dy * moveDistance;
+
+                if (this._coordinateConverter) {
+                    const clampedPos = this._coordinateConverter.clampToVirtualBounds(
+                        this._virtualPosition.x, this._virtualPosition.y
+                    );
+                    this._virtualPosition.x = clampedPos.x;
+                    this._virtualPosition.y = clampedPos.y;
+                }
+
+            }
+        }
+    }
+
+    /**
+     * Установить виртуальную позицию (для gameState - редкая синхронизация)
+     */
+    setVirtualPosition(x: number, y: number): void {
+        const deltaX = x - this._virtualPosition.x;
+        const deltaY = y - this._virtualPosition.y;
+
+        if (deltaX * deltaX + deltaY * deltaY > 25) {
+            this._virtualPosition.x = x;
+            this._virtualPosition.y = y;
+            this._pendingInputs = [];
+        }
+
+        if (this._coordinateConverter) {
+            const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
+            this.position.x = screenPos.x;
+            this.position.y = screenPos.y;
+        }
+
+        if (this._currentMovementVector) {
+            this._isMoving = this._currentMovementVector.dx !== 0 || this._currentMovementVector.dy !== 0;
+        }
+    }
+
     constructor(
         private input: InputManager,
         private position: Point,
         scale: Point,
     ) {
         this._scale = scale;
-        this._predictedPosition = new Point(position.x, position.y);
-        this._confirmedPosition = new Point(position.x, position.y);
     }
 
-    // Set network manager to enable server communication
     setNetworkManager(networkManager: NetworkManager): void {
         this._networkManager = networkManager;
-
-        // Listen for position corrections from server
-        this._networkManager.onCorrection((correctedPosition) => {
-            this.handleServerCorrection(correctedPosition);
-        });
     }
 
-        setAnimationController(animationController: AnimationController): void {
+    setAnimationController(animationController: AnimationController): void {
         this._animationController = animationController;
-
-        // Listen for attack end to re-send current movement state
-        animationController.onAttackEnd(() => {
-            this.resendCurrentMovement();
-        });
     }
 
     setCoordinateConverter(converter: CoordinateConverter): void {
         this._coordinateConverter = converter;
     }
 
-    private resendCurrentMovement(): void {
-        // Check current input state and force send to server
-        let movementX = 0;
-        let movementY = 0;
-
-        if (this.input.isKeyDown("w")) movementY -= 1;
-        if (this.input.isKeyDown("s")) movementY += 1;
-        if (this.input.isKeyDown("a")) movementX -= 1;
-        if (this.input.isKeyDown("d")) movementX += 1;
-
-        const totalMovement = Math.sqrt(movementX ** 2 + movementY ** 2);
-
-        // Note: Movement sending is handled in the main update() logic
-    }
-
-                update(_deltaTime: number) {
-        this._isMoving = false;
-        let movementX = 0;
-        let movementY = 0;
-
-        // Don't process movement during attacks
+    /**
+     * Основная функция обновления движения с client-side prediction
+     */
+    update(_deltaTime: number) {
         if (this._animationController && this._animationController.playerState === PlayerState.ATTACKING) {
-            return;
+            // Если мы только что начали атаку, отправим стоп-команду серверу
+            if (this._attackJustStarted && this._isMoving) {
+                this.sendStopToServer();
+                this._isMoving = false;
+                this._attackJustStarted = false;
+            }
+            return false;
         }
 
-        if (this.input.isKeyDown("w")) movementY -= 1;
-        if (this.input.isKeyDown("s")) movementY += 1;
-        if (this.input.isKeyDown("a")) movementX -= 1;
-        if (this.input.isKeyDown("d")) movementX += 1;
+        // Сбросим флаг начала атаки, если мы не в состоянии атаки
+        this._attackJustStarted = false;
 
-        // Use INTEGER movement vectors everywhere for consistency
-        if (movementX !== 0 || movementY !== 0) {
-            // Use fixed time step instead of variable deltaTime
-            const fixedTimeStep = 1 / TICK_RATE;
+        const desiredVector = this.getDesiredMovementVector();
 
-            // Apply movement with client-side prediction using INTEGER values
-            // This matches what remote players receive from server
-            // BUT only if we haven't hit prediction limit
-            if (this._predictionFrames < 3) {
-                this.applyMovementPrediction(movementX, movementY, fixedTimeStep);
-                this._predictionFrames++; // Count this prediction frame
-                console.log(`🎮 [CLIENT] New movement prediction: frame ${this._predictionFrames}/3`);
-                this._isMoving = true;
-            } else {
-                console.log(`🚫 [CLIENT] Movement blocked - prediction limit reached (${this._predictionFrames}/3)`);
-                // Don't set _isMoving = true if we're at prediction limit
-                // This prevents further movement until server responds
+        if (desiredVector.dx !== 0 || desiredVector.dy !== 0) {
+            this.applyMovement(desiredVector.dx, desiredVector.dy);
+            this._isMoving = true;
+
+            if (this.vectorChanged(desiredVector)) {
+                this._currentMovementVector = desiredVector;
+
+                this._inputSequence++;
+
+                this._pendingInputs.push({
+                    sequence: this._inputSequence,
+                    dx: desiredVector.dx,
+                    dy: desiredVector.dy,
+                    timestamp: Date.now()
+                });
+
+                if (this._pendingInputs.length > 10) {
+                    this._pendingInputs.shift();
+                }
+
+                this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
             }
 
-            // Send INTEGER directions to server for network protocol
-            if (movementX !== this._lastMovementVector.dx ||
-                movementY !== this._lastMovementVector.dy) {
-
-                this._lastMovementVector.dx = movementX;  // Store raw integers
-                this._lastMovementVector.dy = movementY;
-
-                // Send INTEGER movement to server
-                if (this._networkManager) {
-                    this._currentInputId++;
-                    this._predictionFrames = 0; // Reset prediction counter when sending
-                    this._networkManager.sendMovement(movementX, movementY);
-
-                    // Store position for reconciliation
-                    this.storePositionHistory();
-                }
-            } else {
-                // No movement change, but continue prediction if already moving
-                // LIMIT: Only predict for a few frames to prevent massive desync
-                if (this._isMoving && this._predictionFrames < 3) {
-                    // Apply movement with client-side prediction (limited)
-                    this.applyMovementPrediction(this._lastMovementVector.dx, this._lastMovementVector.dy, fixedTimeStep);
-                    this._predictionFrames++; // Increment prediction counter
-                    console.log(`🔮 [CLIENT] Continue prediction: frame ${this._predictionFrames}/3`);
-                } else if (this._isMoving) {
-                    console.log(`⏸️ [CLIENT] Prediction limit reached, waiting for server`);
-                    // FORCE STOP movement to prevent further prediction
-                    this._isMoving = false;
-                    console.log(`🛑 [CLIENT] FORCED STOP - prediction limit enforced`);
-                }
-            }
-        } else if (this._lastMovementVector.dx !== 0 || this._lastMovementVector.dy !== 0) {
-            // Send stop movement to server AND stop local prediction immediately
-            this._lastMovementVector.dx = 0;
-            this._lastMovementVector.dy = 0;
+            return true;
+        } else {
             this._isMoving = false;
 
-            console.log(`⏸️ [CLIENT] Stopping movement prediction immediately`);
+            if (this.vectorChanged(desiredVector)) {
+                this._currentMovementVector = desiredVector;
 
-            if (this._networkManager) {
-                this._currentInputId++;
-                this._predictionFrames = 0; // Reset prediction counter when stopping
-                this._networkManager.sendMovement(0, 0);
-                this.storePositionHistory();
+                this._inputSequence++;
+
+                this._pendingInputs.push({
+                    sequence: this._inputSequence,
+                    dx: desiredVector.dx,
+                    dy: desiredVector.dy,
+                    timestamp: Date.now()
+                });
+
+                this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
             }
 
-            // CRITICAL: Return immediately to prevent any further processing
-            return this._isMoving;
+            return false;
         }
-
-        // Smooth interpolation between predicted and confirmed positions
-        this.interpolatePosition();
-
-        return this._isMoving;
     }
 
-    updateScale(mouseX: number) {
+    /**
+     * Получить желаемое направление движения из нажатых клавиш
+     */
+    private getDesiredMovementVector(): { dx: number; dy: number } {
+        let dx = 0;
+        let dy = 0;
+
+        if (this.input.isKeyDown("w")) dy = -1;
+        if (this.input.isKeyDown("s")) dy = 1;
+        if (this.input.isKeyDown("a")) dx = -1;
+        if (this.input.isKeyDown("d")) dx = 1;
+
+        return { dx, dy };
+    }
+
+    /**
+     * Проверить, изменился ли вектор движения
+     */
+    private vectorChanged(newVector: { dx: number; dy: number }): boolean {
+        return newVector.dx !== this._currentMovementVector.dx ||
+               newVector.dy !== this._currentMovementVector.dy;
+    }
+
+    /**
+     * Отправить движение на сервер
+     */
+    private sendMovementToServer(dx: number, dy: number, inputSequence: number): void {
+        if (!this._networkManager) return;
+
+        this._networkManager.sendMovement(dx, dy, inputSequence);
+    }
+
+    /**
+     * Отправить стоп-команду на сервер
+     */
+    private sendStopToServer(): void {
+        if (!this._networkManager) return;
+
+        this._inputSequence++;
+        this._networkManager.sendMovement(0, 0, this._inputSequence);
+    }
+
+
+
+    /**
+     * Установить начальную позицию
+     */
+    public setInitialPosition(x: number, y: number): void {
+        this._virtualPosition.x = Math.round(x);
+        this._virtualPosition.y = Math.round(y);
+
+        if (this._coordinateConverter) {
+            const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
+            this.position.x = screenPos.x;
+            this.position.y = screenPos.y;
+        } else {
+            this.position.x = x;
+            this.position.y = y;
+        }
+    }
+
+    /**
+     * Установить флаг начала атаки
+     */
+    public setAttackStarted(): void {
+        this._attackJustStarted = true;
+    }
+
+    /**
+     * Обработчик завершения атаки - отправляем текущее состояние движения серверу
+     */
+    public onAttackEnd(): void {
+        this.sendMovementToServer(this._currentMovementVector.dx, this._currentMovementVector.dy, ++this._inputSequence);
+    }
+
+    /**
+     * Обновить направление спрайта
+     */
+    updateScale(mouseX: number): void {
         const newDirection = mouseX < this.position.x ? -1 : 1;
         const currentDirection = Math.sign(this.scale.x);
 
-        // Only update if direction changed
         if (newDirection !== currentDirection) {
             this.scale.x = mouseX < this.position.x ? -Math.abs(this.scale.x) : Math.abs(this.scale.x);
 
-            // Send direction change to server
             if (this._networkManager) {
                 this._networkManager.sendDirection(newDirection as -1 | 1);
             }
-        }
-    }
-
-    private applyMovementPrediction(dx: number, dy: number, fixedTimeStep: number) {
-        // Use virtual world units for consistency with server
-        const moveDistance = MOVEMENT.PLAYER_SPEED * fixedTimeStep;
-        const prevWorldX = this._worldPosition.x;
-        const prevWorldY = this._worldPosition.y;
-
-        console.log(`🎮 [CLIENT] Movement prediction: dx=${dx}, dy=${dy}, moveDistance=${moveDistance.toFixed(3)}, fixedTimeStep=${fixedTimeStep.toFixed(4)}`);
-
-        // Update world position
-        if (dx !== 0) {
-            this._worldPosition.x += (dx > 0 ? moveDistance : -moveDistance);
-        }
-        if (dy !== 0) {
-            this._worldPosition.y += (dy > 0 ? moveDistance : -moveDistance);
-        }
-
-        // Round to discrete positions to match server
-        this._worldPosition.x = Math.round(this._worldPosition.x);
-        this._worldPosition.y = Math.round(this._worldPosition.y);
-
-        console.log(`🌍 [CLIENT] World position changed: from (${prevWorldX.toFixed(2)}, ${prevWorldY.toFixed(2)}) to discrete (${this._worldPosition.x}, ${this._worldPosition.y})`);
-
-        // Convert world position to screen coordinates for sprite
-        if (this._coordinateConverter) {
-            const screenPos = this._coordinateConverter.worldToScreen(this._worldPosition.x, this._worldPosition.y);
-            this._predictedPosition.x = screenPos.x;
-            this._predictedPosition.y = screenPos.y;
-
-            console.log(`📺 [CLIENT] Screen position: (${screenPos.x.toFixed(2)}, ${screenPos.y.toFixed(2)})`);
-
-            // Update sprite position immediately for responsive controls
-            this.position.x = this._predictedPosition.x;
-            this.position.y = this._predictedPosition.y;
-        }
-    }
-
-    private storePositionHistory() {
-        const historyEntry = {
-            position: new Point(this._predictedPosition.x, this._predictedPosition.y),
-            timestamp: Date.now(),
-            inputId: this._currentInputId
-        };
-
-        this._positionHistory.push(historyEntry);
-
-        // Limit history size to prevent memory issues (keep last 60 entries ~1 second at 60fps)
-        if (this._positionHistory.length > 60) {
-            this._positionHistory.shift();
-        }
-    }
-
-    private handleServerCorrection(correctedPosition: { x: number; y: number }) {
-        // Round server position to discrete coordinates
-        const discreteServerX = Math.round(correctedPosition.x);
-        const discreteServerY = Math.round(correctedPosition.y);
-
-        // Calculate difference between client world position and server position
-        const deltaX = discreteServerX - this._worldPosition.x;
-        const deltaY = discreteServerY - this._worldPosition.y;
-        const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-
-        console.log(`🔄 [CLIENT] Server correction: client world (${this._worldPosition.x}, ${this._worldPosition.y}) -> server discrete (${discreteServerX}, ${discreteServerY}), distance: ${distance.toFixed(2)}`);
-
-                // AGGRESSIVE SERVER AUTHORITY: Always trust server for perfect sync
-        if (distance > 0) {
-            console.log(`⚡ [CLIENT] Server correction: ${distance} units - trusting server completely`);
-            this._worldPosition.x = discreteServerX;
-            this._worldPosition.y = discreteServerY;
-
-            // Reset prediction frames since we got server update
-            this._predictionFrames = 0;
-
-            // Update screen position based on corrected world position
-            if (this._coordinateConverter) {
-                const screenPos = this._coordinateConverter.worldToScreen(this._worldPosition.x, this._worldPosition.y);
-                console.log(`📺 [CLIENT] Server authoritative position: (${screenPos.x.toFixed(2)}, ${screenPos.y.toFixed(2)})`);
-            }
-
-            // If server says we're stopped, stop immediately
-            if (distance > 5) {
-                this._isMoving = false;
-                this._lastMovementVector = { dx: 0, dy: 0 };
-                console.log(`⏸️ [CLIENT] Server correction forced stop`);
-            }
-        }
-
-        // Also update legacy predicted/confirmed positions for compatibility
-        this._confirmedPosition.x = discreteServerX;
-        this._confirmedPosition.y = discreteServerY;
-        this._predictedPosition.x = discreteServerX;
-        this._predictedPosition.y = discreteServerY;
-    }
-
-    private interpolatePosition() {
-        // Smoothly interpolate between predicted and confirmed positions
-        // This helps smooth out any jitter from corrections
-        const lerpFactor = this._correctionSmoothing;
-
-        this.position.x = this._predictedPosition.x * (1 - lerpFactor) + this._confirmedPosition.x * lerpFactor;
-        this.position.y = this._predictedPosition.y * (1 - lerpFactor) + this._confirmedPosition.y * lerpFactor;
-    }
-
-        // Method to set initial position (called when connecting to server)
-    public setInitialPosition(x: number, y: number) {
-        console.log(`🎯 [CLIENT] Setting initial position: server world=(${x.toFixed(2)}, ${y.toFixed(2)})`);
-
-        // Round to discrete coordinates to match server system
-        const discreteX = Math.round(x);
-        const discreteY = Math.round(y);
-        console.log(`🎯 [CLIENT] Rounded to discrete: (${discreteX}, ${discreteY})`);
-
-        // Server sends world coordinates, store them and convert to screen
-        this._worldPosition.x = discreteX;
-        this._worldPosition.y = discreteY;
-
-        if (this._coordinateConverter) {
-            const screenPos = this._coordinateConverter.worldToScreen(discreteX, discreteY);
-            console.log(`📺 [CLIENT] Initial screen position: discrete world (${discreteX}, ${discreteY}) -> screen (${screenPos.x.toFixed(2)}, ${screenPos.y.toFixed(2)})`);
-
-            this.position.x = screenPos.x;
-            this.position.y = screenPos.y;
-            this._predictedPosition.x = screenPos.x;
-            this._predictedPosition.y = screenPos.y;
-            this._confirmedPosition.x = screenPos.x;
-            this._confirmedPosition.y = screenPos.y;
-        } else {
-            // Fallback if no converter set yet
-            console.log(`⚠️ [CLIENT] No coordinate converter, using raw discrete coordinates (${discreteX}, ${discreteY})`);
-            this.position.x = discreteX;
-            this.position.y = discreteY;
-            this._predictedPosition.x = discreteX;
-            this._predictedPosition.y = discreteY;
-            this._confirmedPosition.x = discreteX;
-            this._confirmedPosition.y = discreteY;
         }
     }
 }

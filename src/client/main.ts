@@ -35,6 +35,7 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     const networkManager = new NetworkManager();
 
     // Setup coordinate converter for virtual world coordinates
+    // Используем реальные размеры экрана приложения
     const coordinateConverter = new CoordinateConverter(app.screen.width, app.screen.height);
 
     // Setup player manager BEFORE connecting to handle initialState
@@ -48,14 +49,25 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     playerSprite.animationSpeed = PLAYER.ANIMATION_SPEED; // Используем настройки из gameSettings
     playerSprite.play();
 
-    // Set initial player position at world center (will be updated when connected to server)
-    const worldCenter = coordinateConverter.getWorldCenter();
-    const screenCenter = coordinateConverter.worldToScreen(worldCenter.x, worldCenter.y);
+    // Set initial player position at virtual world center (will be updated when connected to server)
+    const virtualCenter = coordinateConverter.getVirtualCenter();
+    const screenCenter = coordinateConverter.virtualToScreen(virtualCenter.x, virtualCenter.y);
     playerSprite.position.set(screenCenter.x, screenCenter.y);
     playerContainer.addChild(playerSprite);
 
     const animationController = new AnimationController(characterVisual.animations, playerSprite);
     const movementController = new MovementController(input, playerSprite.position, playerSprite.scale);
+
+    // Обработчик начала атаки - сообщаем MovementController
+    animationController.onAttackStart(() => {
+        movementController.setAttackStarted();
+    });
+
+    // Обработчик окончания атаки - отправляем текущее состояние движения на сервер
+    animationController.onAttackEnd(() => {
+        movementController.onAttackEnd();
+        networkManager.sendAttackEnd();
+    });
 
     // Connect movement controller to network manager, animation controller, and coordinate converter
     movementController.setNetworkManager(networkManager);
@@ -64,6 +76,32 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
     // Connect player manager to movement controller for server corrections
     playerManager.setMovementController(movementController);
+
+    // Connect network manager to movement controller for movement acknowledgments
+    networkManager.onMovementAck((position, inputSequence) => {
+        movementController.handleMovementAcknowledgment(position, inputSequence);
+    });
+
+    // Обработчик изменения размеров окна
+    const handleResize = () => {
+        const newWidth = app.screen.width;
+        const newHeight = app.screen.height;
+
+        // Обновляем размеры в coordinate converter
+        coordinateConverter.updateScreenSize(newWidth, newHeight);
+
+        // Обновляем позиции всех игроков
+        playerManager.updateAllPlayerPositions();
+    };
+
+    // Добавляем обработчик изменения размеров окна
+    window.addEventListener('resize', handleResize);
+
+    // Также добавляем обработчик изменения ориентации устройства
+    window.addEventListener('orientationchange', () => {
+        // Небольшая задержка для корректного определения новых размеров
+        setTimeout(handleResize, 100);
+    });
 
     // Wait for network connection and initial position
     await new Promise<void>((resolve) => {

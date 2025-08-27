@@ -20,8 +20,6 @@ export function handleWebSocket() {
             const playerId = uuidv4();
             ws.data = { playerId };
 
-            console.log(`New player connected: ${playerId}`);
-
             // Get existing players before adding the new one
             const existingPlayers = gameWorld.getAllPlayersState();
 
@@ -54,8 +52,8 @@ export function handleWebSocket() {
                         switch (decodedMsg.type) {
                             case 'move':
                                 const { dx, dy } = decodedMsg.movementVector;
-                                console.log(`📨 [SERVER] Received movement from ${playerId}: dx=${dx}, dy=${dy}`);
-                                gameWorld.updatePlayerMovement(playerId, dx, dy);
+                                const inputSequence = decodedMsg.inputSequence || 0;
+                                gameWorld.updatePlayerMovement(playerId, dx, dy, inputSequence);
                                 break;
 
                             case 'direction':
@@ -63,7 +61,11 @@ export function handleWebSocket() {
                                 break;
 
                             case 'attack':
-                                gameWorld.handlePlayerAttack(playerId, decodedMsg.position);
+                                gameWorld.handlePlayerAttack(playerId);
+                                break;
+
+                            case 'attackEnd':
+                                gameWorld.handleAttackEnd(playerId);
                                 break;
                         }
                     }
@@ -92,11 +94,10 @@ export function handleWebSocket() {
                             break;
 
                         default:
-                            console.log(`Unknown message type: ${data.type}`);
+                            break;
                     }
                 }
             } catch (error) {
-                console.error(`Error processing message from player ${playerId}:`, error);
                 // Consider sending a correction on error
                 gameWorld.sendCorrectionToPlayer(playerId);
             }
@@ -105,7 +106,6 @@ export function handleWebSocket() {
         // Client disconnected
         close(ws: ServerWebSocket<WebSocketData>) {
             const playerId = ws.data.playerId;
-            console.log(`Player disconnected: ${playerId}`);
 
             // Remove player from game world
             gameWorld.removePlayer(playerId);

@@ -17,6 +17,7 @@ export type OnGameStateCallback = (
     players: Record<string, PlayerState>
 ) => void;
 export type OnCorrectionCallback = (position: PlayerPosition) => void;
+export type OnMovementAckCallback = (position: PlayerPosition, inputSequence: number) => void;
 export type OnPlayerAttackCallback = (
     playerId: string,
     position: PlayerPosition
@@ -35,6 +36,7 @@ export class NetworkManager {
     private onPlayerDirectionCallbacks: OnPlayerDirectionCallback[] = [];
     private onGameStateCallbacks: OnGameStateCallback[] = [];
     private onCorrectionCallbacks: OnCorrectionCallback[] = [];
+    private onMovementAckCallbacks: OnMovementAckCallback[] = [];
     private onPlayerAttackCallbacks: OnPlayerAttackCallback[] = [];
 
     constructor() {
@@ -49,7 +51,7 @@ export class NetworkManager {
     private setupSocketEvents() {
         // Connection established
         this.socket.addEventListener("open", () => {
-            console.log("Connected to game server");
+
             // We'll automatically receive initial state from server
         });
 
@@ -66,18 +68,17 @@ export class NetworkManager {
 
                 this.handleServerMessage(processedData);
             } catch (error) {
-                console.error("Error processing WebSocket message:", error);
+
             }
         });
 
         // Connection closed
         this.socket.addEventListener("close", () => {
-            console.log("Disconnected from game server");
+
         });
 
         // Connection error
-        this.socket.addEventListener("error", (error) => {
-            console.error("WebSocket error:", error);
+        this.socket.addEventListener("error", () => {
         });
     }
 
@@ -90,14 +91,8 @@ export class NetworkManager {
                 );
 
                 if (!message) {
-                    console.warn("Failed to decode binary message");
                     return;
                 }
-
-                // Debug logging for movement data from other players only
-                // if (message.type === 'playerMovement' && message.playerId !== this.playerId) {
-                //     console.log(`📨 Received movement: dx=${message.movementVector?.dx}, dy=${message.movementVector?.dy}`);
-                // }
 
                 switch (message.type) {
                     case "playerMovement":
@@ -130,21 +125,9 @@ export class NetworkManager {
                         break;
 
                     case "initialState":
-                        console.log(
-                            `Received initialState: myId=${
-                                message.player.id
-                            }, otherPlayers=${
-                                Object.keys(message.players).length
-                            }`
-                        );
                         this.playerId = message.player.id;
                         this.initialPosition = message.player.position;
                         this.players = message.players;
-
-                        // Log other players
-                        Object.keys(message.players).forEach((id) => {
-                            console.log(`Other player in initialState: ${id}`);
-                        });
 
                         // Notify about initial game state
                         this.onGameStateCallbacks.forEach((callback) =>
@@ -167,15 +150,18 @@ export class NetworkManager {
                         break;
 
                     case "gameState":
-                        console.log(`🌍 [CLIENT] Received gameState with ${Object.keys(message.players).length} players`);
-                        for (const [playerId, playerState] of Object.entries(message.players)) {
-                            const typedPlayerState = playerState as PlayerState;
-                            console.log(`📥 [CLIENT] GameState player ${playerId}: discrete pos=(${typedPlayerState.position.x}, ${typedPlayerState.position.y}), moving=${typedPlayerState.moving}`);
-                        }
                         this.players = message.players;
                         this.onGameStateCallbacks.forEach((callback) =>
                             callback(message.players)
                         );
+                        break;
+
+                    case "movementAck":
+                        if (message.playerId === this.playerId) {
+                            this.onMovementAckCallbacks.forEach((callback) =>
+                                callback(message.acknowledgedPosition, message.inputSequence)
+                            );
+                        }
                         break;
 
                     case "correction":
@@ -193,43 +179,8 @@ export class NetworkManager {
                         break;
                 }
             }
-            // Handle JSON message (for backward compatibility, may be removed later)
-            else {
-                // Skip if empty or non-string
-                if (typeof data !== "string" || !data) {
-                    console.debug("Ignoring empty message");
-                    return;
-                }
-
-                // Skip ping messages
-                if (data === "ping") {
-                    console.debug("Ignoring ping message");
-                    return;
-                }
-
-                try {
-                    console.warn(
-                        "Received JSON message - should be migrated to binary:",
-                        data.substring(0, 50)
-                    );
-                    const message = JSON.parse(data);
-
-                    if (!message.type) {
-                        console.warn("Received message without type:", message);
-                        return;
-                    }
-
-                    console.warn(
-                        "JSON message type should be migrated to binary:",
-                        message.type
-                    );
-                } catch (parseError) {
-                    console.error("Failed to parse JSON:", parseError);
-                    console.error("Raw data causing the error:", data);
-                }
-            }
         } catch (error) {
-            console.error("Error processing server message:", error);
+            // Handle any errors in message processing
         }
     }
 
@@ -258,19 +209,22 @@ export class NetworkManager {
         this.onCorrectionCallbacks.push(callback);
     }
 
+    public onMovementAck(callback: OnMovementAckCallback): void {
+        this.onMovementAckCallbacks.push(callback);
+    }
+
     public onPlayerAttack(callback: OnPlayerAttackCallback): void {
         this.onPlayerAttackCallbacks.push(callback);
     }
 
     // Send movement to server
-    public sendMovement(dx: number, dy: number): void {
+    public sendMovement(dx: number, dy: number, inputSequence?: number): void {
         if (this.socket.readyState !== WebSocket.OPEN) return;
-
-        console.log(`📤 [CLIENT] Sending movement: dx=${dx}, dy=${dy}`);
 
         const moveMsg = {
             type: "move" as const,
             movementVector: { dx, dy },
+            inputSequence: inputSequence || 0,
         };
 
         // Use binary protocol for frequent updates
@@ -295,6 +249,14 @@ export class NetworkManager {
     // Send attack to server
     public sendAttack(binaryData: Uint8Array): void {
         if (this.socket.readyState !== WebSocket.OPEN) return;
+        this.socket.send(binaryData);
+    }
+
+    // Send attack end to server
+    public sendAttackEnd(): void {
+        if (this.socket.readyState !== WebSocket.OPEN) return;
+
+        const binaryData = BinaryProtocol.encodeAttackEnd();
         this.socket.send(binaryData);
     }
 
