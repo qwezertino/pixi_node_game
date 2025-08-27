@@ -327,6 +327,34 @@ export class BinaryProtocol {
     }
 
     private static decodeMove(data: Uint8Array, view: DataView) {
+        // Check if this is a server message (has playerId) or client message
+        if (data.length > 6 && data[1] > 0 && data[1] < 256) {
+            // Server message (player movement) - has playerId after message type
+            const { playerId, newOffset } = this.decodePlayerId(data, 1);
+
+            if (data.length === newOffset + 1) {
+                // Optimized server message with packed movement
+                const packed = view.getUint8(newOffset);
+                const movement = this.unpackMovement(packed);
+                return {
+                    type: "playerMovement",
+                    playerId,
+                    movementVector: movement,
+                };
+            } else if (data.length === newOffset + 8) {
+                // Legacy server message with float32 movement
+                return {
+                    type: "playerMovement",
+                    playerId,
+                    movementVector: {
+                        dx: view.getFloat32(newOffset, true),
+                        dy: view.getFloat32(newOffset + 4, true),
+                    },
+                };
+            }
+        }
+
+        // Client messages
         if (data.length === 2) {
             // Optimized client message (legacy)
             const packed = view.getUint8(1);
@@ -346,30 +374,7 @@ export class BinaryProtocol {
                 movementVector: movement,
                 inputSequence,
             };
-        } else if (data.length >= 9) {
-            // Server message (player movement)
-            const { playerId, newOffset } = this.decodePlayerId(data, 1);
-            if (data.length === 3 + (newOffset - 1)) {
-                // Optimized server message
-                const packed = view.getUint8(newOffset);
-                const movement = this.unpackMovement(packed);
-                return {
-                    type: "playerMovement",
-                    playerId,
-                    movementVector: movement,
-                };
-            } else {
-                // Legacy server message
-                return {
-                    type: "playerMovement",
-                    playerId,
-                    movementVector: {
-                        dx: view.getFloat32(newOffset, true),
-                        dy: view.getFloat32(newOffset + 4, true),
-                    },
-                };
-            }
-        } else {
+        } else if (data.length === 9) {
             // Legacy client message
             return {
                 type: "move",
@@ -380,17 +385,14 @@ export class BinaryProtocol {
                 inputSequence: 0,
             };
         }
+
+        return null;
     }
 
     private static decodeDirection(data: Uint8Array, view: DataView) {
-        if (data.length === 2) {
-            // Client message
-            return {
-                type: "direction",
-                direction: view.getInt8(1) as -1 | 1,
-            };
-        } else {
-            // Server message
+        // Check if this is a server message (has playerId) or client message
+        if (data.length > 2 && data[1] > 0 && data[1] < 256) {
+            // Server message (player direction) - has playerId after message type
             const { playerId, newOffset } = this.decodePlayerId(data, 1);
             return {
                 type: "playerDirection",
@@ -398,20 +400,22 @@ export class BinaryProtocol {
                 direction: view.getInt8(newOffset) as -1 | 1,
             };
         }
+
+        // Client message
+        if (data.length === 2) {
+            return {
+                type: "direction",
+                direction: view.getInt8(1) as -1 | 1,
+            };
+        }
+
+        return null;
     }
 
     private static decodeAttack(data: Uint8Array, view: DataView) {
-        if (data.length === 9) {
-            // Client message
-            return {
-                type: "attack",
-                position: {
-                    x: view.getFloat32(1, true),
-                    y: view.getFloat32(5, true),
-                },
-            };
-        } else {
-            // Server message
+        // Check if this is a server message (has playerId) or client message
+        if (data.length > 9 && data[1] > 0 && data[1] < 256) {
+            // Server message (player attack) - has playerId after message type
             const { playerId, newOffset } = this.decodePlayerId(data, 1);
             return {
                 type: "playerAttack",
@@ -422,6 +426,19 @@ export class BinaryProtocol {
                 },
             };
         }
+
+        // Client message
+        if (data.length === 9) {
+            return {
+                type: "attack",
+                position: {
+                    x: view.getFloat32(1, true),
+                    y: view.getFloat32(5, true),
+                },
+            };
+        }
+
+        return null;
     }
 
     private static decodeAttackEnd() {
