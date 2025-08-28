@@ -28,11 +28,21 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     app.stage.addChild(playerContainer);
 
     // Initialize modules
-    const fpsDisplay = new FpsDisplay(app);
     const input = new InputManager(app.canvas);
 
     // Create NetworkManager but don't connect yet
     const networkManager = new NetworkManager();
+
+    // Initialize FPS display with network manager
+    const fpsDisplay = new FpsDisplay(app, networkManager);
+
+    // Connect FPS display to network manager for ping tracking
+    networkManager.setFpsDisplay(fpsDisplay);
+
+    // Set up F3 key to toggle detailed stats
+    input.setF3Callback(() => {
+        fpsDisplay.toggleDetailedStats();
+    });
 
     // Setup coordinate converter for virtual world coordinates
     // Используем реальные размеры экрана приложения
@@ -97,11 +107,6 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     // Добавляем обработчик изменения размеров окна
     window.addEventListener('resize', handleResize);
 
-    // Также добавляем обработчик изменения ориентации устройства
-    window.addEventListener('orientationchange', () => {
-        // Небольшая задержка для корректного определения новых размеров
-        setTimeout(handleResize, 100);
-    });
 
     // Wait for network connection and initial position
     await new Promise<void>((resolve) => {
@@ -147,7 +152,6 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     // Game loop
     app.ticker.add((time) => {
         const deltaTime = time.deltaTime / 60; // Convert to seconds
-
         // Update FPS display
         fpsDisplay.update();
 

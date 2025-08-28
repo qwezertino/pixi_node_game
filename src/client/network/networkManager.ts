@@ -39,6 +39,9 @@ export class NetworkManager {
     private onMovementAckCallbacks: OnMovementAckCallback[] = [];
     private onPlayerAttackCallbacks: OnPlayerAttackCallback[] = [];
 
+    // Reference to FPS display for ping tracking
+    private fpsDisplay: any = null;
+
     constructor() {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const host = "localhost:8108"; // Change to window.location.host in production
@@ -68,7 +71,7 @@ export class NetworkManager {
 
                 this.handleServerMessage(processedData);
             } catch (error) {
-
+                console.error("Error processing server message:", error);
             }
         });
 
@@ -227,6 +230,11 @@ export class NetworkManager {
             inputSequence: inputSequence || 0,
         };
 
+        // Track ping if FPS display is available
+        if (this.fpsDisplay && inputSequence !== undefined) {
+            this.fpsDisplay.trackMovementSend(inputSequence);
+        }
+
         // Use binary protocol for frequent updates
         const binaryData = BinaryProtocol.encodeMove(moveMsg);
         this.socket.send(binaryData);
@@ -273,5 +281,10 @@ export class NetworkManager {
     // Get all players
     public getPlayers(): Record<string, PlayerState> {
         return this.players;
+    }
+
+    // Set FPS display reference for ping tracking
+    public setFpsDisplay(fpsDisplay: any) {
+        this.fpsDisplay = fpsDisplay;
     }
 }

@@ -1,0 +1,47 @@
+config:
+  target: 'ws://localhost:8108/ws'
+  phases:
+    # ТЕСТ ~100 КЛИЕНТОВ
+    - duration: 60
+      arrivalRate: 2  # 2 клиента/сек × 60 сек = 120 клиентов
+      name: "Test ~100 clients"
+
+    # ТЕСТ ~500 КЛИЕНТОВ
+    - duration: 60
+      arrivalRate: 8  # 8 клиентов/сек × 60 сек = 480 клиентов
+      name: "Test ~500 clients"
+
+    # ТЕСТ ~1000 КЛИЕНТОВ
+    - duration: 60
+      arrivalRate: 17  # 17 клиентов/сек × 60 сек = 1020 клиентов
+      name: "Test ~1000 clients"
+
+    # ТЕСТ ~10000 КЛИЕНТОВ
+    - duration: 60
+      arrivalRate: 167  # 167 клиентов/сек × 60 сек = 10020 клиентов
+      name: "Test ~10000 clients"
+
+scenarios:
+  - name: "Game Client Simulation"
+    engine: "ws"
+    flow:
+      - think: 2
+      - loop:
+          - send: '{"type": "move", "movementVector": {"dx": 1, "dy": 0}, "inputSequence": 1}'
+          - think: 0.1
+          - send: '{"type": "move", "movementVector": {"dx": 0, "dy": 1}, "inputSequence": 2}'
+          - think: 0.1
+          - send: '{"type": "move", "movementVector": {"dx": -1, "dy": 0}, "inputSequence": 3}'
+          - think: 0.1
+          - send: '{"type": "move", "movementVector": {"dx": 0, "dy": -1}, "inputSequence": 4}'
+          - think: 0.1
+        count: 10  # 10 циклов движения (~4 сек)
+      - loop:
+          - send: '{"type": "attack"}'
+          - think: 2
+        count: 10  # 10 атак (~20 сек)
+      - loop:
+          - send: '{"type": "move", "movementVector": {"dx": 0, "dy": 0}, "inputSequence": 999}'
+          - think: 1
+        count: 34  # 34 итерации × 1 сек = 34 сек, итого ~60 сек (2 + 4 + 20 + 34)
+      - close: {}  # Явно закрываем соединение

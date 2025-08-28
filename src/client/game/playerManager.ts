@@ -8,6 +8,7 @@ import {
 } from "../controllers/animationController";
 import { PLAYER, MOVEMENT } from "../../common/gameSettings";
 import { CoordinateConverter } from "../utils/coordinateConverter";
+//import { LagCompensationSystem } from "../utils/lagCompensation";
 
 // Тип для результата SpriteLoader.loadCharacterVisual после await
 type CharacterVisual = {
