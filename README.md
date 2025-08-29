@@ -155,7 +155,7 @@ Located in `src/protocol/`:
 
 ## 🚀 Performance Benchmarks
 
-- **Concurrent Players**: Tested with 1000+ connections
+- **Concurrent Players**: Tested with 10000+ connections
 - **Tick Rate**: 60Hz server simulation
 - **Latency**: <50ms round-trip for local networks
 - **Bandwidth**: <10KB/s per player with optimizations
