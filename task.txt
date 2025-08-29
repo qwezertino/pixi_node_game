@@ -3,7 +3,7 @@
 Create a simple 2D game with the following networking capabilities:
 Scan all current project files and only then do all below
 
-1. Support for 1000+ concurrent players
+1. Support for 10000+ concurrent players
 2. Multi-threading for handling concurrency
 3. Lag compensation and interpolation for smooth gameplay
 4. Responsive movement and attacks with no perceived delay

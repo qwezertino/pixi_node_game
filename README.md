@@ -1,10 +1,10 @@
 # pixi_node_game
 
-A high-performance multiplayer 2D game built with Pixi.js and Bun.js, designed to handle 1000+ concurrent players with optimized networking and rendering.
+A high-performance multiplayer 2D game built with Pixi.js and Bun.js, designed to handle 10000+ concurrent players with optimized networking and rendering.
 
 ## 🚀 Features
 
-- **High Concurrency**: Supports 1000+ simultaneous players
+- **High Concurrency**: Supports 10000+ simultaneous players
 - **Real-time Networking**: WebSocket-based communication with binary protocol
 - **Smooth Gameplay**: 60Hz tick rate with lag compensation and interpolation
 - **Efficient Rendering**: Pixi.js WebGL rendering with sprite animation system
