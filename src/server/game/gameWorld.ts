@@ -2,8 +2,7 @@ import { ServerWebSocket } from "bun";
 import {
     PlayerState,
     PlayerPosition,
-    TICK_RATE,
-    SYNC_INTERVAL
+    TICK_RATE
 } from "../../protocol/messages";
 import { BinaryProtocol } from "../../protocol/binaryProtocol";
 import { WORLD, MOVEMENT, NETWORK } from "../../common/gameSettings";
@@ -31,6 +30,7 @@ export class GameWorld {
         // setInterval(() => {
         //     this.sendFullSync();
         // }, SYNC_INTERVAL);
+        //SYNC_INTERVAL
     }
 
     private startBatchedUpdates() {
