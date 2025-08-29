@@ -1,3 +1,69 @@
+// Binary protocol constants and helpers
+const MessageType = {
+  JOIN: 1,
+  LEAVE: 2,
+  MOVE: 3,
+  DIRECTION: 4,
+  ATTACK: 5,
+  ATTACK_END: 6,
+  GAME_STATE: 7,
+  MOVEMENT_ACK: 8,
+  CORRECTION: 9,
+  INITIAL_STATE: 10,
+  PLAYER_JOINED: 11,
+  PLAYER_LEFT: 12,
+};
+
+// Binary encoding helpers
+function packMovement(dx, dy) {
+  let packed = 0;
+  packed |= (dx + 1) & 0x03; // dx: -1->0, 0->1, 1->2 (2 bits)
+  packed |= ((dy + 1) & 0x03) << 2; // dy: same, shifted 2 bits
+  return packed;
+}
+
+// Encode binary move message
+function encodeMove(movementVector, inputSequence) {
+  const buffer = new ArrayBuffer(6);
+  const view = new DataView(buffer);
+  view.setUint8(0, MessageType.MOVE);
+
+  const dx = Math.sign(movementVector.dx) || 0;
+  const dy = Math.sign(movementVector.dy) || 0;
+  const packed = packMovement(dx, dy);
+
+  view.setUint8(1, packed);
+  view.setUint32(2, inputSequence, true);
+  return new Uint8Array(buffer);
+}
+
+// Encode binary direction message
+function encodeDirection(direction) {
+  const buffer = new ArrayBuffer(2);
+  const view = new DataView(buffer);
+  view.setUint8(0, MessageType.DIRECTION);
+  view.setInt8(1, direction);
+  return new Uint8Array(buffer);
+}
+
+// Encode binary attack message
+function encodeAttack(position) {
+  const buffer = new ArrayBuffer(9);
+  const view = new DataView(buffer);
+  view.setUint8(0, MessageType.ATTACK);
+  view.setFloat32(1, position.x, true);
+  view.setFloat32(5, position.y, true);
+  return new Uint8Array(buffer);
+}
+
+// Encode binary attack end message
+function encodeAttackEnd() {
+  const buffer = new ArrayBuffer(1);
+  const view = new DataView(buffer);
+  view.setUint8(0, MessageType.ATTACK_END);
+  return new Uint8Array(buffer);
+}
+
 module.exports = {
   // Initialize client with proper state tracking
   initializeClient: function(context, events, done) {
@@ -16,76 +82,69 @@ module.exports = {
     return done();
   },
 
-  // Generate realistic movement with proper input sequence
-  generateMovement: function(context, events, done) {
+  // Generate and send movement message directly
+  generateAndSendMovement: function(context, events, done) {
     // Don't send movement if recently attacked
+    let movement;
     if (context.vars.attacking && Date.now() - context.vars.lastAttackTime < 500) {
-      context.vars.movementMessage = JSON.stringify({
-        type: "move",
-        movementVector: { dx: 0, dy: 0 },
-        inputSequence: context.vars.inputSequence++
-      });
-      return done();
+      movement = { dx: 0, dy: 0 };
+    } else {
+      // Generate realistic movement patterns
+      const patterns = [
+        { dx: 1, dy: 0 },   // Right
+        { dx: -1, dy: 0 },  // Left
+        { dx: 0, dy: 1 },   // Down
+        { dx: 0, dy: -1 },  // Up
+        { dx: 1, dy: 1 },   // Diagonal
+        { dx: -1, dy: -1 }, // Diagonal
+        { dx: 0, dy: 0 }    // Stop (realistic for games)
+      ];
+      movement = patterns[Math.floor(Math.random() * patterns.length)];
     }
 
-    // Generate realistic movement patterns
-    const patterns = [
-      { dx: 1, dy: 0 },   // Right
-      { dx: -1, dy: 0 },  // Left
-      { dx: 0, dy: 1 },   // Down
-      { dx: 0, dy: -1 },  // Up
-      { dx: 1, dy: 1 },   // Diagonal
-      { dx: -1, dy: -1 }, // Diagonal
-      { dx: 0, dy: 0 }    // Stop (realistic for games)
-    ];
+    // Encode as binary and send directly
+    const binaryMessage = encodeMove(movement, context.vars.inputSequence++);
 
-    const movement = patterns[Math.floor(Math.random() * patterns.length)];
+    if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
+      context.ws.send(binaryMessage);
+      context.vars.messagesSent++;
+    }
 
-    context.vars.movementMessage = JSON.stringify({
-      type: "move",
-      movementVector: movement,
-      inputSequence: context.vars.inputSequence++,
-      timestamp: Date.now()
-    });
-
-    context.vars.messagesSent++;
     return done();
   },
 
-  // Change direction occasionally (not every frame)
-  maybeChangeDirection: function(context, events, done) {
+  // Maybe change direction and send directly
+  maybeChangeAndSendDirection: function(context, events, done) {
     // Only change direction 15% of the time
     if (Math.random() > 0.15) {
-      context.vars.directionMessage = null;
-      return done();
+      return done(); // Skip sending
     }
 
     context.vars.direction = context.vars.direction === 1 ? -1 : 1;
 
-    context.vars.directionMessage = JSON.stringify({
-      type: "direction",
-      direction: context.vars.direction,
-      timestamp: Date.now()
-    });
+    // Encode as binary and send directly
+    const binaryMessage = encodeDirection(context.vars.direction);
 
-    context.vars.messagesSent++;
+    if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
+      context.ws.send(binaryMessage);
+      context.vars.messagesSent++;
+    }
+
     return done();
   },
 
-  // Attack with realistic frequency and cooldown
-  maybeAttack: function(context, events, done) {
+  // Maybe attack and send directly
+  maybeAttackAndSend: function(context, events, done) {
     const now = Date.now();
 
     // Attack cooldown of 2 seconds minimum
     if (context.vars.attacking || (now - context.vars.lastAttackTime) < 2000) {
-      context.vars.attackMessage = null;
-      return done();
+      return done(); // Skip sending
     }
 
     // Only attack 5% of the time when not on cooldown
     if (Math.random() > 0.05) {
-      context.vars.attackMessage = null;
-      return done();
+      return done(); // Skip sending
     }
 
     context.vars.attacking = true;
@@ -95,38 +154,42 @@ module.exports = {
     const attackX = context.vars.position.x + (Math.random() - 0.5) * 100;
     const attackY = context.vars.position.y + (Math.random() - 0.5) * 100;
 
-    context.vars.attackMessage = JSON.stringify({
-      type: "attack",
-      position: { x: Math.floor(attackX), y: Math.floor(attackY) },
-      timestamp: now
+    // Encode as binary and send directly
+    const binaryMessage = encodeAttack({
+      x: Math.floor(attackX),
+      y: Math.floor(attackY)
     });
 
-    context.vars.messagesSent++;
+    if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
+      context.ws.send(binaryMessage);
+      context.vars.messagesSent++;
+    }
+
     return done();
   },
 
-  // End attack after realistic duration
-  maybeAttackEnd: function(context, events, done) {
+  // Maybe end attack and send directly
+  maybeAttackEndAndSend: function(context, events, done) {
     if (!context.vars.attacking) {
-      context.vars.attackEndMessage = null;
-      return done();
+      return done(); // Skip sending
     }
 
     // End attack after 200-500ms
     const attackDuration = Date.now() - context.vars.lastAttackTime;
     if (attackDuration < 200) {
-      context.vars.attackEndMessage = null;
-      return done();
+      return done(); // Skip sending
     }
 
     context.vars.attacking = false;
 
-    context.vars.attackEndMessage = JSON.stringify({
-      type: "attackEnd",
-      timestamp: Date.now()
-    });
+    // Encode as binary and send directly
+    const binaryMessage = encodeAttackEnd();
 
-    context.vars.messagesSent++;
+    if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
+      context.ws.send(binaryMessage);
+      context.vars.messagesSent++;
+    }
+
     return done();
   },
 

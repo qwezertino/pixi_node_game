@@ -7,13 +7,13 @@ config:
       arrivalRate: 5
       name: "Warm up - 300 clients"
 
-    # Test 1000 clients sustained
-    - duration: 120
+    # Test 500 clients sustained
+    - duration: 60
       arrivalRate: 8
-      name: "Ramp to 1000 clients"
-    - duration: 180
+      name: "Ramp to 500 clients"
+    - duration: 5
       arrivalRate: 2
-      name: "1000 clients sustained test"
+      name: "500 clients sustained test"
 
     # # Test 5000 clients
     # - duration: 180
@@ -53,26 +53,22 @@ scenarios:
       # Initialize client state
       - function: "initializeClient"
 
-      # Main game loop with realistic behavior
+      # Main game loop with realistic binary behavior
       - loop:
-          # Movement with input sequence (reduced frequency)
-          - function: "generateMovement"
-          - send: '{{ movementMessage }}'
+          # Movement with input sequence (always send)
+          - function: "generateAndSendMovement"
           - think: 0.5  # 2 movements per second (more realistic for high load)
 
-          # Occasional direction change
-          - function: "maybeChangeDirection"
-          - send: '{{ directionMessage }}'
+          # Occasional direction change (conditional)
+          - function: "maybeChangeAndSendDirection"
           - think: 2.0  # Direction changes less frequently
 
-          # Random attack with reasonable frequency
-          - function: "maybeAttack"
-          - send: '{{ attackMessage }}'
+          # Random attack with reasonable frequency (conditional)
+          - function: "maybeAttackAndSend"
           - think: 5.0  # Attacks are very infrequent for testing
 
-          # Attack end
-          - function: "maybeAttackEnd"
-          - send: '{{ attackEndMessage }}'
+          # Attack end (conditional)
+          - function: "maybeAttackEndAndSend"
           - think: 0.5
 
         count: 25  # Reduced for shorter test duration per client

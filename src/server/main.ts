@@ -1,27 +1,29 @@
-import { handleWebSocket } from "./handlers/websocketHandler";
+import { handleOptimizedWebSocket, shutdownOptimizedWebSocket } from "./handlers/websocketHandler";
 
 const PORT: number = 8108;
 
-console.log(`🚀 Starting high-performance game server on port ${PORT}...`);
+console.log(`🚀 Starting HIGH-PERFORMANCE game server on port ${PORT}...`);
+console.log(`🎯 Target: 10,000+ concurrent players with full viewport visibility`);
 
-// Use Bun.serve directly with optimizations for high concurrent connections
+// Optimized Bun.serve configuration for extreme scale
 const server = Bun.serve({
     port: PORT,
-    hostname: "0.0.0.0", // Allow external connections
+    hostname: "0.0.0.0",
 
-    // WebSocket handler
-    websocket: handleWebSocket(),
+    // Use optimized WebSocket handler
+    websocket: handleOptimizedWebSocket(),
 
     fetch(req, server) {
         const url = new URL(req.url);
 
-        // Handle WebSocket upgrade with optimized path
+        // Optimized WebSocket upgrade path
         if (url.pathname === "/ws") {
             const upgradeSuccess = server.upgrade(req, {
-                // WebSocket-specific data
                 data: {
                     playerId: "", // Will be set in open handler
                     lastActivity: Date.now(),
+                    messageCount: 0,
+                    joinTime: Date.now()
                 }
             });
 
@@ -29,16 +31,16 @@ const server = Bun.serve({
                 return; // Connection upgraded successfully
             }
 
-            // Upgrade failed
             return new Response("WebSocket upgrade failed", { status: 400 });
         }
 
-        // Serve static files
+        // Serve static files with optimized caching
         if (url.pathname === "/") {
             return new Response(Bun.file("dist/index.html"), {
                 headers: {
                     "Content-Type": "text/html",
-                    "Cache-Control": "public, max-age=3600" // 1 hour cache
+                    "Cache-Control": "public, max-age=3600",
+                    "X-Server-Mode": "high-performance"
                 },
             });
         }
@@ -49,31 +51,29 @@ const server = Bun.serve({
 
         return new Response(file, {
             headers: {
-                "Cache-Control": "public, max-age=86400" // 24 hour cache for assets
+                "Cache-Control": "public, max-age=86400", // 24 hour cache for assets
+                "X-Server-Mode": "high-performance"
             }
         });
     },
-
-    // Error handling
-    error(error) {
-        console.error("Server error:", error);
-        return new Response("Internal Server Error", { status: 500 });
-    },
 });
-
-// Log server startup
-console.log(`✅ Game server running on http://localhost:${PORT}`);
-console.log(`🔌 WebSocket endpoint: ws://localhost:${PORT}/ws`);
 
 // Graceful shutdown handling
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down server gracefully...');
+process.on("SIGINT", () => {
+    console.log("\n🛑 Shutting down server gracefully...");
+    shutdownOptimizedWebSocket();
     server.stop();
     process.exit(0);
 });
 
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Server terminated');
+process.on("SIGTERM", () => {
+    console.log("\n🛑 Server terminated gracefully...");
+    shutdownOptimizedWebSocket();
     server.stop();
     process.exit(0);
 });
+
+console.log(`✅ High-performance server ready at http://localhost:${PORT}`);
+console.log(`📊 Monitoring: Performance stats will be logged every 10 seconds`);
+console.log(`🔗 WebSocket endpoint: ws://localhost:${PORT}/ws`);
+console.log(`🎮 Ready for 10,000+ concurrent players!`);

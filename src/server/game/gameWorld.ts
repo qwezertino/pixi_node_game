@@ -1,197 +1,80 @@
-import { ServerWebSocket } from "bun";
-import {
-    PlayerState,
-    PlayerPosition,
-    TICK_RATE
-} from "../../protocol/messages";
-import { BinaryProtocol } from "../../protocol/binaryProtocol";
-import { WORLD, MOVEMENT, NETWORK } from "../../common/gameSettings";
+/**
+ * High-performance GameWorld optimized for 10k+ players
+ * Maintains full viewport visibility with advanced performance optimizations
+ */
 
-interface PendingUpdate {
-    type: 'movement' | 'direction' | 'attack' | 'attackEnd';
-    playerId: string;
-    data: any;
+import { ServerWebSocket } from "bun";
+import { PlayerState, PlayerPosition, TICK_RATE } from "../../protocol/messages";
+import { WORLD, MOVEMENT } from "../../common/gameSettings";
+import { PerformanceVisibilityManager } from "../systems/performanceVisibilityManager";
+import { PerformanceBroadcastManager } from "../systems/performanceBroadcastManager";
+
+interface PerformanceMetrics {
+    tickTime: number;
+    avgTickTime: number;
+    maxTickTime: number;
+    playersCount: number;
+    messagesPerSecond: number;
+    visibilityStats: any;
+    broadcastStats: any;
 }
 
-export class GameWorld {
+export class OptimizedGameWorld {
     private players: Map<string, PlayerState> = new Map();
     private connections: Map<string, ServerWebSocket<any>> = new Map();
 
-    // Batching system
-    private pendingUpdates: PendingUpdate[] = [];
+    // High-performance systems
+    private visibilityManager = new PerformanceVisibilityManager();
+    private broadcastManager = new PerformanceBroadcastManager();
 
-    // Connection pools for efficient broadcasting
-    private connectionPool: ServerWebSocket<any>[] = [];
-    private connectionPoolValid = false;    constructor() {
+    // Performance tracking
+    private performanceMetrics: PerformanceMetrics = {
+        tickTime: 0,
+        avgTickTime: 0,
+        maxTickTime: 0,
+        playersCount: 0,
+        messagesPerSecond: 0,
+        visibilityStats: {},
+        broadcastStats: {}
+    };
+
+    private tickTimes: number[] = [];
+    private readonly MAX_TICK_HISTORY = 100;
+    private lastPerformanceReport = Date.now();
+
+    constructor() {
         this.startGameLoop();
-        this.startBatchedUpdates();
-
-        // Less frequent full sync - only for new connections
-        // setInterval(() => {
-        //     this.sendFullSync();
-        // }, SYNC_INTERVAL);
-        //SYNC_INTERVAL
+        this.startPerformanceMonitoring();
     }
 
-    private startBatchedUpdates() {
-        setInterval(() => {
-            this.processBatchedUpdates();
-        }, NETWORK.BATCH_INTERVAL_MS);
-    }
-
-    private invalidateConnectionPool() {
-        this.connectionPoolValid = false;
-    }
-
-    private getConnectionPool(): ServerWebSocket<any>[] {
-        if (!this.connectionPoolValid) {
-            this.connectionPool = Array.from(this.connections.values());
-            this.connectionPoolValid = true;
-        }
-        return this.connectionPool;
-    }
-
-    private processBatchedUpdates() {
-        if (this.pendingUpdates.length === 0) return;
-
-        // Group updates by type for efficient encoding
-        const batches = this.groupUpdatesByType(this.pendingUpdates);
-
-        // Send batched updates
-        this.sendBatchedUpdates(batches);
-
-        // Clear pending updates
-        this.pendingUpdates.length = 0;
-    }
-
-    private groupUpdatesByType(updates: PendingUpdate[]): Map<string, PendingUpdate[]> {
-        const batches = new Map<string, PendingUpdate[]>();
-
-        for (const update of updates) {
-            const key = update.type;
-            if (!batches.has(key)) {
-                batches.set(key, []);
-            }
-            batches.get(key)!.push(update);
-        }
-
-        return batches;
-    }
-
-    private sendBatchedUpdates(batches: Map<string, PendingUpdate[]>) {
-        const connections = this.getConnectionPool();
-
-        for (const [updateType, updates] of batches) {
-            switch (updateType) {
-                case 'movement':
-                    this.broadcastBatchedMovements(updates, connections);
-                    break;
-                case 'direction':
-                    this.broadcastBatchedDirections(updates, connections);
-                    break;
-                case 'attack':
-                    this.broadcastBatchedAttacks(updates, connections);
-                    break;
-            }
-        }
-    }
-
-    private broadcastBatchedMovements(updates: PendingUpdate[], connections: ServerWebSocket<any>[]) {
-        // Pre-encode each movement message once
-        const encodedMessages = new Map<string, Uint8Array>();
-
-        for (const update of updates) {
-            const msgKey = `${update.playerId}_${update.data.dx}_${update.data.dy}`;
-            if (!encodedMessages.has(msgKey)) {
-                const moveMsg = {
-                    type: 'playerMovement' as const,
-                    playerId: update.playerId,
-                    movementVector: { dx: update.data.dx, dy: update.data.dy }
-                };
-                encodedMessages.set(msgKey, BinaryProtocol.encodePlayerMovement(moveMsg));
-            }
-        }
-
-        // Broadcast each unique message to all relevant connections
-        for (const [msgKey, binaryData] of encodedMessages) {
-            const playerId = msgKey.split('_')[0];
-            this.broadcastToOthers(binaryData, playerId, connections);
-        }
-    }
-
-    private broadcastBatchedDirections(updates: PendingUpdate[], connections: ServerWebSocket<any>[]) {
-        const encodedMessages = new Map<string, Uint8Array>();
-
-        for (const update of updates) {
-            const msgKey = `${update.playerId}_${update.data.direction}`;
-            if (!encodedMessages.has(msgKey)) {
-                const dirMsg = {
-                    type: 'playerDirection' as const,
-                    playerId: update.playerId,
-                    direction: update.data.direction
-                };
-                encodedMessages.set(msgKey, BinaryProtocol.encodePlayerDirection(dirMsg));
-            }
-        }
-
-        for (const [msgKey, binaryData] of encodedMessages) {
-            const playerId = msgKey.split('_')[0];
-            this.broadcastToOthers(binaryData, playerId, connections);
-        }
-    }
-
-    private broadcastBatchedAttacks(updates: PendingUpdate[], connections: ServerWebSocket<any>[]) {
-        const encodedMessages = new Map<string, Uint8Array>();
-
-        for (const update of updates) {
-            const msgKey = `${update.playerId}_${update.data.position.x}_${update.data.position.y}`;
-            if (!encodedMessages.has(msgKey)) {
-                const attackMsg = {
-                    type: 'playerAttack' as const,
-                    playerId: update.playerId,
-                    position: update.data.position
-                };
-                encodedMessages.set(msgKey, BinaryProtocol.encodePlayerAttack(attackMsg));
-            }
-        }
-
-        for (const [msgKey, binaryData] of encodedMessages) {
-            const playerId = msgKey.split('_')[0];
-            this.broadcastToOthers(binaryData, playerId, connections);
-        }
-    }
-
-    // Optimized broadcast method - single loop through connections
-    private broadcastToOthers(binaryData: Uint8Array, excludePlayerId: string, connections: ServerWebSocket<any>[]) {
-        for (let i = 0; i < connections.length; i++) {
-            const ws = connections[i];
-            if (ws.data.playerId !== excludePlayerId && ws.readyState === 1) { // 1 = OPEN
-                try {
-                    ws.send(binaryData);
-                } catch (error) {
-                    // Handle failed sends - connection might be closed
-                    console.warn('Failed to send to client:', error);
-                }
-            }
-        }
-    }
-
-    private startGameLoop() {
-        // Fixed time step (32 ticks per second = ~31.25ms per tick)
+    private startGameLoop(): void {
         const tickMs = 1000 / TICK_RATE;
 
         setInterval(() => {
+            const startTime = performance.now();
             this.update();
+            const endTime = performance.now();
+
+            this.trackPerformance(endTime - startTime);
         }, tickMs);
     }
 
-    private update() {
-        for (const [, playerState] of this.players.entries()) {
+    private startPerformanceMonitoring(): void {
+        setInterval(() => {
+            this.reportPerformanceStats();
+        }, 10000); // Report every 10 seconds
+    }
+
+    private update(): void {
+        // Optimized movement update - batch position changes
+        const positionUpdates: { playerId: string; oldPos: PlayerPosition; newPos: PlayerPosition }[] = [];
+
+        for (const [playerId, playerState] of this.players.entries()) {
             const shouldMove = playerState.moving && playerState.movementVector && !playerState.attacking;
 
             if (shouldMove) {
+                const oldPosition = { ...playerState.position };
                 const { dx, dy } = playerState.movementVector!;
-
                 const moveDistance = MOVEMENT.PLAYER_SPEED_PER_TICK;
 
                 if (dx !== 0) {
@@ -201,6 +84,7 @@ export class GameWorld {
                     playerState.position.y += dy * moveDistance;
                 }
 
+                // Apply world boundaries
                 const clampedX = Math.max(WORLD.BOUNDARIES.MIN_X,
                     Math.min(WORLD.BOUNDARIES.MAX_X, playerState.position.x));
                 const clampedY = Math.max(WORLD.BOUNDARIES.MIN_Y,
@@ -210,41 +94,55 @@ export class GameWorld {
                     playerState.position.x = clampedX;
                     playerState.position.y = clampedY;
                 }
+
+                // Track position updates for batch processing
+                if (oldPosition.x !== playerState.position.x || oldPosition.y !== playerState.position.y) {
+                    positionUpdates.push({
+                        playerId,
+                        oldPos: oldPosition,
+                        newPos: { ...playerState.position }
+                    });
+                }
             }
+        }
+
+        // Batch update visibility system
+        if (positionUpdates.length > 0) {
+            this.processBatchPositionUpdates(positionUpdates);
         }
     }
 
-    private sendFullSync() {
-        // Only send full sync if we have players and not too many
-        // For 10k+ clients, disable periodic full sync to reduce load
-        if (this.players.size === 0 || this.players.size > 5000) {
-            return;
+    private processBatchPositionUpdates(updates: { playerId: string; oldPos: PlayerPosition; newPos: PlayerPosition }[]): void {
+        // Update visibility manager with new positions
+        for (const update of updates) {
+            this.visibilityManager.updatePlayerPosition(
+                update.playerId,
+                update.newPos.x,
+                update.newPos.y
+            );
         }
 
-        const gameStateMsg = {
-            type: 'gameState' as const,
-            players: Object.fromEntries(this.players.entries()),
-            timestamp: Date.now()
-        };
+        // Batch broadcast movement updates
+        for (const update of updates) {
+            const player = this.players.get(update.playerId);
+            if (player && player.movementVector) {
+                const visibleToPlayers = this.visibilityManager.getPlayersWhoCanSee(update.playerId);
 
-        const binaryData = BinaryProtocol.encodeGameState(gameStateMsg);
-        const connections = this.getConnectionPool();
+                if (visibleToPlayers.size > 0) {
+                    const moveMsg = {
+                        type: 'playerMovement' as const,
+                        playerId: update.playerId,
+                        movementVector: player.movementVector,
+                        position: update.newPos // Include position for client prediction
+                    };
 
-        // Stagger sends to avoid overwhelming the network
-        let delay = 0;
-        const STAGGER_MS = 1; // 1ms between sends
-
-        for (let i = 0; i < connections.length; i++) {
-            const ws = connections[i];
-            if (ws.readyState === 1) {
-                setTimeout(() => {
-                    try {
-                        ws.send(binaryData);
-                    } catch (error) {
-                        console.warn('Failed to send full sync:', error);
-                    }
-                }, delay);
-                delay += STAGGER_MS;
+                    this.broadcastManager.broadcastToViewport(
+                        moveMsg,
+                        visibleToPlayers,
+                        'normal',
+                        update.playerId
+                    );
+                }
             }
         }
     }
@@ -262,17 +160,24 @@ export class GameWorld {
 
         this.players.set(playerId, playerState);
         this.connections.set(playerId, ws);
-        this.invalidateConnectionPool();
 
+        // Register with performance systems
+        this.broadcastManager.registerConnection(playerId, ws);
+        this.visibilityManager.addPlayer(playerId, spawnPosition.x, spawnPosition.y, 1920, 1080);
+
+        // Broadcast to players who can see the new player
         this.broadcastPlayerJoined(playerState);
 
         return playerState;
     }
 
-    public removePlayer(playerId: string) {
+    public removePlayer(playerId: string): void {
         this.players.delete(playerId);
         this.connections.delete(playerId);
-        this.invalidateConnectionPool();
+
+        // Unregister from performance systems
+        this.broadcastManager.unregisterConnection(playerId);
+        this.visibilityManager.removePlayer(playerId);
 
         this.broadcastPlayerLeft(playerId);
     }
@@ -285,28 +190,46 @@ export class GameWorld {
             player.inputSequence = inputSequence;
         }
 
-        if (dx !== 0 || dy !== 0) {
-            player.movementVector = {
-                dx: dx,
-                dy: dy
-            };
+        const wasMoving = player.moving;
+        const oldMovementVector = { ...player.movementVector };
 
+        if (dx !== 0 || dy !== 0) {
+            player.movementVector = { dx, dy };
             player.moving = true;
         } else {
             player.moving = false;
             player.movementVector = { dx: 0, dy: 0 };
         }
 
+        // Broadcast movement change (including stops) to visible players
+        const movementChanged = wasMoving !== player.moving ||
+                               oldMovementVector.dx !== player.movementVector.dx ||
+                               oldMovementVector.dy !== player.movementVector.dy;
+
+        if (movementChanged) {
+            const visibleToPlayers = this.visibilityManager.getPlayersWhoCanSee(playerId);
+
+            if (visibleToPlayers.size > 0) {
+                const moveMsg = {
+                    type: 'playerMovement' as const,
+                    playerId,
+                    movementVector: player.movementVector,
+                    position: player.position
+                };
+
+                this.broadcastManager.broadcastToViewport(
+                    moveMsg,
+                    visibleToPlayers,
+                    'normal',
+                    playerId
+                );
+            }
+        }
+
+        // Send immediate acknowledgment to moving player
         if (inputSequence !== undefined) {
             this.sendMovementAcknowledgment(playerId, player.position, inputSequence);
         }
-
-        // Add to pending updates instead of immediate broadcast
-        this.pendingUpdates.push({
-            type: 'movement',
-            playerId,
-            data: { dx, dy }
-        });
 
         return true;
     }
@@ -317,12 +240,23 @@ export class GameWorld {
 
         player.direction = direction;
 
-        // Add to pending updates instead of immediate broadcast
-        this.pendingUpdates.push({
-            type: 'direction',
-            playerId,
-            data: { direction }
-        });
+        // Broadcast direction change to visible players
+        const visibleToPlayers = this.visibilityManager.getPlayersWhoCanSee(playerId);
+
+        if (visibleToPlayers.size > 0) {
+            const dirMsg = {
+                type: 'playerDirection' as const,
+                playerId,
+                direction
+            };
+
+            this.broadcastManager.broadcastToViewport(
+                dirMsg,
+                visibleToPlayers,
+                'normal',
+                playerId
+            );
+        }
 
         return true;
     }
@@ -333,12 +267,23 @@ export class GameWorld {
 
         player.attacking = true;
 
-        // Add to pending updates instead of immediate broadcast
-        this.pendingUpdates.push({
-            type: 'attack',
-            playerId,
-            data: { position: player.position }
-        });
+        // Broadcast attack to visible players
+        const visibleToPlayers = this.visibilityManager.getPlayersWhoCanSee(playerId);
+
+        if (visibleToPlayers.size > 0) {
+            const attackMsg = {
+                type: 'playerAttack' as const,
+                playerId,
+                position: player.position
+            };
+
+            this.broadcastManager.broadcastToViewport(
+                attackMsg,
+                visibleToPlayers,
+                'high', // High priority for attacks
+                playerId
+            );
+        }
 
         return true;
     }
@@ -351,25 +296,45 @@ export class GameWorld {
         return true;
     }
 
-    private broadcastPlayerJoined(playerState: PlayerState) {
-        const joinedMsg = {
-            type: 'playerJoined' as const,
-            player: playerState
-        };
+    public updatePlayerViewport(playerId: string, width: number, height: number): void {
+        this.visibilityManager.updatePlayerViewport(playerId, width, height);
+    }
 
-        const binaryData = BinaryProtocol.encodePlayerJoined(joinedMsg);
-        const connections = this.getConnectionPool();
+    private broadcastPlayerJoined(playerState: PlayerState): void {
+        // Get players who can see the new player
+        const visibleToPlayers = this.visibilityManager.getPlayersWhoCanSee(playerState.id);
 
-        // Broadcast immediately for join events (important for visibility)
-        for (let i = 0; i < connections.length; i++) {
-            const ws = connections[i];
-            if (ws.data.playerId !== playerState.id && ws.readyState === 1) {
-                try {
-                    ws.send(binaryData);
-                } catch (error) {
-                    console.warn('Failed to send player joined message:', error);
-                }
-            }
+
+        if (visibleToPlayers.size > 0) {
+            const joinedMsg = {
+                type: 'playerJoined' as const,
+                player: playerState
+            };
+
+            this.broadcastManager.broadcastToViewport(
+                joinedMsg,
+                visibleToPlayers,
+                'high', // High priority for join events
+                playerState.id
+            );
+        }
+    }
+
+    private broadcastPlayerLeft(playerId: string): void {
+        // Broadcast to all players since we need to clean up their client state
+        const allPlayers = new Set(this.players.keys());
+
+        if (allPlayers.size > 0) {
+            const leftMsg = {
+                type: 'playerLeft' as const,
+                playerId
+            };
+
+            this.broadcastManager.broadcastToViewport(
+                leftMsg,
+                allPlayers,
+                'high' // High priority for cleanup
+            );
         }
     }
 
@@ -385,42 +350,13 @@ export class GameWorld {
             timestamp: Date.now(),
         };
 
-        const binaryData = BinaryProtocol.encodeMovementAcknowledgment(ackMsg);
-
-        try {
-            connection.send(binaryData);
-        } catch (error) {
-            console.warn('Failed to send movement acknowledgment:', error);
-        }
+        // Send acknowledgment immediately to this specific player
+        this.broadcastManager.broadcastImmediate(ackMsg, new Set([playerId]));
     }
 
-    private broadcastPlayerLeft(playerId: string) {
-        const leftMsg = {
-            type: 'playerLeft' as const,
-            playerId
-        };
-
-        const binaryData = BinaryProtocol.encodePlayerLeft(leftMsg);
-        const connections = this.getConnectionPool();
-
-        // Broadcast immediately for leave events (important for cleanup)
-        for (let i = 0; i < connections.length; i++) {
-            const ws = connections[i];
-            if (ws.readyState === 1) {
-                try {
-                    ws.send(binaryData);
-                } catch (error) {
-                    console.warn('Failed to send player left message:', error);
-                }
-            }
-        }
-    }
-
-    public sendCorrectionToPlayer(playerId: string) {
+    public sendCorrectionToPlayer(playerId: string): void {
         const player = this.players.get(playerId);
-        const connection = this.connections.get(playerId);
-
-        if (!player || !connection) return;
+        if (!player) return;
 
         const correctionMsg = {
             type: 'correction' as const,
@@ -428,13 +364,7 @@ export class GameWorld {
             position: player.position
         };
 
-        const binaryData = BinaryProtocol.encodeCorrection(correctionMsg);
-
-        try {
-            connection.send(binaryData);
-        } catch (error) {
-            console.warn('Failed to send correction:', error);
-        }
+        this.broadcastManager.broadcastImmediate(correctionMsg, new Set([playerId]));
     }
 
     private getRandomSpawnPosition(): PlayerPosition {
@@ -446,10 +376,50 @@ export class GameWorld {
         return { x, y };
     }
 
-
     public getAllPlayersState(): Record<string, PlayerState> {
         return Object.fromEntries(this.players.entries());
     }
 
+    private trackPerformance(tickTime: number): void {
+        this.tickTimes.push(tickTime);
+        if (this.tickTimes.length > this.MAX_TICK_HISTORY) {
+            this.tickTimes.shift();
+        }
 
+        this.performanceMetrics.tickTime = tickTime;
+        this.performanceMetrics.maxTickTime = Math.max(this.performanceMetrics.maxTickTime, tickTime);
+        this.performanceMetrics.avgTickTime = this.tickTimes.reduce((a, b) => a + b, 0) / this.tickTimes.length;
+        this.performanceMetrics.playersCount = this.players.size;
+    }
+
+    private reportPerformanceStats(): void {
+        const now = Date.now();
+        const uptime = Math.floor((now - this.lastPerformanceReport) / 1000);
+
+        this.performanceMetrics.visibilityStats = this.visibilityManager.getPerformanceStats();
+        this.performanceMetrics.broadcastStats = this.broadcastManager.getStats();
+
+        const memUsage = process.memoryUsage();
+
+        console.log(`🔥 Performance Stats (Uptime: ${uptime}s):`);
+        console.log(`   📊 Players: ${this.performanceMetrics.playersCount}`);
+        console.log(`   📨 Messages/sec: ${this.performanceMetrics.broadcastStats.messagesPerSecond.toFixed(1)}`);
+        console.log(`   ⏱️  Tick time: ${this.performanceMetrics.tickTime.toFixed(2)}ms (avg: ${this.performanceMetrics.avgTickTime.toFixed(2)}ms, max: ${this.performanceMetrics.maxTickTime.toFixed(2)}ms)`);
+        console.log(`   🧠 Memory: ${(memUsage.rss / 1024 / 1024).toFixed(1)}MB RSS, ${(memUsage.heapUsed / 1024 / 1024).toFixed(1)}MB Heap`);
+        console.log(`   👁️  Visibility: ${this.performanceMetrics.visibilityStats.avgVisiblePlayers?.toFixed(1) || 0} avg visible/player, ${this.performanceMetrics.visibilityStats.maxVisiblePlayers || 0} max`);
+        console.log(`   🎯 Grid cells: ${this.performanceMetrics.visibilityStats.totalPlayers || 0}`);
+        console.log(`   🚦 Rate Limits: Movement ${(this.performanceMetrics.broadcastStats.messagesPerSecond || 0).toFixed(1)}/s, Direction 0.0/s, Attack 0.0/s`);
+
+        // Emergency actions if performance degrades
+        if (this.performanceMetrics.avgTickTime > 500) { // 500ms+ tick time is bad
+            console.warn(`⚠️  High tick time detected: ${this.performanceMetrics.avgTickTime.toFixed(2)}ms`);
+            this.broadcastManager.emergencyClearQueue();
+        }
+
+        this.lastPerformanceReport = now;
+    }
+
+    public getPerformanceMetrics(): PerformanceMetrics {
+        return { ...this.performanceMetrics };
+    }
 }

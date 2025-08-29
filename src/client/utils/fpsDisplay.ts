@@ -7,7 +7,7 @@ export class FpsDisplay {
     private background: Graphics;
     private app: Application;
     private networkManager: NetworkManager;
-    private showDetailedStats: boolean = false;
+    private showDetailedStats: boolean = true; // Изначально показываем полные метрики
     private statsUpdateCounter: number = 0;
 
     // Network stats tracking
@@ -16,6 +16,8 @@ export class FpsDisplay {
     private connectionStartTime: number = Date.now();
     private pingHistory: number[] = [];
     private pendingPings: Map<number, number> = new Map(); // inputSequence -> sendTime
+    private pingInterval: number | null = null;
+    private lastPingTime: number = 0; // Время последнего измерения пинга
 
     constructor(app: Application, networkManager: NetworkManager) {
         this.app = app;
@@ -50,28 +52,55 @@ export class FpsDisplay {
         this.background = new Graphics();
         this.background.fill(0x000000);
         this.background.alpha = 0.7;
-        this.background.visible = false;
+        this.background.visible = this.showDetailedStats; // Показываем если включены детальные статистики
         app.stage.addChild(this.background);
         app.stage.addChild(this.statsText);
 
+        // Устанавливаем видимость статистики согласно начальному состоянию
+        this.statsText.visible = this.showDetailedStats;
+
+        // В детальном режиме скрываем простой FPS
+        this.fpsText.visible = !this.showDetailedStats;
+
         // Track network messages
         this.setupNetworkTracking();
+
+        // Start periodic ping for better latency measurement
+        this.startPingInterval();
+    }
+
+    private startPingInterval() {
+        // Не отправляем искусственные ping-сообщения
+        // Вместо этого будем измерять пинг на основе реальных движений
+        // Если игрок долго не двигается, покажем последний известный пинг
     }
 
     private setupNetworkTracking() {
-        // Hook into WebSocket to track messages
-        const originalSend = this.networkManager['socket'].send;
-        this.networkManager['socket'].send = (data: string | ArrayBufferLike | Blob | ArrayBufferView<ArrayBufferLike>) => {
-            this.messagesSent++;
-            return originalSend.call(this.networkManager['socket'], data);
-        };
+        // Добавляем задержку, чтобы WebSocket был инициализирован
+        setTimeout(() => {
+            try {
+                // Hook into WebSocket to track messages
+                const socket = this.networkManager['socket'];
+                if (socket && socket.send) {
+                    const originalSend = socket.send.bind(socket);
+                    socket.send = (data: string | ArrayBufferLike | Blob | ArrayBufferView) => {
+                        this.messagesSent++;
+                        return originalSend(data);
+                    };
+                }
 
-        // Track received messages through existing handler
-        const originalHandleMessage = this.networkManager['handleServerMessage'];
-        this.networkManager['handleServerMessage'] = (data: string | ArrayBuffer) => {
-            this.messagesReceived++;
-            return originalHandleMessage.call(this.networkManager, data);
-        };
+                // Track received messages through existing handler
+                const originalHandleMessage = this.networkManager['handleServerMessage'];
+                if (originalHandleMessage) {
+                    this.networkManager['handleServerMessage'] = (data: string | ArrayBuffer) => {
+                        this.messagesReceived++;
+                        return originalHandleMessage.call(this.networkManager, data);
+                    };
+                }
+            } catch (error) {
+                console.warn('Failed to setup network tracking:', error);
+            }
+        }, 100);
 
         // Track movement acknowledgments for ping calculation
         this.networkManager.onMovementAck((_, inputSequence) => {
@@ -86,18 +115,33 @@ export class FpsDisplay {
 
     public trackMovementSend(inputSequence: number) {
         this.pendingPings.set(inputSequence, Date.now());
+
+        // Clean up old pending pings (older than 5 seconds)
+        const now = Date.now();
+        for (const [seq, time] of this.pendingPings.entries()) {
+            if (now - time > 5000) {
+                this.pendingPings.delete(seq);
+            }
+        }
     }
 
     private addPingMeasurement(ping: number) {
         this.pingHistory.push(ping);
+        this.lastPingTime = Date.now(); // Запоминаем время последнего измерения
         if (this.pingHistory.length > 20) { // Keep last 20 measurements
             this.pingHistory.shift();
         }
     }
 
     update() {
-        // Update FPS (always visible)
-        this.fpsText.text = `FPS: ${Math.round(this.app.ticker.FPS)}`;
+        // В минимальном режиме показываем только FPS
+        if (!this.showDetailedStats) {
+            this.fpsText.text = `FPS: ${Math.round(this.app.ticker.FPS)}`;
+            this.fpsText.visible = true;
+        } else {
+            // В детальном режиме скрываем простой FPS, так как он будет в детальных статистиках
+            this.fpsText.visible = false;
+        }
 
         // Update detailed stats less frequently (every 10 frames)
         this.statsUpdateCounter++;
@@ -113,10 +157,14 @@ export class FpsDisplay {
         const now = Date.now();
         const memory = (performance as any).memory;
         const players = this.networkManager.getPlayers();
-        const playerCount = Object.keys(players).length;
+        const currentPlayerId = this.networkManager.getPlayerId();
 
-        // Calculate ping (simplified - in real implementation you'd use server timestamps)
-        const ping = this.calculateAveragePing();
+        // Count visible players (excluding current player)
+        const visiblePlayers = Object.keys(players).filter(id => id !== currentPlayerId).length;
+        const totalPlayers = Object.keys(players).length;
+
+        // Calculate ping display
+        const pingDisplay = this.getPingDisplayText();
 
         // Build stats string
         const stats = [
@@ -126,10 +174,11 @@ export class FpsDisplay {
             ``,
             `=== NETWORK ===`,
             `Status: ${this.getConnectionStatus()}`,
-            `Ping: ${ping}ms`,
+            `Ping: ${pingDisplay}`,
             `Messages Sent: ${this.messagesSent}`,
             `Messages Received: ${this.messagesReceived}`,
-            `Players Online: ${playerCount}`,
+            `Players Visible: ${visiblePlayers}`,
+            `Total Players: ${totalPlayers}`,
             ``,
             `=== MEMORY ===`,
             `Used: ${memory ? this.formatBytes(memory.usedJSHeapSize) : 'N/A'}`,
@@ -142,7 +191,7 @@ export class FpsDisplay {
             `User Agent: ${navigator.userAgent.substring(0, 50)}...`,
             ``,
             `=== GAME WORLD ===`,
-            `Player ID: ${this.networkManager.getPlayerId() || 'Connecting...'}`,
+            `Player ID: ${currentPlayerId || 'Connecting...'}`,
             `Uptime: ${this.formatTime(now - this.connectionStartTime)}`
         ];
 
@@ -157,13 +206,32 @@ export class FpsDisplay {
     }
 
     private calculateAveragePing(): number {
-        // Simplified ping calculation - in production you'd measure actual round-trip time
         if (this.pingHistory.length === 0) return 0;
+
+        // Calculate average of recent ping measurements
         const sum = this.pingHistory.reduce((a, b) => a + b, 0);
-        return Math.round(sum / this.pingHistory.length);
+        const average = sum / this.pingHistory.length;
+
+        // Return rounded average
+        return Math.round(average);
     }
 
-    private getConnectionStatus(): string {
+    private getPingDisplayText(): string {
+        if (this.pingHistory.length === 0) {
+            // Если еще не было измерений пинга
+            return "Waiting for movement...";
+        }
+
+        const ping = this.calculateAveragePing();
+        const timeSinceLastPing = Date.now() - this.lastPingTime;
+
+        // Если последнее измерение было больше 10 секунд назад
+        if (timeSinceLastPing > 10000) {
+            return `${ping}ms (${Math.floor(timeSinceLastPing / 1000)}s ago)`;
+        }
+
+        return `${ping}ms`;
+    }    private getConnectionStatus(): string {
         const socket = this.networkManager['socket'];
         switch (socket.readyState) {
             case WebSocket.CONNECTING: return 'Connecting';
@@ -198,8 +266,13 @@ export class FpsDisplay {
 
     toggleDetailedStats() {
         this.showDetailedStats = !this.showDetailedStats;
+
+        // Управляем видимостью детальных статистик
         this.statsText.visible = this.showDetailedStats;
         this.background.visible = this.showDetailedStats;
+
+        // Управляем видимостью простого FPS
+        this.fpsText.visible = !this.showDetailedStats;
 
         if (this.showDetailedStats) {
             this.updateDetailedStats(); // Immediate update when shown
@@ -208,5 +281,14 @@ export class FpsDisplay {
 
     isDetailedStatsVisible(): boolean {
         return this.showDetailedStats;
+    }
+
+    // Cleanup method
+    destroy() {
+        // Больше не используем pingInterval, но оставляем для совместимости
+        if (this.pingInterval) {
+            window.clearInterval(this.pingInterval);
+            this.pingInterval = null;
+        }
     }
 }
