@@ -8,18 +8,173 @@ import {
 import { BinaryProtocol } from "../../protocol/binaryProtocol";
 import { WORLD, MOVEMENT } from "../../common/gameSettings";
 
+interface PendingUpdate {
+    type: 'movement' | 'direction' | 'attack' | 'attackEnd';
+    playerId: string;
+    data: any;
+}
 
 export class GameWorld {
     private players: Map<string, PlayerState> = new Map();
     private connections: Map<string, ServerWebSocket<any>> = new Map();
 
+    // Batching system
+    private pendingUpdates: PendingUpdate[] = [];
+    private readonly BATCH_INTERVAL_MS = 16; // ~60 FPS batching
 
-    constructor() {
+    // Connection pools for efficient broadcasting
+    private connectionPool: ServerWebSocket<any>[] = [];
+    private connectionPoolValid = false;    constructor() {
         this.startGameLoop();
+        this.startBatchedUpdates();
 
+        // Less frequent full sync - only for new connections
+        // setInterval(() => {
+        //     this.sendFullSync();
+        // }, SYNC_INTERVAL);
+    }
+
+    private startBatchedUpdates() {
         setInterval(() => {
-            this.sendFullSync();
-        }, SYNC_INTERVAL);
+            this.processBatchedUpdates();
+        }, this.BATCH_INTERVAL_MS);
+    }
+
+    private invalidateConnectionPool() {
+        this.connectionPoolValid = false;
+    }
+
+    private getConnectionPool(): ServerWebSocket<any>[] {
+        if (!this.connectionPoolValid) {
+            this.connectionPool = Array.from(this.connections.values());
+            this.connectionPoolValid = true;
+        }
+        return this.connectionPool;
+    }
+
+    private processBatchedUpdates() {
+        if (this.pendingUpdates.length === 0) return;
+
+        // Group updates by type for efficient encoding
+        const batches = this.groupUpdatesByType(this.pendingUpdates);
+
+        // Send batched updates
+        this.sendBatchedUpdates(batches);
+
+        // Clear pending updates
+        this.pendingUpdates.length = 0;
+    }
+
+    private groupUpdatesByType(updates: PendingUpdate[]): Map<string, PendingUpdate[]> {
+        const batches = new Map<string, PendingUpdate[]>();
+
+        for (const update of updates) {
+            const key = update.type;
+            if (!batches.has(key)) {
+                batches.set(key, []);
+            }
+            batches.get(key)!.push(update);
+        }
+
+        return batches;
+    }
+
+    private sendBatchedUpdates(batches: Map<string, PendingUpdate[]>) {
+        const connections = this.getConnectionPool();
+
+        for (const [updateType, updates] of batches) {
+            switch (updateType) {
+                case 'movement':
+                    this.broadcastBatchedMovements(updates, connections);
+                    break;
+                case 'direction':
+                    this.broadcastBatchedDirections(updates, connections);
+                    break;
+                case 'attack':
+                    this.broadcastBatchedAttacks(updates, connections);
+                    break;
+            }
+        }
+    }
+
+    private broadcastBatchedMovements(updates: PendingUpdate[], connections: ServerWebSocket<any>[]) {
+        // Pre-encode each movement message once
+        const encodedMessages = new Map<string, Uint8Array>();
+
+        for (const update of updates) {
+            const msgKey = `${update.playerId}_${update.data.dx}_${update.data.dy}`;
+            if (!encodedMessages.has(msgKey)) {
+                const moveMsg = {
+                    type: 'playerMovement' as const,
+                    playerId: update.playerId,
+                    movementVector: { dx: update.data.dx, dy: update.data.dy }
+                };
+                encodedMessages.set(msgKey, BinaryProtocol.encodePlayerMovement(moveMsg));
+            }
+        }
+
+        // Broadcast each unique message to all relevant connections
+        for (const [msgKey, binaryData] of encodedMessages) {
+            const playerId = msgKey.split('_')[0];
+            this.broadcastToOthers(binaryData, playerId, connections);
+        }
+    }
+
+    private broadcastBatchedDirections(updates: PendingUpdate[], connections: ServerWebSocket<any>[]) {
+        const encodedMessages = new Map<string, Uint8Array>();
+
+        for (const update of updates) {
+            const msgKey = `${update.playerId}_${update.data.direction}`;
+            if (!encodedMessages.has(msgKey)) {
+                const dirMsg = {
+                    type: 'playerDirection' as const,
+                    playerId: update.playerId,
+                    direction: update.data.direction
+                };
+                encodedMessages.set(msgKey, BinaryProtocol.encodePlayerDirection(dirMsg));
+            }
+        }
+
+        for (const [msgKey, binaryData] of encodedMessages) {
+            const playerId = msgKey.split('_')[0];
+            this.broadcastToOthers(binaryData, playerId, connections);
+        }
+    }
+
+    private broadcastBatchedAttacks(updates: PendingUpdate[], connections: ServerWebSocket<any>[]) {
+        const encodedMessages = new Map<string, Uint8Array>();
+
+        for (const update of updates) {
+            const msgKey = `${update.playerId}_${update.data.position.x}_${update.data.position.y}`;
+            if (!encodedMessages.has(msgKey)) {
+                const attackMsg = {
+                    type: 'playerAttack' as const,
+                    playerId: update.playerId,
+                    position: update.data.position
+                };
+                encodedMessages.set(msgKey, BinaryProtocol.encodePlayerAttack(attackMsg));
+            }
+        }
+
+        for (const [msgKey, binaryData] of encodedMessages) {
+            const playerId = msgKey.split('_')[0];
+            this.broadcastToOthers(binaryData, playerId, connections);
+        }
+    }
+
+    // Optimized broadcast method - single loop through connections
+    private broadcastToOthers(binaryData: Uint8Array, excludePlayerId: string, connections: ServerWebSocket<any>[]) {
+        for (let i = 0; i < connections.length; i++) {
+            const ws = connections[i];
+            if (ws.data.playerId !== excludePlayerId && ws.readyState === 1) { // 1 = OPEN
+                try {
+                    ws.send(binaryData);
+                } catch (error) {
+                    // Handle failed sends - connection might be closed
+                    console.warn('Failed to send to client:', error);
+                }
+            }
+        }
     }
 
     private startGameLoop() {
@@ -61,6 +216,12 @@ export class GameWorld {
     }
 
     private sendFullSync() {
+        // Only send full sync if we have players and not too many
+        // For 10k+ clients, disable periodic full sync to reduce load
+        if (this.players.size === 0 || this.players.size > 5000) {
+            return;
+        }
+
         const gameStateMsg = {
             type: 'gameState' as const,
             players: Object.fromEntries(this.players.entries()),
@@ -68,9 +229,24 @@ export class GameWorld {
         };
 
         const binaryData = BinaryProtocol.encodeGameState(gameStateMsg);
+        const connections = this.getConnectionPool();
 
-        for (const ws of this.connections.values()) {
-            ws.send(binaryData);
+        // Stagger sends to avoid overwhelming the network
+        let delay = 0;
+        const STAGGER_MS = 1; // 1ms between sends
+
+        for (let i = 0; i < connections.length; i++) {
+            const ws = connections[i];
+            if (ws.readyState === 1) {
+                setTimeout(() => {
+                    try {
+                        ws.send(binaryData);
+                    } catch (error) {
+                        console.warn('Failed to send full sync:', error);
+                    }
+                }, delay);
+                delay += STAGGER_MS;
+            }
         }
     }
 
@@ -87,6 +263,7 @@ export class GameWorld {
 
         this.players.set(playerId, playerState);
         this.connections.set(playerId, ws);
+        this.invalidateConnectionPool();
 
         this.broadcastPlayerJoined(playerState);
 
@@ -96,6 +273,7 @@ export class GameWorld {
     public removePlayer(playerId: string) {
         this.players.delete(playerId);
         this.connections.delete(playerId);
+        this.invalidateConnectionPool();
 
         this.broadcastPlayerLeft(playerId);
     }
@@ -124,7 +302,12 @@ export class GameWorld {
             this.sendMovementAcknowledgment(playerId, player.position, inputSequence);
         }
 
-        this.broadcastPlayerMovement(playerId, player.movementVector);
+        // Add to pending updates instead of immediate broadcast
+        this.pendingUpdates.push({
+            type: 'movement',
+            playerId,
+            data: { dx, dy }
+        });
 
         return true;
     }
@@ -135,7 +318,12 @@ export class GameWorld {
 
         player.direction = direction;
 
-        this.broadcastPlayerDirection(playerId, direction);
+        // Add to pending updates instead of immediate broadcast
+        this.pendingUpdates.push({
+            type: 'direction',
+            playerId,
+            data: { direction }
+        });
 
         return true;
     }
@@ -145,7 +333,13 @@ export class GameWorld {
         if (!player) return false;
 
         player.attacking = true;
-        this.broadcastPlayerAttack(playerId, player.position);
+
+        // Add to pending updates instead of immediate broadcast
+        this.pendingUpdates.push({
+            type: 'attack',
+            playerId,
+            data: { position: player.position }
+        });
 
         return true;
     }
@@ -165,17 +359,24 @@ export class GameWorld {
         };
 
         const binaryData = BinaryProtocol.encodePlayerJoined(joinedMsg);
+        const connections = this.getConnectionPool();
 
-        for (const [id, ws] of this.connections.entries()) {
-            if (id !== playerState.id) {
-                ws.send(binaryData);
+        // Broadcast immediately for join events (important for visibility)
+        for (let i = 0; i < connections.length; i++) {
+            const ws = connections[i];
+            if (ws.data.playerId !== playerState.id && ws.readyState === 1) {
+                try {
+                    ws.send(binaryData);
+                } catch (error) {
+                    console.warn('Failed to send player joined message:', error);
+                }
             }
         }
     }
 
     private sendMovementAcknowledgment(playerId: string, position: PlayerPosition, inputSequence: number): void {
         const connection = this.connections.get(playerId);
-        if (!connection) return;
+        if (!connection || connection.readyState !== 1) return;
 
         const ackMsg = {
             type: 'movementAck' as const,
@@ -186,7 +387,12 @@ export class GameWorld {
         };
 
         const binaryData = BinaryProtocol.encodeMovementAcknowledgment(ackMsg);
-        connection.send(binaryData);
+
+        try {
+            connection.send(binaryData);
+        } catch (error) {
+            console.warn('Failed to send movement acknowledgment:', error);
+        }
     }
 
     private broadcastPlayerLeft(playerId: string) {
@@ -196,56 +402,17 @@ export class GameWorld {
         };
 
         const binaryData = BinaryProtocol.encodePlayerLeft(leftMsg);
+        const connections = this.getConnectionPool();
 
-        for (const ws of this.connections.values()) {
-            ws.send(binaryData);
-        }
-    }
-
-        private broadcastPlayerMovement(playerId: string, movementVector: { dx: number; dy: number }) {
-        const moveMsg = {
-            type: 'playerMovement' as const,
-            playerId,
-            movementVector
-        };
-
-        const binaryData = BinaryProtocol.encodePlayerMovement(moveMsg);
-
-        for (const [id, ws] of this.connections.entries()) {
-            if (id !== playerId) {
-                ws.send(binaryData);
-            }
-        }
-    }
-
-    private broadcastPlayerDirection(playerId: string, direction: -1 | 1) {
-        const dirMsg = {
-            type: 'playerDirection' as const,
-            playerId,
-            direction
-        };
-
-        const binaryData = BinaryProtocol.encodePlayerDirection(dirMsg);
-
-        for (const [id, ws] of this.connections.entries()) {
-            if (id !== playerId) {
-                ws.send(binaryData);
-            }
-        }
-    }
-
-    private broadcastPlayerAttack(playerId: string, position: PlayerPosition) {
-        const attackMsg = {
-            type: 'playerAttack' as const,
-            playerId,
-            position
-        };
-
-        const binaryData = BinaryProtocol.encodePlayerAttack(attackMsg);
-
-        for (const [id, ws] of this.connections.entries()) {
-            if (id !== playerId) {
-                ws.send(binaryData);
+        // Broadcast immediately for leave events (important for cleanup)
+        for (let i = 0; i < connections.length; i++) {
+            const ws = connections[i];
+            if (ws.readyState === 1) {
+                try {
+                    ws.send(binaryData);
+                } catch (error) {
+                    console.warn('Failed to send player left message:', error);
+                }
             }
         }
     }
@@ -264,7 +431,11 @@ export class GameWorld {
 
         const binaryData = BinaryProtocol.encodeCorrection(correctionMsg);
 
-        connection.send(binaryData);
+        try {
+            connection.send(binaryData);
+        } catch (error) {
+            console.warn('Failed to send correction:', error);
+        }
     }
 
     private getRandomSpawnPosition(): PlayerPosition {

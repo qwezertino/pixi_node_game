@@ -1,0 +1,81 @@
+config:
+  target: 'ws://localhost:8108/ws'
+  processor: './artillery-processor.cjs'
+  phases:
+    # Gradual ramp up to test stability
+    - duration: 60
+      arrivalRate: 5
+      name: "Warm up - 300 clients"
+
+    # Test 1000 clients sustained
+    - duration: 120
+      arrivalRate: 8
+      name: "Ramp to 1000 clients"
+    - duration: 180
+      arrivalRate: 2
+      name: "1000 clients sustained test"
+
+    # # Test 5000 clients
+    # - duration: 180
+    #   arrivalRate: 20
+    #   name: "Ramp to 5000 clients"
+    # - duration: 300
+    #   arrivalRate: 5
+    #   name: "5000 clients sustained test"
+
+    # # Test 10000 clients - the ultimate goal
+    # - duration: 300
+    #   arrivalRate: 25
+    #   name: "Ramp to 10000 clients"
+    # - duration: 600
+    #   arrivalRate: 2
+    #   name: "10000 clients sustained test"
+
+  # Performance and monitoring - OPTIMIZED FOR HIGH LOAD
+  # http:
+  #   timeout: 30  # Reduced timeout
+  ws:
+    timeout: 30  # Reduced timeout
+
+  # Metrics collection
+  plugins:
+    metrics-by-endpoint:
+      useOnlyRequestNames: true
+
+scenarios:
+  - name: "Optimized Game Client"
+    engine: "ws"
+    weight: 100
+    flow:
+      # Brief connection delay
+      - think: 1.0
+
+      # Initialize client state
+      - function: "initializeClient"
+
+      # Main game loop with realistic behavior
+      - loop:
+          # Movement with input sequence (reduced frequency)
+          - function: "generateMovement"
+          - send: '{{ movementMessage }}'
+          - think: 0.5  # 2 movements per second (more realistic for high load)
+
+          # Occasional direction change
+          - function: "maybeChangeDirection"
+          - send: '{{ directionMessage }}'
+          - think: 2.0  # Direction changes less frequently
+
+          # Random attack with reasonable frequency
+          - function: "maybeAttack"
+          - send: '{{ attackMessage }}'
+          - think: 5.0  # Attacks are very infrequent for testing
+
+          # Attack end
+          - function: "maybeAttackEnd"
+          - send: '{{ attackEndMessage }}'
+          - think: 0.5
+
+        count: 25  # Reduced for shorter test duration per client
+
+      # Graceful disconnect
+      - function: "logDisconnect"

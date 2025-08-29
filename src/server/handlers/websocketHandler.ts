@@ -10,15 +10,31 @@ const gameWorld = new GameWorld();
 // Store websocket data
 interface WebSocketData {
     playerId: string;
+    lastActivity: number;
 }
+
+// Connection tracking for performance monitoring
+let totalConnections = 0;
+let activeConnections = 0;
 
 export function handleWebSocket() {
     return {
         // Connection is opened by a new client
         open(ws: ServerWebSocket<WebSocketData>) {
+            totalConnections++;
+            activeConnections++;
+
             // Generate unique player ID
             const playerId = uuidv4();
-            ws.data = { playerId };
+            ws.data = {
+                playerId,
+                lastActivity: Date.now()
+            };
+
+            // Log connection stats periodically
+            if (totalConnections % 100 === 0) {
+                console.log(`Connections: ${activeConnections} active, ${totalConnections} total`);
+            }
 
             // Get existing players before adding the new one
             const existingPlayers = gameWorld.getAllPlayersState();
@@ -35,16 +51,23 @@ export function handleWebSocket() {
             };
 
             // Send as binary data
-            const binaryData = BinaryProtocol.encodeInitialState(initialState);
-            ws.send(binaryData);
+            try {
+                const binaryData = BinaryProtocol.encodeInitialState(initialState);
+                ws.send(binaryData);
+            } catch (error) {
+                console.error('Failed to send initial state:', error);
+                ws.close();
+                activeConnections--;
+            }
         },
 
         // Message received from client
         message(ws: ServerWebSocket<WebSocketData>, message: string | Uint8Array) {
             const playerId = ws.data.playerId;
+            ws.data.lastActivity = Date.now();
 
             try {
-                // Handle binary message
+                // Handle binary message (prioritized for performance)
                 if (message instanceof Uint8Array) {
                     const decodedMsg = BinaryProtocol.decodeMessage(message);
 
@@ -70,7 +93,7 @@ export function handleWebSocket() {
                         }
                     }
                 }
-                // Handle JSON message
+                // Handle JSON message (fallback for compatibility)
                 else {
                     const data = JSON.parse(message);
 
@@ -78,7 +101,8 @@ export function handleWebSocket() {
                         case 'move':
                             if (data.movementVector) {
                                 const { dx, dy } = data.movementVector;
-                                gameWorld.updatePlayerMovement(playerId, dx, dy);
+                                const inputSequence = data.inputSequence || 0;
+                                gameWorld.updatePlayerMovement(playerId, dx, dy, inputSequence);
                             }
                             break;
 
@@ -89,8 +113,11 @@ export function handleWebSocket() {
                             break;
 
                         case 'attack':
-                            // Handle attack (future implementation)
-                            // Broadcast attack to other players
+                            gameWorld.handlePlayerAttack(playerId);
+                            break;
+
+                        case 'attackEnd':
+                            gameWorld.handleAttackEnd(playerId);
                             break;
 
                         default:
@@ -98,7 +125,7 @@ export function handleWebSocket() {
                     }
                 }
             } catch (error) {
-                // Consider sending a correction on error
+                // Send correction on error to resync client
                 gameWorld.sendCorrectionToPlayer(playerId);
             }
         },
@@ -106,9 +133,15 @@ export function handleWebSocket() {
         // Client disconnected
         close(ws: ServerWebSocket<WebSocketData>) {
             const playerId = ws.data.playerId;
+            activeConnections--;
 
             // Remove player from game world
             gameWorld.removePlayer(playerId);
+
+            // Log disconnection stats periodically
+            if (activeConnections % 100 === 0 || activeConnections < 10) {
+                console.log(`Player disconnected. Active connections: ${activeConnections}`);
+            }
         },
     };
 }
