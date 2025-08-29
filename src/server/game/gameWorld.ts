@@ -6,7 +6,7 @@ import {
     SYNC_INTERVAL
 } from "../../protocol/messages";
 import { BinaryProtocol } from "../../protocol/binaryProtocol";
-import { WORLD, MOVEMENT } from "../../common/gameSettings";
+import { WORLD, MOVEMENT, NETWORK } from "../../common/gameSettings";
 
 interface PendingUpdate {
     type: 'movement' | 'direction' | 'attack' | 'attackEnd';
@@ -20,7 +20,6 @@ export class GameWorld {
 
     // Batching system
     private pendingUpdates: PendingUpdate[] = [];
-    private readonly BATCH_INTERVAL_MS = 16; // ~60 FPS batching
 
     // Connection pools for efficient broadcasting
     private connectionPool: ServerWebSocket<any>[] = [];
@@ -37,7 +36,7 @@ export class GameWorld {
     private startBatchedUpdates() {
         setInterval(() => {
             this.processBatchedUpdates();
-        }, this.BATCH_INTERVAL_MS);
+        }, NETWORK.BATCH_INTERVAL_MS);
     }
 
     private invalidateConnectionPool() {
