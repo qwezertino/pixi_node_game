@@ -1,113 +1,127 @@
 
-## Project Requirements
-Create a simple 2D game with the following networking capabilities:
-Scan all current project files and only then do all below
+Техлист серверной архитектуры Go для 10K игроков
+1. Основная архитектура
 
-1. Support for 10000+ concurrent players
-2. Multi-threading for handling concurrency
-3. Lag compensation and interpolation for smooth gameplay
-4. Responsive movement and attacks with no perceived delay
-5. Efficient WebSocket communication
-6. Integer-based grid movement system
-7. Server-side and client-side world state synchronization
-8. 60 Hz tickrate
-9. Full world state sync every 30 seconds to prevent desyncs
-10. Debug logging for connections/disconnections
+Go 1.21+ с runtime оптимизациями (GOGC=800, GOMAXPROCS=CPU_COUNT)
+Gorilla WebSocket для WebSocket соединений
+Lock-free структуры данных с atomic операциями
+Memory pooling (sync.Pool) для уменьшения GC pressure
+Worker pool pattern для параллельной обработки
 
-## Technical Stack
-- Server: Implement using Bun.js for superior performance and WebSocket support
-- Client: Implement using PixiJS for efficient WebGL rendering
-- Communication: WebSockets for real-time data transfer
+2. Структуры данных
+Player:
 
-## Data Optimization Requirements
-To minimize bandwidth usage:
-- Use binary data format for all network communication (NOT JSON)
-- Send delta movement (dx, dy) instead of absolute positions
-- Use simple numeric values for player states (idle=0, move=1, attack=2)
-- Implement binary facing direction (-1=left, 1=right) separate from movement
-- Batch player actions and send together rather than immediately
-- Only send data when player state changes
-- Use bit packing techniques to minimize message size
+ID (uint32), X/Y позиция (uint16 для 4000x4000), векторы VX/VY (int8: -1,0,1)
+FacingRight (bool) для поворота спрайта, State, ClientTick для reconciliation
+Viewport размеры (uint16), WebSocket connection
+Atomic timestamp для последнего обновления
 
-## Networking Architecture
-Implement the following architecture:
+GameEvent:
 
-1. **Client-Side**:
-   - Capture and process player input
-   - Apply input locally for immediate feedback
-   - Queue inputs for sending to server in batches
-   - Apply server corrections when received
-   - Implement interpolation for smooth rendering
-   - Allow players to move in one direction while facing another
-   - Use PixiJS for efficient rendering
+PlayerID, Type (move/attack/face), VectorX/VY, FacingRight, ClientTick, Timestamp
 
-2. **Server-Side**:
-   - Run game loop at 60Hz (every 16.7ms)
-   - Process all game logic authoritatively
-   - Distribute processing across multiple worker threads
-   - Send updates only when player states change
-   - Send complete world state every 30 seconds
-   - Validate and sanitize client inputs
-   - Log connections and disconnections
+3. Core компоненты
+GameServer:
 
-3. **Binary Data Format**:
-   - Client input format (binary structure):
-     ```
-     [2 bytes] Player ID
-     [1 byte] Action count
-     For each action:
-       [3 bits] Action type (0=idle, 1=move, 2=attack)
-       [2 bits] dx (-1, 0, 1)
-       [2 bits] dy (-1, 0, 1)
-       [1 bit] facing (0=left, 1=right)
-       [2 bytes] Client timestamp
-     ```
-   - Server update format (binary structure):
-     ```
-     [4 bytes] Server timestamp
-     [2 bytes] Entity count
-     For each entity:
-       [2 bytes] Entity ID
-       [1 bit] Is full update flag
-       If full update:
-         [2 bytes] x position
-         [2 bytes] y position
-       Else (delta update):
-         [2 bits] dx
-         [2 bits] dy
-       [1 bit] facing
-       [3 bits] state
-     [1 byte] Event count
-     For each event:
-       [1 byte] Event type
-       [2 bytes] Source ID
-       [2 bytes] Target ID
-       [1 byte] Additional data (damage, etc)
-     ```
+map[uint32]*Player - все игроки
+chan GameEvent с большим буфером (50k+)
+Worker goroutines (количество = CPU cores)
+Tick system 60 FPS с time.Ticker
 
-## Implementation Priorities
-1. Set up Bun.js server with binary WebSocket support
-2. Implement basic client-side rendering with PixiJS
-3. Create binary serialization/deserialization functions
-4. Establish binary WebSocket communication between client and server
-5. Create player movement with client-side prediction
-6. Implement server-side validation and state management
-7. Add multi-threading for physics and game logic
-8. Optimize binary data transmission and add batching
-9. Implement complete state sync mechanism (every 30 seconds)
-10. Add debug logging and monitoring
-11. Add support for lag compensation and interpolation
-12. Scale test with simulated 1000+ players
+PlayerManager:
 
-## Technical Implementation Notes
-- Use binary WebSocket messages (NOT text/JSON) for all network communication
-- Implement efficient binary serialization/deserialization
-- Use integers for all position values
-- Handle network jitter with smoothing algorithms
-- Implement interest management to only send relevant updates to each player
-- Add debug visualization options for development
-- Create configurable network parameters (tick rate, update frequency)
-- Implement reconnection handling for client disconnects
-- Use bit-level operations for packing/unpacking data
+Одна goroutine на каждого игрока для чтения WebSocket
+Lock-free добавление/удаление игроков
+Async обработка disconnect'ов
 
-Please implement this architecture to create a high-performance 2D multiplayer game capable of handling 1000+ concurrent players with smooth, responsive gameplay.
+4. Обработка событий
+Event Processing:
+
+Batch обработка событий (drain channel за раз)
+Параллельная обработка chunks событий по worker'ам
+Валидация движения без locks (distance check)
+Movement reconciliation с client tick validation
+
+Movement System:
+
+Вектор (-1,0,1) → новая позиция в world coordinates
+World wrapping для координат (3999 → 0, 0 → 3999)
+FacingRight просто toggle при смене направления движения
+Предиктивная валидация с учетом client-side prediction
+
+5. Broadcast система
+Viewport-based Broadcasting:
+
+Для каждого игрока вычислять viewport bounds по его разрешению
+Фильтровать всех игроков по viewport области в реальном времени
+Параллельная отправка через worker pool
+Async отправка без блокировки main loop
+
+
+6. Бинарный протокол
+Outgoing packet format:
+
+Header: PlayerCount (4 bytes)
+Per player: ID(4) + X(2) + Y(2) + VX(1) + VY(1) + FacingRight(1 bit) + State(7 bits) = 11 bytes
+Delta updates: только изменения позиции (3-4 bytes per player)
+Compression для массовых updates
+
+Incoming packet format:
+
+Command(1) + VectorX(1) + VectorY(1) + FacingRight(1) + ClientTick(4) = 8 bytes
+
+7. Concurrency модель
+Main Game Loop:
+
+Single goroutine для game state
+Lock-free channels для communication
+Batch processing событий
+
+Per-Player goroutines:
+
+WebSocket read goroutine на игрока
+Async write через channels
+Graceful disconnect handling
+
+Worker Pools:
+
+Event processing workers (CPU count)
+Broadcast workers (CPU count × 2)
+Connection handlers pool
+
+8. Memory оптимизации
+Object Pools:
+
+sync.Pool для GameEvent, packets, player lists
+Pre-allocated slices для visible players
+Reuse binary buffers
+
+GC оптимизации:
+
+Minimize allocations в hot paths
+Use value types вместо pointers где возможно
+Batch allocation для player arrays
+
+9. Performance мониторинг
+Metrics:
+
+Tick duration, players count, events/sec
+Memory usage, GC stats
+Per-player latency tracking
+Bottleneck identification
+
+
+10. Архитектурные принципы
+
+No global locks - только per-player или per-component locks
+Async everything - никаких blocking операций в main loop
+Batch processing - группировка операций для efficiency
+Predictive validation - client-side prediction + server reconciliation
+Graceful degradation - LOD система при перегрузке
+
+Ожидаемые результаты:
+
+10K concurrent players
+<3ms average latency
+60 FPS stable tick rate
+~95% network traffic reduction vs naive approach

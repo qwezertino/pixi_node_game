@@ -34,10 +34,13 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     const networkManager = new NetworkManager();
 
     // Initialize FPS display with network manager
+    console.log("Creating FPS display...");
     const fpsDisplay = new FpsDisplay(app, networkManager);
+    console.log("FPS display created");
 
     // Connect FPS display to network manager for ping tracking
     networkManager.setFpsDisplay(fpsDisplay);
+    console.log("FPS display connected to network manager");
 
     // Set up F3 key to toggle detailed stats
     input.setF3Callback(() => {
@@ -109,14 +112,18 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
 
     // Wait for network connection and initial position
+    console.log("Waiting for network connection and player ID...");
     await new Promise<void>((resolve) => {
         const checkInterval = setInterval(() => {
             // If we have a player ID, we're connected
-            if (networkManager.getPlayerId()) {
+            const playerId = networkManager.getPlayerId();
+            if (playerId) {
                 clearInterval(checkInterval);
+                console.log("Got player ID:", playerId);
 
                                 // Set player position from server (server sends world coordinates)
                 const initialPosition = networkManager.getInitialPosition();
+                console.log("Initial position:", initialPosition);
 
                 // Only set the movement controller - it will handle coordinate conversion
                 movementController.setInitialPosition(initialPosition.x, initialPosition.y);
@@ -125,6 +132,7 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
             }
         }, 100);
     });
+    console.log("Network connection established, starting game...");
 
         // Attack handling with immediate feedback
     app.canvas.addEventListener("mousedown", (e) => {
@@ -150,6 +158,7 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     let accumulator = 0;
 
     // Game loop
+    console.log("Starting game loop...");
     app.ticker.add((time) => {
         const deltaTime = time.deltaTime / 60; // Convert to seconds
         // Update FPS display
@@ -177,4 +186,5 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
         // Update animation and visual state (can run at variable frame rate)
         animationController.playerRef.scale.copyFrom(movementController.scale);
     });
+    console.log("Game loop started");
 })();

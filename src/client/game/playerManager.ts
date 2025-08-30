@@ -174,30 +174,41 @@ export class PlayerManager {
 
     private setupNetworkCallbacks() {
         this.networkManager.onPlayerJoined(async (player) => {
+            console.log("🔗 PlayerManager: Player joined callback triggered", player);
             await this.addRemotePlayer(player);
         });
 
         this.networkManager.onPlayerLeft((playerId) => {
+            console.log("❌ PlayerManager: Player left callback triggered", playerId);
             this.removeRemotePlayer(playerId);
         });
 
         this.networkManager.onPlayerMovement((playerId, dx, dy) => {
             const currentPlayerId = this.networkManager.getPlayerId();
+            console.log("🏃 PlayerManager: Movement callback", { playerId, currentPlayerId, dx, dy });
 
             if (playerId === currentPlayerId) {
+                console.log("⏭️  Skipping own movement");
                 return;
             }
 
             const player = this.remotePlayers.get(playerId);
             if (player) {
+                console.log("✅ Setting movement vector for player", playerId);
                 player.setMovementVector(dx, dy);
+            } else {
+                console.log("❌ Player not found in remotePlayers:", playerId, "Available players:", Array.from(this.remotePlayers.keys()));
             }
         });
 
         this.networkManager.onPlayerDirection((playerId, direction) => {
+            console.log("↔️  PlayerManager: Direction callback", { playerId, direction });
             const player = this.remotePlayers.get(playerId);
             if (player) {
+                console.log("✅ Setting direction for player", playerId);
                 player.setDirection(direction);
+            } else {
+                console.log("❌ Player not found for direction:", playerId);
             }
         });
 
@@ -209,10 +220,15 @@ export class PlayerManager {
         });
 
         this.networkManager.onGameState(async (players) => {
+            console.log("🌍 PlayerManager: Game state received", players);
             const currentPlayerId = this.networkManager.getPlayerId();
+            console.log("My player ID:", currentPlayerId);
 
             for (const [playerId, playerState] of Object.entries(players)) {
+                console.log("Processing player:", playerId, playerState);
+
                 if (playerId === currentPlayerId) {
+                    console.log("Updating my position:", playerState.position);
                     if (this.movementController) {
                         this.movementController.setVirtualPosition(playerState.position.x, playerState.position.y);
                     }
@@ -222,6 +238,7 @@ export class PlayerManager {
                 const existingPlayer = this.remotePlayers.get(playerId);
 
                 if (existingPlayer) {
+                    console.log("Updating existing player:", playerId);
                     existingPlayer.virtualPosition.x = playerState.position.x;
                     existingPlayer.virtualPosition.y = playerState.position.y;
 
@@ -243,6 +260,7 @@ export class PlayerManager {
                         );
                     }
                 } else {
+                    console.log("Adding new player from game state:", playerId);
                     await this.addRemotePlayer(playerState);
                 }
             }
@@ -256,7 +274,12 @@ export class PlayerManager {
     }
 
     async addRemotePlayer(playerState: PlayerState) {
-        if (this.remotePlayers.has(playerState.id)) return;
+        console.log("➕ PlayerManager: Adding remote player", playerState);
+
+        if (this.remotePlayers.has(playerState.id)) {
+            console.log("⚠️  Player already exists, skipping:", playerState.id);
+            return;
+        }
 
         const characterVisual = await SpriteLoader.loadCharacterVisual(
             "/assets/16x16_knight_2_v3.png"
@@ -289,6 +312,8 @@ export class PlayerManager {
         this.playerContainer.addChild(remotePlayer.sprite);
 
         this.remotePlayers.set(playerState.id, remotePlayer);
+
+        console.log("✅ Remote player added successfully:", playerState.id, "Total players:", this.remotePlayers.size);
     }
 
     setMovementController(movementController: any) {

@@ -33,6 +33,7 @@ export interface MoveMessage extends ClientMessage {
         dy: number;
     };
     inputSequence: number;
+    position: PlayerPosition; // Позиция клиента в момент отправки
 }
 
 export interface DirectionChangeMessage extends ClientMessage {

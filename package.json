@@ -9,7 +9,7 @@
     "dev:server": "bun run src/server/main.ts",
     "build:client": "vite build",
     "build:server": "bun build src/server/main.ts --outfile=dist/assets/server.js --target=bun",
-    "build": "tsc && vite build && bun build src/server/main.ts --outfile=dist/assets/server.js --target=bun",
+    "build": "tsc && vite build",
     "start": "bun run dist/assets/server.js"
   },
   "dependencies": {

@@ -6,16 +6,14 @@ export const NETWORK = {
     BATCH_INTERVAL_MS: 50, // ~20 FPS батчинг - идеально для RPG, снижает нагрузку на сервер
 };
 
-// Параметры движения
 export const MOVEMENT = {
-    PLAYER_SPEED_PER_TICK: 4, // Скорость движения за тик (целые единицы)
-    // Старая скорость для обратной совместимости: 100 единиц/сек при 32 тиках/сек = ~3.125 единиц/тик
+    PLAYER_SPEED_PER_TICK: 4,
 };
 
 // Параметры игрового мира (целые координаты)
 export const WORLD = {
     VIRTUAL_SIZE: {
-        WIDTH: 2000,  // Виртуальный мир 1000x1000 единиц
+        WIDTH: 2000,
         HEIGHT: 2000,
     },
     SPAWN_AREA: {

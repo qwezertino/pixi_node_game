@@ -23,6 +23,8 @@ export class FpsDisplay {
         this.app = app;
         this.networkManager = networkManager;
 
+        console.log("Initializing FPS Display...");
+
         // Create FPS text (always visible)
         this.fpsText = new Text({
             text: "FPS: 0",
@@ -35,6 +37,7 @@ export class FpsDisplay {
         });
         this.fpsText.position.set(10, 10);
         app.stage.addChild(this.fpsText);
+        console.log("FPS text added to stage");
 
         // Create detailed stats text (hidden by default)
         this.statsText = new Text({

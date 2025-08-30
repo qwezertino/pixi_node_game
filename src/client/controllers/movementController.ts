@@ -33,8 +33,8 @@ export class MovementController {
     private _inputSequence = 0;
     private _pendingInputs: Array<{sequence: number, dx: number, dy: number, timestamp: number}> = [];
 
-    // Флаг для отслеживания начала атаки
-    private _attackJustStarted = false;
+    // Флаг для отслеживания отправки стоп-команды во время атаки
+    private _attackStopSent = false;
 
     get isMoving() {
         return this._isMoving;
@@ -72,8 +72,6 @@ export class MovementController {
             this._virtualPosition.y = clampedPos.y;
         }
 
-
-
         if (this._coordinateConverter) {
             const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
             this.position.x = screenPos.x;
@@ -91,29 +89,22 @@ export class MovementController {
         const deltaY = acknowledgedPosition.y - this._virtualPosition.y;
         const distanceSquared = deltaX * deltaX + deltaY * deltaY;
 
-        if (distanceSquared > 4) {
+        // Simple correction: either position is accurate or we reconcile
+        if (distanceSquared > 16) { // 4 pixels tolerance - if bigger difference, reconcile
             this.reconcilePosition(acknowledgedPosition, inputSequence);
-        } else if (distanceSquared > 0.25) {
-            const lerpFactor = 0.4;
-            this._virtualPosition.x += deltaX * lerpFactor;
-            this._virtualPosition.y += deltaY * lerpFactor;
         }
-
-        if (this._coordinateConverter) {
-            const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
-            this.position.x = screenPos.x;
-            this.position.y = screenPos.y;
-        }
+        // If distanceSquared <= 16, client prediction is accurate enough
     }
 
     /**
      * Пересчет позиции на основе server acknowledgment (server reconciliation)
      */
     private reconcilePosition(serverPosition: {x: number, y: number}, lastAckedSequence: number): void {
-
+        // Set position to server authoritative position
         this._virtualPosition.x = serverPosition.x;
         this._virtualPosition.y = serverPosition.y;
 
+        // Re-apply pending inputs that happened after the acknowledged sequence
         const futureInputs = this._pendingInputs.filter(input => input.sequence > lastAckedSequence);
 
         if (futureInputs.length > 0) {
@@ -129,8 +120,14 @@ export class MovementController {
                     this._virtualPosition.x = clampedPos.x;
                     this._virtualPosition.y = clampedPos.y;
                 }
-
             }
+        }
+
+        // Update screen position after reconciliation
+        if (this._coordinateConverter) {
+            const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
+            this.position.x = screenPos.x;
+            this.position.y = screenPos.y;
         }
     }
 
@@ -183,33 +180,15 @@ export class MovementController {
      */
     update(_deltaTime: number) {
         if (this._animationController && this._animationController.playerState === PlayerState.ATTACKING) {
-            // Если мы только что начали атаку, отправим стоп-команду серверу
-            if (this._attackJustStarted && this._isMoving) {
-                this.sendStopToServer();
-                this._isMoving = false;
-                this._attackJustStarted = false;
-            }
-            return false;
-        }
+            // During attack, send stop only once at the beginning
+            this._isMoving = false;
 
-        // Сбросим флаг начала атаки, если мы не в состоянии атаки
-        this._attackJustStarted = false;
-
-        const desiredVector = this.getDesiredMovementVector();
-
-        if (desiredVector.dx !== 0 || desiredVector.dy !== 0) {
-            this.applyMovement(desiredVector.dx, desiredVector.dy);
-            this._isMoving = true;
-
-            if (this.vectorChanged(desiredVector)) {
-                this._currentMovementVector = desiredVector;
-
+            if (!this._attackStopSent) {
                 this._inputSequence++;
-
                 this._pendingInputs.push({
                     sequence: this._inputSequence,
-                    dx: desiredVector.dx,
-                    dy: desiredVector.dy,
+                    dx: 0,
+                    dy: 0,
                     timestamp: Date.now()
                 });
 
@@ -217,8 +196,44 @@ export class MovementController {
                     this._pendingInputs.shift();
                 }
 
-                this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
+                this.sendMovementToServer(0, 0, this._inputSequence);
+                this._attackStopSent = true;
             }
+
+            return false;
+        }
+
+        // Reset attack stop flag when not attacking
+        this._attackStopSent = false;
+
+        const desiredVector = this.getDesiredMovementVector();
+
+        if (desiredVector.dx !== 0 || desiredVector.dy !== 0) {
+            this._isMoving = true;
+
+            // Always update movement vector
+            this._currentMovementVector = desiredVector;
+
+            // Send movement to server every tick
+            const now = Date.now();
+            this._inputSequence++;
+
+            this._pendingInputs.push({
+                sequence: this._inputSequence,
+                dx: desiredVector.dx,
+                dy: desiredVector.dy,
+                timestamp: now
+            });
+
+            if (this._pendingInputs.length > 10) {
+                this._pendingInputs.shift();
+            }
+
+            // Apply movement first to get new position
+            this.applyMovement(this._currentMovementVector.dx, this._currentMovementVector.dy);
+
+            // Then send movement with the NEW position (after movement)
+            this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
 
             return true;
         } else {
@@ -236,6 +251,7 @@ export class MovementController {
                     timestamp: Date.now()
                 });
 
+                // Send movement with current position (no movement applied yet for stop)
                 this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
             }
 
@@ -272,20 +288,10 @@ export class MovementController {
     private sendMovementToServer(dx: number, dy: number, inputSequence: number): void {
         if (!this._networkManager) return;
 
-        this._networkManager.sendMovement(dx, dy, inputSequence);
+        // Send current position to server for validation
+        const currentPosition = this.getVirtualPosition();
+        this._networkManager.sendMovement(dx, dy, inputSequence, currentPosition);
     }
-
-    /**
-     * Отправить стоп-команду на сервер
-     */
-    private sendStopToServer(): void {
-        if (!this._networkManager) return;
-
-        this._inputSequence++;
-        this._networkManager.sendMovement(0, 0, this._inputSequence);
-    }
-
-
 
     /**
      * Установить начальную позицию
@@ -305,17 +311,17 @@ export class MovementController {
     }
 
     /**
-     * Установить флаг начала атаки
+     * Установить флаг начала атаки (устаревший метод, оставлен для совместимости)
      */
     public setAttackStarted(): void {
-        this._attackJustStarted = true;
+        // No longer needed - attack handling is done in update()
     }
 
     /**
-     * Обработчик завершения атаки - отправляем текущее состояние движения серверу
+     * Обработчик завершения атаки (устаревший метод, оставлен для совместимости)
      */
     public onAttackEnd(): void {
-        this.sendMovementToServer(this._currentMovementVector.dx, this._currentMovementVector.dy, ++this._inputSequence);
+        // No longer needed - movement resumes automatically after attack
     }
 
     /**
