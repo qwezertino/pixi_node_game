@@ -172,7 +172,7 @@ func (s *Server) createConnection(player *types.Player, conn *websocket.Conn) *C
 			rate.Limit(s.cfg.Net.MessageRateLimit),
 			s.cfg.Net.BurstLimit,
 		),
-		sendChan: make(chan []byte, 256), // Buffer for outgoing messages
+		sendChan: make(chan []byte, s.cfg.Net.SendChannelSize), // Buffer for outgoing messages
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -319,12 +319,8 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			Viewport: viewport,
 		}
 
-		log.Printf("🔊 Broadcasting movement: Player %d, vector:(%d,%d)",
-			connection.player.ID, clientMsg.MovementVector.DX, clientMsg.MovementVector.DY)
-
 		select {
 		case s.broadcastChan <- broadcast:
-			log.Printf("✅ Movement broadcast sent to channel")
 		default:
 			log.Printf("❌ Movement broadcast channel full, skipped")
 			// Broadcast channel full, skip
@@ -404,7 +400,6 @@ func (s *Server) sendInitialState(connection *Connection) {
 
 // notifyPlayerJoined уведомляет всех игроков о присоединении нового игрока
 func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
-	log.Printf("📢 Notifying all players about Player %d joining", newPlayer.ID)
 
 	playerState := types.PlayerState{
 		ID:          newPlayer.ID,
@@ -428,27 +423,22 @@ func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
 
 		// Skip the new player - they already got the full state
 		if connection.player.ID == newPlayer.ID {
-			log.Printf("   ⏭️  Skipping new player (Player %d)", connection.player.ID)
 			return true
 		}
 
 		select {
 		case connection.sendChan <- data:
-			log.Printf("   ✅ Notified Player %d about new player", connection.player.ID)
 			sentCount++
 		default:
-			log.Printf("   ❌ Failed to notify Player %d", connection.player.ID)
 		}
 
 		return true
 	})
 
-	log.Printf("📊 PlayerJoined notification result: %d/%d players notified", sentCount, totalConnections-1)
 }
 
 // notifyPlayerLeft уведомляет всех игроков об отключении игрока
 func (s *Server) notifyPlayerLeft(leftPlayerID uint32) {
-	log.Printf("📢 Notifying all players about Player %d leaving", leftPlayerID)
 
 	data := s.protocol.EncodePlayerLeft(leftPlayerID)
 
@@ -461,22 +451,18 @@ func (s *Server) notifyPlayerLeft(leftPlayerID uint32) {
 
 		// Skip the leaving player - they're already disconnected
 		if connection.player.ID == leftPlayerID {
-			log.Printf("   ⏭️  Skipping leaving player (Player %d)", connection.player.ID)
 			return true
 		}
 
 		select {
 		case connection.sendChan <- data:
-			log.Printf("   ✅ Notified Player %d about player leaving", connection.player.ID)
 			sentCount++
 		default:
-			log.Printf("   ❌ Failed to notify Player %d", connection.player.ID)
 		}
 
 		return true
 	})
 
-	log.Printf("📊 PlayerLeft notification result: %d/%d players notified", sentCount, totalConnections-1)
 }
 
 // connectionSender отправляет сообщения клиенту
@@ -537,7 +523,6 @@ func (s *Server) broadcastWorker(workerID int) {
 
 // processBroadcast обрабатывает рассылку
 func (s *Server) processBroadcast(broadcast BroadcastMessage) {
-	log.Printf("📡 Processing broadcast from Player %d", broadcast.PlayerID)
 
 	sentCount := 0
 	totalConnections := 0
@@ -548,7 +533,6 @@ func (s *Server) processBroadcast(broadcast BroadcastMessage) {
 
 		// Skip sender
 		if connection.player.ID == broadcast.PlayerID {
-			log.Printf("   ⏭️  Skipping sender (Player %d)", connection.player.ID)
 			return true
 		}
 
@@ -561,7 +545,6 @@ func (s *Server) processBroadcast(broadcast BroadcastMessage) {
 
 			select {
 			case connection.sendChan <- broadcast.Data:
-				log.Printf("   ✅ Sent to Player %d", connection.player.ID)
 				sentCount++
 			default:
 				log.Printf("   ❌ Channel full for Player %d", connection.player.ID)
@@ -573,8 +556,6 @@ func (s *Server) processBroadcast(broadcast BroadcastMessage) {
 
 		return true
 	})
-
-	log.Printf("📊 Broadcast result: %d/%d clients notified", sentCount, totalConnections-1)
 }
 
 // getOrCreateRateLimiter получает или создает rate limiter для IP

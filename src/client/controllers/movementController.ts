@@ -3,22 +3,9 @@ import { InputManager } from "../utils/inputManager";
 import { NetworkManager } from "../network/networkManager";
 import { AnimationController, PlayerState } from "./animationController";
 import { CoordinateConverter } from "../utils/coordinateConverter";
-import { MOVEMENT } from "../../common/gameSettings";
+import { MOVEMENT } from "../../shared/gameConfig";
 
-/**
- * Контроллер движения для локального игрока с client-side prediction
- *
- * Принцип работы:
- * 1. При нажатии клавиш определяем вектор движения (-1, 0, 1)
- * 2. Отправляем вектор движения на сервер
- * 3. Локально предсказываем движение для плавности (client-side prediction)
- * 4. Сервер рассчитывает позицию и рассылает обновления
- * 5. При получении gameState корректируем позицию (server reconciliation)
- *
- * Client-side prediction + Server reconciliation = плавное движение без лагов!
- * Виртуальный мир: 1000x1000 целочисленных единиц
- * Экран: адаптируется к размеру экрана клиента
- */
+
 export class MovementController {
     private _isMoving = false;
     private _scale: Point;
@@ -55,7 +42,7 @@ export class MovementController {
      * Применить движение локально (client-side prediction)
      */
     private applyMovement(dx: number, dy: number): void {
-        const moveDistance = MOVEMENT.PLAYER_SPEED_PER_TICK;
+        const moveDistance = MOVEMENT.playerSpeedPerTick;
 
         if (dx !== 0) {
             this._virtualPosition.x += dx * moveDistance;
@@ -109,7 +96,7 @@ export class MovementController {
 
         if (futureInputs.length > 0) {
             for (const input of futureInputs) {
-                const moveDistance = MOVEMENT.PLAYER_SPEED_PER_TICK;
+                const moveDistance = MOVEMENT.playerSpeedPerTick;
                 this._virtualPosition.x += input.dx * moveDistance;
                 this._virtualPosition.y += input.dy * moveDistance;
 
@@ -179,32 +166,10 @@ export class MovementController {
      * Основная функция обновления движения с client-side prediction
      */
     update(_deltaTime: number) {
-        if (this._animationController && this._animationController.playerState === PlayerState.ATTACKING) {
-            // During attack, send stop only once at the beginning
-            this._isMoving = false;
-
-            if (!this._attackStopSent) {
-                this._inputSequence++;
-                this._pendingInputs.push({
-                    sequence: this._inputSequence,
-                    dx: 0,
-                    dy: 0,
-                    timestamp: Date.now()
-                });
-
-                if (this._pendingInputs.length > 10) {
-                    this._pendingInputs.shift();
-                }
-
-                this.sendMovementToServer(0, 0, this._inputSequence);
-                this._attackStopSent = true;
-            }
-
-            return false;
-        }
-
         // Reset attack stop flag when not attacking
-        this._attackStopSent = false;
+        if (this._animationController && this._animationController.playerState !== PlayerState.ATTACKING) {
+            this._attackStopSent = false;
+        }
 
         const desiredVector = this.getDesiredMovementVector();
 
@@ -214,34 +179,57 @@ export class MovementController {
             // Always update movement vector
             this._currentMovementVector = desiredVector;
 
-            // Send movement to server every tick
-            const now = Date.now();
-            this._inputSequence++;
+            // Check if we're attacking - if so, block ALL movement (local and server)
+            if (this._animationController && this._animationController.playerState === PlayerState.ATTACKING) {
+                // During attack, send stop command only once and don't apply any movement
+                if (!this._attackStopSent) {
+                    this._inputSequence++;
+                    this._pendingInputs.push({
+                        sequence: this._inputSequence,
+                        dx: 0,
+                        dy: 0,
+                        timestamp: Date.now()
+                    });
 
-            this._pendingInputs.push({
-                sequence: this._inputSequence,
-                dx: desiredVector.dx,
-                dy: desiredVector.dy,
-                timestamp: now
-            });
+                    if (this._pendingInputs.length > 10) {
+                        this._pendingInputs.shift();
+                    }
 
-            if (this._pendingInputs.length > 10) {
-                this._pendingInputs.shift();
+                    this.sendMovementToServer(0, 0, this._inputSequence);
+                    this._attackStopSent = true;
+                }
+                // Block both local movement and server communication during attack
+                return true; // Still return true to indicate movement keys are pressed
+            } else {
+                // Normal movement - apply locally and send to server
+                this.applyMovement(this._currentMovementVector.dx, this._currentMovementVector.dy);
+
+                const now = Date.now();
+                this._inputSequence++;
+
+                this._pendingInputs.push({
+                    sequence: this._inputSequence,
+                    dx: desiredVector.dx,
+                    dy: desiredVector.dy,
+                    timestamp: now
+                });
+
+                if (this._pendingInputs.length > 10) {
+                    this._pendingInputs.shift();
+                }
+
+                this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
             }
-
-            // Apply movement first to get new position
-            this.applyMovement(this._currentMovementVector.dx, this._currentMovementVector.dy);
-
-            // Then send movement with the NEW position (after movement)
-            this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
 
             return true;
         } else {
             this._isMoving = false;
 
-            if (this.vectorChanged(desiredVector)) {
-                this._currentMovementVector = desiredVector;
+            // Send stop command only if not during attack
+            if (this.vectorChanged(desiredVector) &&
+                !(this._animationController && this._animationController.playerState === PlayerState.ATTACKING)) {
 
+                this._currentMovementVector = desiredVector;
                 this._inputSequence++;
 
                 this._pendingInputs.push({
@@ -251,7 +239,6 @@ export class MovementController {
                     timestamp: Date.now()
                 });
 
-                // Send movement with current position (no movement applied yet for stop)
                 this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
             }
 

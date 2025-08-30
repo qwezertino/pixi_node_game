@@ -1,4 +1,4 @@
-import { Application, Container } from "pixi.js";
+import { Application, Container, Graphics } from "pixi.js";
 import { SpriteLoader } from "./utils/spriteLoader";
 import { FpsDisplay } from "./utils/fpsDisplay";
 import { InputManager } from "./utils/inputManager";
@@ -7,14 +7,14 @@ import { AnimationController, PlayerState } from "./controllers/animationControl
 import { NetworkManager } from "./network/networkManager";
 import { PlayerManager } from "./game/playerManager";
 import { TICK_RATE } from "../protocol/messages";
-import { PLAYER } from "../common/gameSettings";
+import { PLAYER } from "../shared/gameConfig";
 import { BinaryProtocol } from "../protocol/binaryProtocol";
 import { CoordinateConverter } from "./utils/coordinateConverter";
 
 (async () => {
     const app = new Application();
     await app.init({
-        background: "#1099bb",
+        background: "#333333", // Темно-серый фон для области вне мира
         resizeTo: window,
         eventMode: "static",
         antialias: true
@@ -22,6 +22,12 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
     const container = document.getElementById("pixi-container")!;
     container.appendChild(app.canvas);
+
+    // Create world background (light gray) to visualize world boundaries
+    const worldBackground = new Graphics();
+    worldBackground.rect(0, 0, app.screen.width, app.screen.height);
+    worldBackground.fill(0xE0E0E0); // Светло-серый фон мира
+    app.stage.addChild(worldBackground);
 
     // Create player container for organizing all player sprites
     const playerContainer = new Container();
@@ -34,13 +40,10 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     const networkManager = new NetworkManager();
 
     // Initialize FPS display with network manager
-    console.log("Creating FPS display...");
     const fpsDisplay = new FpsDisplay(app, networkManager);
-    console.log("FPS display created");
 
     // Connect FPS display to network manager for ping tracking
     networkManager.setFpsDisplay(fpsDisplay);
-    console.log("FPS display connected to network manager");
 
     // Set up F3 key to toggle detailed stats
     input.setF3Callback(() => {
@@ -58,8 +61,8 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     const characterVisual = await SpriteLoader.loadCharacterVisual("/assets/16x16_knight_3_v3.png");
 
     const playerSprite = characterVisual.getAnimation("idle")!;
-    playerSprite.scale.set(PLAYER.BASE_SCALE); // Используем настройки из gameSettings
-    playerSprite.animationSpeed = PLAYER.ANIMATION_SPEED; // Используем настройки из gameSettings
+    playerSprite.scale.set(PLAYER.baseScale); // Используем настройки из gameSettings
+    playerSprite.animationSpeed = PLAYER.animationSpeed; // Используем настройки из gameSettings
     playerSprite.play();
 
     // Set initial player position at virtual world center (will be updated when connected to server)
@@ -102,6 +105,11 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
         // Обновляем размеры в coordinate converter
         coordinateConverter.updateScreenSize(newWidth, newHeight);
+
+        // Обновляем размер фона мира
+        worldBackground.clear();
+        worldBackground.rect(0, 0, newWidth, newHeight);
+        worldBackground.fill(0xE0E0E0);
 
         // Обновляем позиции всех игроков
         playerManager.updateAllPlayerPositions();
@@ -169,12 +177,15 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
         // Process physics at fixed time steps
         while (accumulator >= fixedTimeStep) {
-            // Update movement only if not attacking
+            // Always update movement - let MovementController decide attack behavior
+            const isMoving = movementController.update(fixedTimeStep);
+            movementController.updateScale(input.mousePosition.x);
+
+            // Set animation state based on attack state and movement
             if (animationController.playerState !== PlayerState.ATTACKING) {
-                const isMoving = movementController.update(fixedTimeStep);
-                movementController.updateScale(input.mousePosition.x);
                 animationController.setState(isMoving ? PlayerState.MOVING : PlayerState.IDLE);
             }
+            // During attack, keep ATTACKING state and don't change it
 
             // Update remote players
             playerManager.update(fixedTimeStep);

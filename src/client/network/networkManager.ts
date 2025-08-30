@@ -102,21 +102,12 @@ export class NetworkManager {
 
                 switch (message.type) {
                     case "playerMovement":
-                        console.log("📥 Received playerMovement:", {
-                            fromPlayer: message.playerId,
-                            myId: this.playerId,
-                            vector: message.movementVector,
-                            areEqual: message.playerId === this.playerId,
-                            playerIdType: typeof message.playerId,
-                            myIdType: typeof this.playerId
-                        });
 
-                        // Only process movement updates for other players, not ourselves
+
                         if (
                             message.movementVector &&
                             message.playerId !== this.playerId
                         ) {
-                            console.log("✅ Processing movement for other player");
                             this.onPlayerMovementCallbacks.forEach((callback) =>
                                 callback(
                                     message.playerId,
@@ -173,7 +164,6 @@ export class NetworkManager {
                         break;
 
                     case "gameState":
-                        console.log("🌍 Received gameState:", message);
 
                         // If we don't have a player ID yet, determine it from the game state
                         if (!this.playerId && message.players) {
@@ -182,11 +172,9 @@ export class NetworkManager {
                                 // For now, assume we're the first player in the list
                                 // This is a simplified approach - in real game this should be handled differently
                                 this.playerId = playerIds[playerIds.length - 1]; // Take the last player (most recently joined)
-                                console.log("📋 Set player ID from gameState:", this.playerId, "at position:", message.players[this.playerId]?.position);
 
                                 if (message.players[this.playerId]) {
                                     this.initialPosition = message.players[this.playerId].position;
-                                    console.log("📋 Initial position:", this.initialPosition);
                                 }
                             }
                         }
@@ -198,16 +186,8 @@ export class NetworkManager {
                         break;
 
                     case "movementAck":
-                        console.log("📥 Received movementAck:", {
-                            fromPlayer: message.playerId,
-                            myId: this.playerId,
-                            position: message.position,
-                            inputSequence: message.inputSequence,
-                            areEqual: message.playerId === this.playerId
-                        });
 
                         if (message.playerId === this.playerId) {
-                            console.log("✅ Processing own movement ack");
                             this.onMovementAckCallbacks.forEach((callback) =>
                                 callback(message.position, message.inputSequence)
                             );

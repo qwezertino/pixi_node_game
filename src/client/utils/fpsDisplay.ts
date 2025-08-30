@@ -37,7 +37,6 @@ export class FpsDisplay {
         });
         this.fpsText.position.set(10, 10);
         app.stage.addChild(this.fpsText);
-        console.log("FPS text added to stage");
 
         // Create detailed stats text (hidden by default)
         this.statsText = new Text({

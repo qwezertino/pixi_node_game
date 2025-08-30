@@ -1,0 +1,46 @@
+{
+  "network": {
+    "tickRate": 32,
+    "syncInterval": 30000,
+    "batchIntervalMs": 50,
+    "port": 8108,
+    "host": "0.0.0.0",
+    "maxConnections": 12000,
+    "eventChannelSize": 100000,
+    "sendChannelSize": 2048,
+    "broadcastWorkers": 0,
+    "messageRateLimit": 60,
+    "burstLimit": 10,
+    "readBufferSize": 4096,
+    "writeBufferSize": 4096,
+    "workers": 0
+  },
+  "movement": {
+    "playerSpeedPerTick": 4
+  },
+  "world": {
+    "virtualSize": {
+      "width": 6000,
+      "height": 3000
+    },
+    "spawnArea": {
+      "minX": 100,
+      "maxX": 900,
+      "minY": 100,
+      "maxY": 900
+    },
+    "boundaries": {
+      "minX": 0,
+      "maxX": 6000,
+      "minY": 0,
+      "maxY": 3000
+    }
+  },
+  "player": {
+    "baseScale": 2,
+    "animationSpeed": 0.1
+  },
+  "game": {
+    "debugMode": false
+  }
+}

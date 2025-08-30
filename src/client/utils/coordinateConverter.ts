@@ -1,14 +1,6 @@
-import { WORLD } from "../../common/gameSettings";
+import { WORLD } from "../../shared/gameConfig";
 
-/**
- * Конвертер между целочисленными виртуальными координатами и экранными пикселями
- *
- * Виртуальный мир: 1000x1000 целочисленных единиц
- * Экран: адаптируется к размеру экрана каждого клиента
- *
- * Коэффициенты конвертации рассчитываются динамически для каждого клиента
- * Это обеспечивает точную синхронизацию без проблем с floating point precision
- */
+
 export class CoordinateConverter {
     private scaleX: number = 1;
     private scaleY: number = 1;
@@ -23,52 +15,43 @@ export class CoordinateConverter {
 
     /**
      * Рассчитываем коэффициенты конвертации на основе размера экрана
-     * Используем подход "fit to screen" - вписываем виртуальный мир в экран
+     * Используем подход "fill screen" - растягиваем виртуальный мир на весь экран
      */
     private calculateScales(): void {
-        // Рассчитываем коэффициенты так, чтобы виртуальный мир вписывался в экран
-        // Сохраняя соотношение сторон виртуального мира
-        const virtualWidth = WORLD.VIRTUAL_SIZE.WIDTH;
-        const virtualHeight = WORLD.VIRTUAL_SIZE.HEIGHT;
+        // Рассчитываем коэффициенты так, чтобы виртуальный мир заполнял весь экран
+        const virtualWidth = WORLD.virtualSize.width;
+        const virtualHeight = WORLD.virtualSize.height;
 
-        // Рассчитываем коэффициенты для вписывания по ширине и высоте
-        const scaleXByWidth = this.screenWidth / virtualWidth;
-        const scaleYByHeight = this.screenHeight / virtualHeight;
-
-        // Выбираем минимальный коэффициент, чтобы весь мир поместился на экране
-        const minScale = Math.min(scaleXByWidth, scaleYByHeight);
-
-        this.scaleX = minScale;
-        this.scaleY = minScale;
+        // Рассчитываем коэффициенты для заполнения экрана
+        this.scaleX = this.screenWidth / virtualWidth;
+        this.scaleY = this.screenHeight / virtualHeight;
     }
 
     /**
      * Конвертировать виртуальные координаты в экранные пиксели
-     * Учитывает смещение мира для центрирования на экране
-     * @param virtualX - X координата в виртуальном мире (0-1000)
-     * @param virtualY - Y координата в виртуальном мире (0-1000)
+     * Мир заполняет весь экран, поэтому смещение не нужно
+     * @param virtualX - X координата в виртуальном мире (0-6000)
+     * @param virtualY - Y координата в виртуальном мире (0-6000)
      * @returns Экранные координаты в пикселях
      */
     virtualToScreen(virtualX: number, virtualY: number): { x: number, y: number } {
-        const offset = this.getWorldOffset();
         return {
-            x: virtualX * this.scaleX + offset.x,
-            y: virtualY * this.scaleY + offset.y
+            x: virtualX * this.scaleX,
+            y: virtualY * this.scaleY
         };
     }
 
     /**
      * Конвертировать экранные пиксели в виртуальные координаты
-     * Учитывает смещение мира на экране
+     * Мир заполняет весь экран, поэтому смещение не нужно
      * @param screenX - X координата на экране
      * @param screenY - Y координата на экране
      * @returns Виртуальные координаты (округленные до целых)
      */
     screenToVirtual(screenX: number, screenY: number): { x: number, y: number } {
-        const offset = this.getWorldOffset();
         return {
-            x: Math.round((screenX - offset.x) / this.scaleX),
-            y: Math.round((screenY - offset.y) / this.scaleY)
+            x: Math.round(screenX / this.scaleX),
+            y: Math.round(screenY / this.scaleY)
         };
     }
 
@@ -78,33 +61,27 @@ export class CoordinateConverter {
      */
     getVirtualCenter(): { x: number, y: number } {
         return {
-            x: Math.round(WORLD.VIRTUAL_SIZE.WIDTH / 2),
-            y: Math.round(WORLD.VIRTUAL_SIZE.HEIGHT / 2)
+            x: Math.round(WORLD.virtualSize.width / 2),
+            y: Math.round(WORLD.virtualSize.height / 2)
         };
     }
 
     /**
      * Получить позицию виртуального мира на экране
-     * Возвращает смещение, необходимое для центрирования мира на экране
+     * Мир заполняет весь экран, поэтому смещение всегда (0, 0)
      */
     getWorldOffset(): { x: number, y: number } {
-        const virtualWidth = WORLD.VIRTUAL_SIZE.WIDTH * this.scaleX;
-        const virtualHeight = WORLD.VIRTUAL_SIZE.HEIGHT * this.scaleY;
-
-        return {
-            x: (this.screenWidth - virtualWidth) / 2,
-            y: (this.screenHeight - virtualHeight) / 2
-        };
+        return { x: 0, y: 0 };
     }
 
     /**
      * Проверить, находится ли точка в пределах виртуального мира
      */
     isInVirtualBounds(virtualX: number, virtualY: number): boolean {
-        return virtualX >= WORLD.BOUNDARIES.MIN_X &&
-               virtualX <= WORLD.BOUNDARIES.MAX_X &&
-               virtualY >= WORLD.BOUNDARIES.MIN_Y &&
-               virtualY <= WORLD.BOUNDARIES.MAX_Y;
+        return virtualX >= WORLD.boundaries.minX &&
+               virtualX <= WORLD.boundaries.maxX &&
+               virtualY >= WORLD.boundaries.minY &&
+               virtualY <= WORLD.boundaries.maxY;
     }
 
     /**
@@ -112,10 +89,10 @@ export class CoordinateConverter {
      */
     clampToVirtualBounds(virtualX: number, virtualY: number): { x: number, y: number } {
         return {
-            x: Math.max(WORLD.BOUNDARIES.MIN_X,
-               Math.min(WORLD.BOUNDARIES.MAX_X, virtualX)),
-            y: Math.max(WORLD.BOUNDARIES.MIN_Y,
-               Math.min(WORLD.BOUNDARIES.MAX_Y, virtualY))
+            x: Math.max(WORLD.boundaries.minX,
+               Math.min(WORLD.boundaries.maxX, virtualX)),
+            y: Math.max(WORLD.boundaries.minY,
+               Math.min(WORLD.boundaries.maxY, virtualY))
         };
     }
 

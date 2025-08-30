@@ -1,7 +1,7 @@
-import { NETWORK } from '../common/gameSettings';
+import { NETWORK } from '../shared/gameConfig';
 
-export const TICK_RATE = NETWORK.TICK_RATE;
-export const SYNC_INTERVAL = NETWORK.SYNC_INTERVAL;
+export const TICK_RATE = NETWORK.tickRate;
+export const SYNC_INTERVAL = NETWORK.syncInterval;
 
 export interface PlayerPosition {
     x: number;

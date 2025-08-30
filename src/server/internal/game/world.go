@@ -2,6 +2,7 @@ package game
 
 import (
 	"log"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,9 @@ type GameWorld struct {
 	lastFullSync time.Time
 } // NewGameWorld создает новый игровой мир
 func NewGameWorld(cfg *config.Config) *GameWorld {
+	// Initialize random seed for spawn positions
+	rand.Seed(time.Now().UnixNano())
+
 	gw := &GameWorld{
 		cfg:          cfg,
 		eventChan:    make(chan types.GameEvent, cfg.Net.EventChannelSize),
@@ -77,9 +81,12 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 func (gw *GameWorld) AddPlayer() *types.Player {
 	playerID := atomic.AddUint32(&gw.nextPlayerID, 1)
 
-	// Generate spawn position
-	spawnX := gw.cfg.World.SpawnMinX + uint16(playerID%uint32(gw.cfg.World.SpawnMaxX-gw.cfg.World.SpawnMinX))
-	spawnY := gw.cfg.World.SpawnMinY + uint16((playerID*7)%uint32(gw.cfg.World.SpawnMaxY-gw.cfg.World.SpawnMinY))
+	// Generate random spawn position within spawn area
+	spawnRangeX := gw.cfg.World.SpawnMaxX - gw.cfg.World.SpawnMinX
+	spawnRangeY := gw.cfg.World.SpawnMaxY - gw.cfg.World.SpawnMinY
+
+	spawnX := gw.cfg.World.SpawnMinX + uint16(rand.Intn(int(spawnRangeX)))
+	spawnY := gw.cfg.World.SpawnMinY + uint16(rand.Intn(int(spawnRangeY)))
 
 	player := &types.Player{
 		ID:             playerID,

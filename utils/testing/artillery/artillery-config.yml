@@ -2,34 +2,34 @@ config:
   target: 'ws://localhost:8108/ws'
   processor: './artillery-processor.cjs'
   phases:
-    # Gradual ramp up to test stability
-    - duration: 60
-      arrivalRate: 5
-      name: "Warm up - 300 clients"
-
-    # Test 500 clients sustained
-    - duration: 60
-      arrivalRate: 8
-      name: "Ramp to 500 clients"
-    - duration: 5
-      arrivalRate: 2
-      name: "500 clients sustained test"
-
-    # # Test 5000 clients
-    # - duration: 180
-    #   arrivalRate: 20
-    #   name: "Ramp to 5000 clients"
-    # - duration: 300
+    # # Gradual ramp up to test stability
+    # - duration: 60
     #   arrivalRate: 5
-    #   name: "5000 clients sustained test"
+    #   name: "Warm up - 300 clients"
 
-    # # Test 10000 clients - the ultimate goal
-    # - duration: 300
-    #   arrivalRate: 25
-    #   name: "Ramp to 10000 clients"
-    # - duration: 600
+    # # Test 500 clients sustained
+    # - duration: 60
+    #   arrivalRate: 8
+    #   name: "Ramp to 500 clients"
+    # - duration: 5
     #   arrivalRate: 2
-    #   name: "10000 clients sustained test"
+    #   name: "500 clients sustained test"
+
+    # Test 5000 clients
+    - duration: 180
+      arrivalRate: 20
+      name: "Ramp to 5000 clients"
+    - duration: 300
+      arrivalRate: 5
+      name: "5000 clients sustained test"
+
+    # Test 10000 clients - the ultimate goal
+    - duration: 300
+      arrivalRate: 25
+      name: "Ramp to 10000 clients"
+    - duration: 600
+      arrivalRate: 2
+      name: "10000 clients sustained test"
 
   # Performance and monitoring - OPTIMIZED FOR HIGH LOAD
   # http:

@@ -22,9 +22,9 @@ function packMovement(dx, dy) {
   return packed;
 }
 
-// Encode binary move message
-function encodeMove(movementVector, inputSequence) {
-  const buffer = new ArrayBuffer(6);
+// Encode binary move message with position (compatible with current server)
+function encodeMove(movementVector, inputSequence, position = { x: 400, y: 300 }) {
+  const buffer = new ArrayBuffer(14); // Updated to 14 bytes to include position
   const view = new DataView(buffer);
   view.setUint8(0, MessageType.MOVE);
 
@@ -34,6 +34,11 @@ function encodeMove(movementVector, inputSequence) {
 
   view.setUint8(1, packed);
   view.setUint32(2, inputSequence, true);
+
+  // Add position data (x, y as uint32)
+  view.setUint32(6, Math.floor(position.x), true);
+  view.setUint32(10, Math.floor(position.y), true);
+
   return new Uint8Array(buffer);
 }
 
@@ -68,7 +73,11 @@ module.exports = {
   // Initialize client with proper state tracking
   initializeClient: function(context, events, done) {
     context.vars.inputSequence = 1;
-    context.vars.position = { x: 400, y: 300 }; // Start in center
+    // Use spawn area from gameConfig (100-900 range)
+    context.vars.position = {
+      x: Math.floor(Math.random() * 800) + 100, // 100-900
+      y: Math.floor(Math.random() * 800) + 100  // 100-900
+    };
     context.vars.direction = 1;
     context.vars.attacking = false;
     context.vars.lastAttackTime = 0;
@@ -102,8 +111,18 @@ module.exports = {
       movement = patterns[Math.floor(Math.random() * patterns.length)];
     }
 
-    // Encode as binary and send directly
-    const binaryMessage = encodeMove(movement, context.vars.inputSequence++);
+    // Encode as binary and send directly with current position
+    const binaryMessage = encodeMove(movement, context.vars.inputSequence++, context.vars.position);
+
+    // Update position based on movement for next message
+    if (movement.dx !== 0 || movement.dy !== 0) {
+      context.vars.position.x += movement.dx * 4; // Using speed from gameConfig
+      context.vars.position.y += movement.dy * 4;
+
+      // Keep position within world bounds (from gameConfig)
+      context.vars.position.x = Math.max(0, Math.min(2000, context.vars.position.x));
+      context.vars.position.y = Math.max(0, Math.min(2000, context.vars.position.y));
+    }
 
     if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
       context.ws.send(binaryMessage);
