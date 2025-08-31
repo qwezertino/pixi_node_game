@@ -18,7 +18,6 @@ func main() {
 	cfg := config.Load()
 
 	log.Printf("🚀 Starting HIGH-PERFORMANCE Go game server")
-	log.Printf("🎯 Target: 10,000+ concurrent players")
 	log.Printf("📊 Config: Port=%d, TickRate=%dHz, Workers=%d",
 		cfg.Server.Port, cfg.Game.TickRate, cfg.Server.Workers)
 

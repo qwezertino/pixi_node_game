@@ -27,7 +27,9 @@ export type OnPlayerAttackCallback = (
 ) => void;
 
 export class NetworkManager {
-    private socket: WebSocket;
+    private socket: WebSocket | null = null;
+    private worker: Worker | null = null;
+    private useWorker: boolean = true; // Use Web Worker for WebSocket to avoid blocking main thread
     private playerId: string = "";
     private initialPosition: PlayerPosition = { x: 0, y: 0 };
     private players: Record<string, PlayerState> = {};
@@ -46,19 +48,84 @@ export class NetworkManager {
     private fpsDisplay: any = null;
 
     constructor() {
+        if (this.useWorker && typeof Worker !== 'undefined') {
+            this.initWorker();
+        } else {
+            this.initDirectSocket();
+        }
+    }
+
+    private initWorker() {
+        try {
+            this.worker = new Worker(new URL('./networkWorker.ts', import.meta.url), { type: 'module' });
+
+            this.worker.onmessage = (e) => {
+                const msg = e.data;
+                switch (msg.type) {
+                    case 'open':
+                        this.onSocketOpen();
+                        break;
+                    case 'message':
+                        this.handleServerMessage(msg.data);
+                        break;
+                    case 'close':
+                        this.onSocketClose();
+                        break;
+                    case 'error':
+                        this.onSocketError();
+                        break;
+                }
+            };
+
+            this.worker.onerror = (error) => {
+                console.error('Network Worker error:', error);
+                // Fallback to direct socket
+                this.useWorker = false;
+                this.initDirectSocket();
+            };
+
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const host = "127.0.0.1:8108";
+            const wsUrl = `${protocol}//${host}/ws`;
+
+            this.worker.postMessage({ type: 'connect', url: wsUrl });
+        } catch (error) {
+            console.warn('Failed to initialize Web Worker, falling back to direct WebSocket:', error);
+            this.useWorker = false;
+            this.initDirectSocket();
+        }
+    }
+
+    private initDirectSocket() {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const host = "localhost:8108"; // Change to window.location.host in production
+        const host = "127.0.0.1:8108";
         const wsUrl = `${protocol}//${host}/ws`;
 
         this.socket = new WebSocket(wsUrl);
         this.setupSocketEvents();
     }
 
+    private onSocketOpen() {
+        // Handle connection established
+        console.log('WebSocket connected via worker');
+    }
+
+    private onSocketClose() {
+        // Handle connection closed
+        console.log('WebSocket closed');
+    }
+
+    private onSocketError() {
+        // Handle connection error
+        console.error('WebSocket error');
+    }
+
     private setupSocketEvents() {
+        if (!this.socket) return;
+
         // Connection established
         this.socket.addEventListener("open", () => {
-
-            // We'll automatically receive initial state from server
+            console.log('WebSocket connected directly');
         });
 
         // Receive messages from server
@@ -68,7 +135,6 @@ export class NetworkManager {
 
                 // Handle Blob data
                 if (processedData instanceof Blob) {
-                    // Convert Blob to ArrayBuffer
                     processedData = await processedData.arrayBuffer();
                 }
 
@@ -80,11 +146,12 @@ export class NetworkManager {
 
         // Connection closed
         this.socket.addEventListener("close", () => {
-
+            console.log('WebSocket closed');
         });
 
         // Connection error
         this.socket.addEventListener("error", () => {
+            console.error('WebSocket error');
         });
     }
 
@@ -251,8 +318,6 @@ export class NetworkManager {
 
     // Send movement to server
     public sendMovement(dx: number, dy: number, inputSequence?: number, position?: { x: number; y: number }): void {
-        if (this.socket.readyState !== WebSocket.OPEN) return;
-
         const moveMsg = {
             type: "move" as const,
             movementVector: { dx, dy },
@@ -267,13 +332,16 @@ export class NetworkManager {
 
         // Use binary protocol for frequent updates
         const binaryData = BinaryProtocol.encodeMove(moveMsg);
-        this.socket.send(binaryData);
+
+        if (this.worker) {
+            this.worker.postMessage({ type: 'send', data: binaryData });
+        } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(binaryData);
+        }
     }
 
     // Send direction change to server
     public sendDirection(direction: -1 | 1): void {
-        if (this.socket.readyState !== WebSocket.OPEN) return;
-
         const dirMsg = {
             type: "direction" as const,
             direction,
@@ -281,21 +349,32 @@ export class NetworkManager {
 
         // Use binary protocol for frequent updates
         const binaryData = BinaryProtocol.encodeDirection(dirMsg);
-        this.socket.send(binaryData);
+
+        if (this.worker) {
+            this.worker.postMessage({ type: 'send', data: binaryData });
+        } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(binaryData);
+        }
     }
 
     // Send attack to server
     public sendAttack(binaryData: Uint8Array): void {
-        if (this.socket.readyState !== WebSocket.OPEN) return;
-        this.socket.send(binaryData);
+        if (this.worker) {
+            this.worker.postMessage({ type: 'send', data: binaryData });
+        } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(binaryData);
+        }
     }
 
     // Send attack end to server
     public sendAttackEnd(): void {
-        if (this.socket.readyState !== WebSocket.OPEN) return;
-
         const binaryData = BinaryProtocol.encodeAttackEnd();
-        this.socket.send(binaryData);
+
+        if (this.worker) {
+            this.worker.postMessage({ type: 'send', data: binaryData });
+        } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(binaryData);
+        }
     }
 
     // Get player ID
@@ -313,8 +392,37 @@ export class NetworkManager {
         return this.players;
     }
 
+    // Get connection status
+    public getConnectionStatus(): string {
+        if (this.worker) {
+            // For worker, we can't directly check socket state, assume connected if worker exists
+            return 'Connected (Worker)';
+        } else if (this.socket) {
+            switch (this.socket.readyState) {
+                case WebSocket.CONNECTING: return 'Connecting';
+                case WebSocket.OPEN: return 'Connected';
+                case WebSocket.CLOSING: return 'Closing';
+                case WebSocket.CLOSED: return 'Disconnected';
+                default: return 'Unknown';
+            }
+        }
+        return 'Disconnected';
+    }
+
+    // Cleanup method
+    public disconnect(): void {
+        if (this.worker) {
+            this.worker.postMessage({ type: 'disconnect' });
+            this.worker.terminate();
+            this.worker = null;
+        } else if (this.socket) {
+            this.socket.close();
+            this.socket = null;
+        }
+    }
+
     // Set FPS display reference for ping tracking
-    public setFpsDisplay(fpsDisplay: any) {
+    public setFpsDisplay(fpsDisplay: any): void {
         this.fpsDisplay = fpsDisplay;
     }
 }

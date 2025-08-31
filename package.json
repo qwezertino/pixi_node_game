@@ -4,13 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "npm-run-all --parallel dev:client dev:server",
     "dev:client": "vite",
-    "dev:server": "bun run src/server/main.ts",
-    "build:client": "vite build",
-    "build:server": "bun build src/server/main.ts --outfile=dist/assets/server.js --target=bun",
-    "build": "tsc && vite build",
-    "start": "bun run dist/assets/server.js"
+    "build:client": "vite build"
   },
   "dependencies": {
     "@pixi/devtools": "^2.0.1",

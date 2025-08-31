@@ -9,8 +9,8 @@
     "eventChannelSize": 100000,
     "sendChannelSize": 2048,
     "broadcastWorkers": 0,
-    "messageRateLimit": 60,
-    "burstLimit": 10,
+    "messageRateLimit": 120,
+    "burstLimit": 20,
     "readBufferSize": 4096,
     "writeBufferSize": 4096,
     "workers": 0
@@ -24,10 +24,10 @@
       "height": 3000
     },
     "spawnArea": {
-      "minX": 100,
-      "maxX": 900,
-      "minY": 100,
-      "maxY": 900
+      "minX": 1500,
+      "maxX": 3000,
+      "minY": 500,
+      "maxY": 1500
     },
     "boundaries": {
       "minX": 0,
@@ -42,5 +42,8 @@
   },
   "game": {
     "debugMode": false
+  },
+  "colors": {
+    "worldBackground": "#808080"
   }
 }

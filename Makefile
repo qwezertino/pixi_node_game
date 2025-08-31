@@ -10,7 +10,7 @@ SERVER_BINARY=server
 SERVER_OUTPUT_DIR=$(CLIENT_BUILD_DIR)
 
 # Install dependencies for both client and server
-deps:
+install:
 	@echo "📦 Installing client dependencies..."
 	bun install
 	@echo "📦 Installing server dependencies..."
@@ -34,6 +34,15 @@ build-server:
 	rm -f src/server/internal/config/gameConfig.json
 	@echo "📋 Copying config files to dist..."
 
+build-server-linux:
+	@echo "🚀 Building linux server release..."
+	@echo "📋 Copying config for embedding..."
+	cp src/shared/gameConfig.json src/server/internal/config/
+	cd $(SERVER_DIR) && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o ../../$(SERVER_OUTPUT_DIR)/$(SERVER_BINARY) cmd/server/main.go
+	@echo "🧹 Cleaning up temporary config file..."
+	rm -f src/server/internal/config/gameConfig.json
+	@echo "📋 Copying config files to dist..."
+
 # Build optimized release version
 build-release: build-client
 	@echo "🚀 Building optimized server release..."
@@ -53,11 +62,11 @@ dev-client:
 dev-server: build-server
 	echo "🚀 Starting server in development mode..."
 	cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
-# 	@echo "🚀 Starting server in development mode..."
-# 	cp src/shared/gameConfig.json src/server/internal/config/
-# 	cd $(SERVER_DIR) && go run cmd/server/main.go
-# 	@echo "🧹 Cleaning up temporary config file..."
-# 	rm -f src/server/internal/config/gameConfig.json
+
+
+dev-server-linux: build-server-linux
+	echo "🚀 Starting server in development mode..."
+	cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
 
 # Run production build
 run: build
@@ -89,9 +98,11 @@ help:
 	@echo "  build           - Build client and server"
 	@echo "  build-client    - Build only client (TypeScript + PixiJS)"
 	@echo "  build-server    - Build only server (Go) with embedded config"
+	@echo "  build-server-linux - Build only server (Go) with embedded config (Linux)"
 	@echo "  build-release   - Build only optimized server (Go) with embedded config"
 	@echo "  dev-client      - Run client development server"
 	@echo "  dev-server      - Run server development mode"
+	@echo "  dev-server-linux - Run server development mode (Linux)"
 	@echo "  run             - Run production build"
 	@echo "  clean           - Clean build artifacts"
 	@echo "  load-test       - Run server load tests with Artillery"

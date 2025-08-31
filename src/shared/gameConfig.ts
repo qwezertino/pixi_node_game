@@ -36,6 +36,9 @@ export interface GameConfig {
   game: {
     debugMode: boolean;
   };
+  colors: {
+    worldBackground: string;
+  };
 }
 
 // Импортируем конфиг как модуль
@@ -48,4 +51,5 @@ export const NETWORK = gameConfig.network;
 export const MOVEMENT = gameConfig.movement;
 export const WORLD = gameConfig.world;
 export const PLAYER = gameConfig.player;
+export const COLORS = gameConfig.colors;
 export const GAME = gameConfig.game;

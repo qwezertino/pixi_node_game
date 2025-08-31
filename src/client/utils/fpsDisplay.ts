@@ -234,14 +234,7 @@ export class FpsDisplay {
 
         return `${ping}ms`;
     }    private getConnectionStatus(): string {
-        const socket = this.networkManager['socket'];
-        switch (socket.readyState) {
-            case WebSocket.CONNECTING: return 'Connecting';
-            case WebSocket.OPEN: return 'Connected';
-            case WebSocket.CLOSING: return 'Closing';
-            case WebSocket.CLOSED: return 'Disconnected';
-            default: return 'Unknown';
-        }
+        return this.networkManager.getConnectionStatus();
     }
 
     private formatBytes(bytes: number): string {

@@ -103,7 +103,6 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 
 	gw.players.Store(playerID, player)
 
-	log.Printf("👤 Player %d joined at (%d, %d)", playerID, spawnX, spawnY)
 	return player
 }
 
@@ -116,7 +115,6 @@ func (gw *GameWorld) RemovePlayer(playerID uint32) {
 			Type:      types.EventDisconnect,
 			Timestamp: time.Now().UnixNano(),
 		}
-		log.Printf("👤 Player %d left", playerID)
 	}
 }
 

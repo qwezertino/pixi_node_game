@@ -157,8 +157,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Start connection handlers
 	go s.handleConnection(connection)
-
-	log.Printf("🔗 Player %d connected from %s", player.ID, clientIP)
 }
 
 // createConnection создает новое соединение
@@ -201,7 +199,7 @@ func (s *Server) handleConnection(connection *Connection) {
 		default:
 			_, message, err := connection.conn.ReadMessage()
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
 					log.Printf("❌ WebSocket error for player %d: %v", connection.player.ID, err)
 				}
 				return
@@ -473,12 +471,14 @@ func (s *Server) connectionSender(connection *Connection) {
 	for {
 		select {
 		case <-connection.ctx.Done():
-			return
-
 		case data := <-connection.sendChan:
 			connection.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := connection.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				log.Printf("❌ Failed to send message to player %d: %v", connection.player.ID, err)
+				if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					// Normal close, don't log error
+					return
+				}
+				// log.Printf("❌ Failed to send message to player %d: %v", connection.player.ID, err)
 				return
 			}
 
@@ -502,8 +502,6 @@ func (s *Server) cleanupConnection(connection *Connection) {
 	connection.conn.Close()
 	s.connections.Delete(playerID)
 	s.gameWorld.RemovePlayer(playerID)
-
-	log.Printf("🔌 Player %d disconnected", playerID)
 }
 
 // broadcastWorker обрабатывает рассылку сообщений
