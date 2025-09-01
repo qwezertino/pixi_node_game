@@ -1,8 +1,8 @@
-import { BinaryProtocol } from "../../protocol/binaryProtocol";
+import { BinaryProtocol } from "./protocol/binaryProtocol";
 import {
     PlayerState,
     PlayerPosition
-} from "../../protocol/messages";
+} from "./protocol/messages";
 
 // Callback types
 export type OnPlayerJoinedCallback = (player: PlayerState) => void;

@@ -1,4 +1,4 @@
-import { NETWORK } from '../shared/gameConfig';
+import { NETWORK } from '../../../shared/gameConfig';
 
 export const TICK_RATE = NETWORK.tickRate;
 export const SYNC_INTERVAL = NETWORK.syncInterval;

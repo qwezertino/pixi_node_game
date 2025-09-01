@@ -6,9 +6,9 @@ import { MovementController } from "./controllers/movementController";
 import { AnimationController, PlayerState } from "./controllers/animationController";
 import { NetworkManager } from "./network/networkManager";
 import { PlayerManager } from "./game/playerManager";
-import { TICK_RATE } from "../protocol/messages";
+import { TICK_RATE } from "./network/protocol/messages";
 import { PLAYER, COLORS } from "../shared/gameConfig";
-import { BinaryProtocol } from "../protocol/binaryProtocol";
+import { BinaryProtocol } from "./network/protocol/binaryProtocol";
 import { CoordinateConverter } from "./utils/coordinateConverter";
 
 (async () => {

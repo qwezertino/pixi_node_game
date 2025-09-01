@@ -1,6 +1,6 @@
 import { Container, Point, AnimatedSprite, Texture } from "pixi.js";
 import { NetworkManager } from "../network/networkManager";
-import { PlayerState } from "../../protocol/messages";
+import { PlayerState } from "../network/protocol/messages";
 import { SpriteLoader } from "../utils/spriteLoader";
 import {
     AnimationController,
