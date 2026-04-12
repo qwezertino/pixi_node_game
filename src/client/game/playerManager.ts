@@ -6,7 +6,7 @@ import {
     AnimationController,
     PlayerState as AnimationPlayerState,
 } from "../controllers/animationController";
-import { PLAYER, MOVEMENT } from "../../shared/gameConfig";
+import { PLAYER } from "../../shared/gameConfig";
 import { CoordinateConverter } from "../utils/coordinateConverter";
 //import { LagCompensationSystem } from "../utils/lagCompensation";
 
@@ -17,6 +17,19 @@ type CharacterVisual = {
 };
 
 // Represents a remote player in the game
+// Снимок состояния для entity interpolation
+interface PositionSnapshot {
+    time: number; // performance.now() момент получения от сервера
+    x: number;
+    y: number;
+}
+
+// Задержка рендера: 2 тика при 30Hz = ~66ms.
+// Клиент всегда рендерит других игроков "в прошлом",
+// интерполируя между двумя известными позициями — никаких телепортов.
+const INTERPOLATION_DELAY_MS = 100;
+const MAX_SNAPSHOTS = 32;
+
 class RemotePlayer {
     sprite: AnimatedSprite;
     animationController: AnimationController;
@@ -24,7 +37,10 @@ class RemotePlayer {
     movementVector: { dx: number; dy: number } = { dx: 0, dy: 0 };
     isMoving: boolean = false;
 
-    // Позиция в виртуальном мире (целые числа)
+    // Буфер серверных позиций для интерполяции
+    private snapshots: PositionSnapshot[] = [];
+
+    // Текущая рендер-позиция (интерполированная)
     public virtualPosition = { x: 0, y: 0 };
     private coordinateConverter: CoordinateConverter | null = null;
 
@@ -76,43 +92,75 @@ class RemotePlayer {
         );
     }
 
+    // Добавить серверный снимок позиции в буфер
+    pushSnapshot(x: number, y: number) {
+        const now = performance.now();
+        this.snapshots.push({ time: now, x, y });
+        // Удаляем старые снимки — держим только MAX_SNAPSHOTS
+        if (this.snapshots.length > MAX_SNAPSHOTS) {
+            this.snapshots.shift();
+        }
+    }
+
     update(_deltaTime: number) {
         const isAttacking =
             this.animationController.playerState ===
             AnimationPlayerState.ATTACKING;
 
-        if (!isAttacking && this.isMoving && this.movementVector &&
-            (this.movementVector.dx !== 0 || this.movementVector.dy !== 0)) {
-            this.animationController.setState(AnimationPlayerState.MOVING);
+        // Entity interpolation: рендерим позицию на INTERPOLATION_DELAY_MS в прошлом.
+        // Это означает что мы всегда имеем два снимка вокруг целевого времени —
+        // никаких экстраполяций и телепортов.
+        const renderTime = performance.now() - INTERPOLATION_DELAY_MS;
+        const snaps = this.snapshots;
 
-            const moveDistance = MOVEMENT.playerSpeedPerTick;
+        if (snaps.length >= 2) {
+            // Найти два снимка вокруг renderTime
+            let newer = snaps[snaps.length - 1];
+            let older = snaps[snaps.length - 2];
 
-            if (this.movementVector.dx !== 0) {
-                this.virtualPosition.x += this.movementVector.dx * moveDistance;
+            for (let i = snaps.length - 1; i >= 1; i--) {
+                if (snaps[i - 1].time <= renderTime) {
+                    older = snaps[i - 1];
+                    newer = snaps[i];
+                    break;
+                }
             }
-            if (this.movementVector.dy !== 0) {
-                this.virtualPosition.y += this.movementVector.dy * moveDistance;
-            }
+
+            // Интерполируем между older и newer
+            const span = newer.time - older.time;
+            const t = span > 0 ? Math.min(1, (renderTime - older.time) / span) : 1;
+            this.virtualPosition.x = older.x + (newer.x - older.x) * t;
+            this.virtualPosition.y = older.y + (newer.y - older.y) * t;
 
             if (this.coordinateConverter) {
-                const clampedPos = this.coordinateConverter.clampToVirtualBounds(
+                const screenPos = this.coordinateConverter.virtualToScreen(
                     this.virtualPosition.x, this.virtualPosition.y
                 );
-                this.virtualPosition.x = clampedPos.x;
-                this.virtualPosition.y = clampedPos.y;
-            }
-
-            if (this.coordinateConverter) {
-                const screenPos = this.coordinateConverter.virtualToScreen(this.virtualPosition.x, this.virtualPosition.y);
                 this.position.x = screenPos.x;
                 this.position.y = screenPos.y;
             }
-        } else if (!isAttacking) {
-            this.animationController.setState(AnimationPlayerState.IDLE);
+        } else if (snaps.length === 1) {
+            // Только один снимок — просто применяем его
+            this.virtualPosition.x = snaps[0].x;
+            this.virtualPosition.y = snaps[0].y;
+            if (this.coordinateConverter) {
+                const screenPos = this.coordinateConverter.virtualToScreen(
+                    this.virtualPosition.x, this.virtualPosition.y
+                );
+                this.position.x = screenPos.x;
+                this.position.y = screenPos.y;
+            }
+        }
+        // Если снимков нет — не двигаем, ждём первого gameState
+
+        // Анимация
+        if (!isAttacking) {
+            this.animationController.setState(
+                this.isMoving ? AnimationPlayerState.MOVING : AnimationPlayerState.IDLE
+            );
         }
 
         this.sprite.position.copyFrom(this.position);
-
         this.sprite.scale.x = this.direction * Math.abs(this.sprite.scale.x);
     }
 
@@ -135,7 +183,8 @@ class RemotePlayer {
     }
 
     /**
-     * Установка позиции (упрощенная версия для прямой синхронизации)
+     * Установка начальной позиции (при первом появлении игрока).
+     * Добавляет два идентичных снимка чтобы интерполяция сразу работала.
      */
     syncPosition(virtualX: number, virtualY: number) {
         this.virtualPosition.x = virtualX;
@@ -148,6 +197,14 @@ class RemotePlayer {
         }
 
         this.sprite.position.copyFrom(this.position);
+
+        // Заполняем буфер снимков начальной позицией чтобы интерполяция
+        // сразу имела данные и игрок был виден
+        const now = performance.now();
+        this.snapshots = [
+            { time: now - INTERPOLATION_DELAY_MS - 50, x: virtualX, y: virtualY },
+            { time: now - INTERPOLATION_DELAY_MS,       x: virtualX, y: virtualY },
+        ];
     }
 }
 
@@ -228,21 +285,12 @@ export class PlayerManager {
                 const existingPlayer = this.remotePlayers.get(playerId);
 
                 if (existingPlayer) {
-                    existingPlayer.virtualPosition.x = playerState.position.x;
-                    existingPlayer.virtualPosition.y = playerState.position.y;
-
-                    const screenPos = this.coordinateConverter.virtualToScreen(
-                        existingPlayer.virtualPosition.x,
-                        existingPlayer.virtualPosition.y
-                    );
-                    existingPlayer.position.x = screenPos.x;
-                    existingPlayer.position.y = screenPos.y;
-                    existingPlayer.sprite.position.copyFrom(existingPlayer.position);
+                    // Entity interpolation: добавляем снимок в буфер,
+                    // позиция будет плавно интерполирована в update()
+                    existingPlayer.pushSnapshot(playerState.position.x, playerState.position.y);
 
                     existingPlayer.direction = playerState.direction;
                     existingPlayer.isMoving = playerState.moving;
-
-                    // Always sync movement vector from gameState vx/vy
                     existingPlayer.setMovementVector(
                         playerState.vx ?? 0,
                         playerState.vy ?? 0

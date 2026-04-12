@@ -242,7 +242,8 @@ func (gw *GameWorld) tick() {
 	attackDurNano := gw.cfg.Game.AttackDuration.Nanoseconds()
 
 	gw.tickCount++
-	// Full sync every TickRate ticks (~1 second)
+	// Full sync every second — corrects drift from lost delta packets.
+	// Entity interpolation on the client smooths out any position correction.
 	fullSync := gw.tickCount%uint32(gw.cfg.Game.TickRate) == 0
 
 	gw.players.Range(func(key, value interface{}) bool {
