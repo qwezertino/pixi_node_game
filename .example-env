@@ -32,12 +32,14 @@ RATE_LIMIT_BURST=20
 
 # ─── Go runtime tuning ────────────────────────────────────────────────────────
 # Reduce GC frequency for high-throughput workloads (default is 100)
-GOGC=800
+GOGC=400
 # CPU cores to use (0 = all available)
 GOMAXPROCS=0
-# Hard memory cap — uncomment to enable
-# GOMEMLIMIT=2GiB
+# Hard memory cap — GC will run more frequently before hitting this limit
+GOMEMLIMIT=512MiB
 # ─── Monitoring external ports ────────────────────────────────────────────────────────────────────────
 PROMETHEUS_PORT=9090
 GRAFANA_PORT=3000
 GRAFANA_ADMIN_PASSWORD=admin
+LOKI_PORT=3100
+COMPOSE_PROJECT_NAME=pixi_game
