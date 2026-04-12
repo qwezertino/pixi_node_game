@@ -85,8 +85,7 @@ export class NetworkManager {
             };
 
             const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-            const host = "127.0.0.1:8108";
-            const wsUrl = `${protocol}//${host}/ws`;
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
 
             this.worker.postMessage({ type: 'connect', url: wsUrl });
         } catch (error) {
@@ -98,8 +97,7 @@ export class NetworkManager {
 
     private initDirectSocket() {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const host = "127.0.0.1:8108";
-        const wsUrl = `${protocol}//${host}/ws`;
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
 
         this.socket = new WebSocket(wsUrl);
         this.setupSocketEvents();
