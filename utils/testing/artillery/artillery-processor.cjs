@@ -1,3 +1,10 @@
+// Bandwidth control: set MOVE_SEND_RATE=0.1 to send only 10% of moves.
+// Useful for local → VPS testing to avoid saturating your own upload channel.
+// Default 1.0 = send everything (for VPS → VPS load testing).
+// Example: MOVE_SEND_RATE=0.1 NUM_CLIENTS=200 bun artillery run ...
+const MOVE_SEND_RATE = parseFloat(process.env.MOVE_SEND_RATE || '1.0');
+const DIR_SEND_RATE  = parseFloat(process.env.DIR_SEND_RATE  || '1.0');
+
 // Binary protocol constants and helpers
 const MessageType = {
   JOIN: 1,
@@ -107,10 +114,7 @@ module.exports = {
       movement = patterns[Math.floor(Math.random() * patterns.length)];
     }
 
-    // Encode as binary and send directly
-    const binaryMessage = encodeMove(movement, context.vars.inputSequence++);
-
-    // Update position based on movement for next message
+    // Update position locally regardless of whether we send
     if (movement.dx !== 0 || movement.dy !== 0) {
       context.vars.position.x += movement.dx * 4; // Using speed from gameConfig
       context.vars.position.y += movement.dy * 4;
@@ -120,6 +124,12 @@ module.exports = {
       context.vars.position.y = Math.max(0, Math.min(2000, context.vars.position.y));
     }
 
+    // Bandwidth control: skip sending based on MOVE_SEND_RATE probability
+    if (Math.random() > MOVE_SEND_RATE) {
+      return done();
+    }
+
+    const binaryMessage = encodeMove(movement, context.vars.inputSequence++);
     if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
       context.ws.send(binaryMessage);
       context.vars.messagesSent++;
@@ -130,8 +140,8 @@ module.exports = {
 
   // Maybe change direction and send directly
   maybeChangeAndSendDirection: function(context, events, done) {
-    // Only change direction 15% of the time
-    if (Math.random() > 0.15) {
+    // Only change direction 15% of the time, also apply DIR_SEND_RATE
+    if (Math.random() > 0.15 * DIR_SEND_RATE) {
       return done(); // Skip sending
     }
 

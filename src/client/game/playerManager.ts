@@ -24,10 +24,14 @@ interface PositionSnapshot {
     y: number;
 }
 
-// Задержка рендера: 2 тика при 30Hz = ~66ms.
+// Задержка рендера: 3 тика при 30Hz = ~100ms + safety margin.
+// Gaffer on Games: для 30pps с 2-5% потерей пакетов нужно 3× interval = 150ms.
 // Клиент всегда рендерит других игроков "в прошлом",
 // интерполируя между двумя известными позициями — никаких телепортов.
-const INTERPOLATION_DELAY_MS = 100;
+const INTERPOLATION_DELAY_MS = 150;
+// Максимальное время экстраполяции когда буфер пуст (высокий пинг / потеря пакетов).
+// После этого порога позиция замораживается до следующего снимка.
+const MAX_EXTRAPOLATE_MS = 250;
 const MAX_SNAPSHOTS = 32;
 
 class RemotePlayer {
@@ -114,23 +118,47 @@ class RemotePlayer {
         const snaps = this.snapshots;
 
         if (snaps.length >= 2) {
-            // Найти два снимка вокруг renderTime
-            let newer = snaps[snaps.length - 1];
-            let older = snaps[snaps.length - 2];
+            const newest = snaps[snaps.length - 1];
 
-            for (let i = snaps.length - 1; i >= 1; i--) {
-                if (snaps[i - 1].time <= renderTime) {
-                    older = snaps[i - 1];
-                    newer = snaps[i];
-                    break;
+            if (renderTime <= newest.time) {
+                // Нормальная интерполяция: ищем пару снимков вокруг renderTime
+                let newer = newest;
+                let older = snaps[snaps.length - 2];
+
+                for (let i = snaps.length - 1; i >= 1; i--) {
+                    if (snaps[i - 1].time <= renderTime) {
+                        older = snaps[i - 1];
+                        newer = snaps[i];
+                        break;
+                    }
+                }
+
+                const span = newer.time - older.time;
+                const t = span > 0 ? Math.min(1, (renderTime - older.time) / span) : 1;
+                this.virtualPosition.x = older.x + (newer.x - older.x) * t;
+                this.virtualPosition.y = older.y + (newer.y - older.y) * t;
+            } else {
+                // renderTime опережает новейший снимок — высокий пинг / потеря пакетов.
+                // Экстраполируем скоростью последних двух снимков вместо заморозки.
+                const extrapolateMs = renderTime - newest.time;
+                if (extrapolateMs <= MAX_EXTRAPOLATE_MS) {
+                    const prev = snaps[snaps.length - 2];
+                    const dt = newest.time - prev.time;
+                    if (dt > 0) {
+                        const vx = (newest.x - prev.x) / dt;
+                        const vy = (newest.y - prev.y) / dt;
+                        this.virtualPosition.x = newest.x + vx * extrapolateMs;
+                        this.virtualPosition.y = newest.y + vy * extrapolateMs;
+                    } else {
+                        this.virtualPosition.x = newest.x;
+                        this.virtualPosition.y = newest.y;
+                    }
+                } else {
+                    // Слишком долго без данных — замораживаем на последней известной позиции
+                    this.virtualPosition.x = newest.x;
+                    this.virtualPosition.y = newest.y;
                 }
             }
-
-            // Интерполируем между older и newer
-            const span = newer.time - older.time;
-            const t = span > 0 ? Math.min(1, (renderTime - older.time) / span) : 1;
-            this.virtualPosition.x = older.x + (newer.x - older.x) * t;
-            this.virtualPosition.y = older.y + (newer.y - older.y) * t;
 
             if (this.coordinateConverter) {
                 const screenPos = this.coordinateConverter.virtualToScreen(

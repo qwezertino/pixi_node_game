@@ -2,6 +2,24 @@ config:
   target: 'ws://localhost:8108/ws'
   processor: './artillery-processor.cjs'
   phases:
+    # ─────────────────────────────────────────────────────────────────
+    # LOCAL → VPS TESTING (run from your machine against remote server)
+    # Reduces both upload (MOVE_SEND_RATE=0.1) and download pressure.
+    # Start with 200 clients, measure ping without saturating your ISP.
+    #
+    # Usage:
+    #   MOVE_SEND_RATE=0.1 bun artillery run --target "ws://89.117.62.251:8108/ws" \
+    #     utils/testing/artillery/artillery-config.yml
+    #
+    # ─────────────────────────────────────────────────────────────────
+    # - duration: 30
+    #   arrivalRate: 5
+    #   name: "LOCAL warm up (150 clients)"
+    # - duration: 60
+    #   arrivalRate: 2
+    #   name: "LOCAL sustained 200 clients — MOVE_SEND_RATE=0.1"
+    # ─────────────────────────────────────────────────────────────────
+
     # # Gradual ramp up to test stability
     # - duration: 60
     #   arrivalRate: 5
@@ -24,7 +42,7 @@ config:
     #   arrivalRate: 10
     #   name: "1200 clients sustained test"
 
-     # Test 2400 clients
+    #Test 2400 clients
     - duration: 60
       arrivalRate: 20
       name: "Ramp to 2400 clients"
