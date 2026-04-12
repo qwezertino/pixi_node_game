@@ -96,16 +96,21 @@ lint:
 	golangci-lint run
 
 
-# Docker: создать директории для хранения данных с нужными правами (только при первом запуске)
-docker/data/.initialized:
-	@echo "📁 Initializing data directories..."
+# Docker: выставить правильные права на директории данных
+# Prometheus=65534 (nobody), Grafana=472, Loki=0 (root, задан в compose)
+docker-chown:
+	@echo "🔐 Setting data directory permissions..."
 	@mkdir -p docker/data/prometheus docker/data/grafana docker/data/loki
-	@sudo chown 472:472 docker/data/grafana && sudo chmod 755 docker/data/grafana
-	@chmod 755 docker/data/prometheus docker/data/loki
-	@touch docker/data/.initialized
-	@echo "✅ Data directories ready"
+	@sudo chown -R 65534:65534 docker/data/prometheus
+	@sudo chown -R 472:472 docker/data/grafana
+	@sudo chmod -R 755 docker/data/prometheus docker/data/grafana docker/data/loki
+	@echo "✅ Permissions set"
 
-docker-init: docker/data/.initialized
+# Docker: создать директории для хранения данных (только при первом запуске)
+docker/data/.initialized:
+	@touch docker/data/.initialized
+
+docker-init: docker-chown docker/data/.initialized
 
 # Docker: запустить без пересборки
 docker-up: docker-init
