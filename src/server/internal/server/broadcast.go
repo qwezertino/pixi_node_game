@@ -31,7 +31,11 @@ type shard struct {
 	// Буфер 2: если воркер не успел — tick всё равно не блокируется.
 	broadcastChan chan *websocket.PreparedMessage
 
-	// directChan получает срочные per-connection сообщения (ACK, join/left).
+	// eventChan получает join/left PreparedMessage — редкие события для всех.
+	// Буфер 256: при рампе 20 join/sec и N=8 шардов — ~2.5 event/sec/shard.
+	eventChan chan *websocket.PreparedMessage
+
+	// directChan получает срочные per-connection сообщения (ACK).
 	// Обрабатывается с приоритетом перед broadcast.
 	directChan chan directMsg
 }
@@ -40,6 +44,7 @@ func newShard() *shard {
 	return &shard{
 		conns:         make(map[uint32]*Connection),
 		broadcastChan: make(chan *websocket.PreparedMessage, 2),
+		eventChan:     make(chan *websocket.PreparedMessage, 256),
 		directChan:    make(chan directMsg, 4096),
 	}
 }
@@ -82,7 +87,7 @@ func (sh *shard) run(ctx context.Context) {
 	writeDeadline := 10 * time.Second
 
 	for {
-		// Priority pass: drain all waiting direct messages before blocking.
+		// Priority pass: drain directChan and eventChan before blocking on tick.
 		for {
 			select {
 			case dm := <-sh.directChan:
@@ -98,6 +103,16 @@ func (sh *shard) run(ctx context.Context) {
 						metrics.BytesSent.Add(float64(len(dm.data)))
 					}
 				}
+			case pm := <-sh.eventChan:
+				sh.mu.RLock()
+				for _, conn := range sh.conns {
+					conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+					if err := conn.conn.WritePreparedMessage(pm); err != nil {
+						metrics.WSWriteErrors.Inc()
+						conn.cancel()
+					}
+				}
+				sh.mu.RUnlock()
 			default:
 				goto block
 			}
@@ -110,6 +125,17 @@ func (sh *shard) run(ctx context.Context) {
 
 		case pm := <-sh.broadcastChan:
 			// Write PreparedMessage to all connections in this shard under RLock.
+			sh.mu.RLock()
+			for _, conn := range sh.conns {
+				conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+				if err := conn.conn.WritePreparedMessage(pm); err != nil {
+					metrics.WSWriteErrors.Inc()
+					conn.cancel()
+				}
+			}
+			sh.mu.RUnlock()
+
+		case pm := <-sh.eventChan:
 			sh.mu.RLock()
 			for _, conn := range sh.conns {
 				conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
@@ -212,7 +238,21 @@ func (s *Server) sendDirect(conn *Connection, data []byte) {
 	s.shardFor(conn.player.ID).sendDirect(conn.player.ID, data)
 }
 
+// broadcastEvent отправляет PreparedMessage во все шарды через eventChan.
+// O(N_shards) вместо O(N_connections) — ключевая оптимизация для join/left.
+func (s *Server) broadcastEvent(pm *websocket.PreparedMessage) {
+	for _, sh := range s.shards {
+		select {
+		case sh.eventChan <- pm:
+		default:
+			// eventChan переполнен — крайне маловероятно при cap=256 и 20 join/sec.
+			metrics.SendChannelDropped.Inc()
+		}
+	}
+}
+
 // notifyPlayerJoined уведомляет всех игроков о новом игроке.
+// Клиент фильтрует собственный join по player ID.
 func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
 	playerState := types.PlayerState{
 		ID:          newPlayer.ID,
@@ -221,27 +261,21 @@ func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
 		FacingRight: true,
 	}
 	data := s.protocol.EncodePlayerJoined(playerState)
-
-	s.connections.Range(func(key, value interface{}) bool {
-		conn := value.(*Connection)
-		if conn.player.ID == newPlayer.ID {
-			return true // Skip the new player — they got full state already.
-		}
-		s.shardFor(conn.player.ID).sendDirect(conn.player.ID, data)
-		return true
-	})
+	pm, err := websocket.NewPreparedMessage(websocket.BinaryMessage, data)
+	if err != nil {
+		slog.Error("failed to prepare player joined message", "error", err)
+		return
+	}
+	s.broadcastEvent(pm)
 }
 
 // notifyPlayerLeft уведомляет всех игроков об отключении.
 func (s *Server) notifyPlayerLeft(leftPlayerID uint32) {
 	data := s.protocol.EncodePlayerLeft(leftPlayerID)
-
-	s.connections.Range(func(key, value interface{}) bool {
-		conn := value.(*Connection)
-		if conn.player.ID == leftPlayerID {
-			return true
-		}
-		s.shardFor(conn.player.ID).sendDirect(conn.player.ID, data)
-		return true
-	})
+	pm, err := websocket.NewPreparedMessage(websocket.BinaryMessage, data)
+	if err != nil {
+		slog.Error("failed to prepare player left message", "error", err)
+		return
+	}
+	s.broadcastEvent(pm)
 }

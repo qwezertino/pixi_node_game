@@ -174,6 +174,7 @@ export class PlayerManager {
 
     private setupNetworkCallbacks() {
         this.networkManager.onPlayerJoined(async (player) => {
+            if (player.id === this.networkManager.getPlayerId()) return;
             await this.addRemotePlayer(player);
         });
 

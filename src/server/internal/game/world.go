@@ -24,9 +24,9 @@ type GameWorld struct {
 	players sync.Map // map[uint32]*types.Player - lock-free player storage
 
 	// Tick-driven broadcast: вызывается раз в тик с текущим состоянием всех игроков.
-	// Сервер регистрирует callback через SetTickBroadcaster.
-	broadcastChan chan broadcastPayload
-	tickerDone    chan struct{} // closed when game loop exits
+	// Хранится в atomic.Value — записывается один раз из SetTickBroadcaster,
+	// читается из gameLoop горутины. Прямой вызов из tick() — никаких аллокаций.
+	broadcastFn atomic.Value // stores broadcastFuncHolder
 
 	// High-performance systems
 	visibilityManager *systems.VisibilityManager
@@ -56,12 +56,7 @@ type GameWorld struct {
 	lastFullSync time.Time
 }
 
-// broadcastPayload передаёт данные из tick в broadcast-горутину.
-type broadcastPayload struct {
-	all      []types.PlayerState
-	changed  []types.PlayerState
-	fullSync bool
-} // NewGameWorld создает новый игровой мир
+// NewGameWorld создает новый игровой мир
 func NewGameWorld(cfg *config.Config) *GameWorld {
 	// Initialize random seed for spawn positions
 	rand.Seed(time.Now().UnixNano())
@@ -72,8 +67,6 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 		nextPlayerID:   1000, // Start from 1000 for easy debugging
 		lastFullSync:   time.Now(),
 		prevStates:     make(map[uint32]types.PlayerState, 256),
-		broadcastChan:  make(chan broadcastPayload, 2),
-		tickerDone:     make(chan struct{}),
 		scratchStates:  make([]types.PlayerState, 0, 256),
 		scratchChanged: make([]types.PlayerState, 0, 64),
 		scratchSeenIDs: make(map[uint32]struct{}, 256),
@@ -204,8 +197,10 @@ func (gw *GameWorld) gameLoop() {
 
 // SetTickBroadcaster регистрирует функцию, вызываемую раз в тик со срезом
 // состояний всех игроков. Вызывается из server.New() до первого тика.
+// Функция вызывается синхронно из tick() — broadcastTick делает только
+// 8 non-blocking channel sends, поэтому задержка tick'а минимальна.
 func (gw *GameWorld) SetTickBroadcaster(fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool)) {
-	go gw.broadcastLoop(fn)
+	gw.broadcastFn.Store(broadcastFuncHolder{fn: fn})
 }
 
 // TryAttack проверяет cooldown и запускает атаку если она разрешена.
@@ -262,7 +257,7 @@ func (gw *GameWorld) tick() {
 			}
 		}
 
-		gw.updatePlayerPosition(player)
+		gw.updatePlayerPosition(player, nowNano)
 		st := player.ToState()
 		gw.scratchStates = append(gw.scratchStates, st)
 		gw.scratchSeenIDs[st.ID] = struct{}{}
@@ -294,44 +289,26 @@ func (gw *GameWorld) tick() {
 		return
 	}
 
-	// Copy scratch slices before sending — broadcastLoop reads them asynchronously
-	// while tick() will overwrite scratch on the very next tick.
-	allCopy := make([]types.PlayerState, len(gw.scratchStates))
-	copy(allCopy, gw.scratchStates)
-
-	var changedCopy []types.PlayerState
-	if !fullSync && len(gw.scratchChanged) > 0 {
-		changedCopy = make([]types.PlayerState, len(gw.scratchChanged))
-		copy(changedCopy, gw.scratchChanged)
-	}
-
-	select {
-	case gw.broadcastChan <- broadcastPayload{all: allCopy, changed: changedCopy, fullSync: fullSync}:
-	default:
-		// broadcast goroutine is still busy — skip this tick's payload.
-	}
-
-	now := time.Now()
-	if now.Sub(gw.lastFullSync) >= gw.cfg.Game.SyncInterval {
-		atomic.StoreInt64(&gw.lastSyncTime, now.UnixNano())
-		gw.lastFullSync = now
-	}
-}
-
-// broadcastLoop выделенная горутина для broadcast (вместо go-per-tick).
-func (gw *GameWorld) broadcastLoop(fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool)) {
-	for {
-		select {
-		case payload := <-gw.broadcastChan:
-			fn(payload.all, payload.changed, payload.fullSync)
-		case <-gw.stopChan:
-			return
+	// Call broadcastFn synchronously — it does only 8 non-blocking channel sends,
+	// so it returns in microseconds. No allCopy/changedCopy allocations needed:
+	// EncodeGameState serialises scratchStates into bytes before tick() returns.
+	if holder, ok := gw.broadcastFn.Load().(broadcastFuncHolder); ok {
+		var changed []types.PlayerState
+		if !fullSync && len(gw.scratchChanged) > 0 {
+			changed = gw.scratchChanged
 		}
+		holder.fn(gw.scratchStates, changed, fullSync)
+	}
+
+	if time.Duration(nowNano-atomic.LoadInt64(&gw.lastSyncTime)) >= gw.cfg.Game.SyncInterval {
+		atomic.StoreInt64(&gw.lastSyncTime, nowNano)
+		gw.lastFullSync = time.Unix(0, nowNano)
 	}
 }
 
-// updatePlayerPosition обновляет позицию игрока на основе его векторов движения
-func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
+// updatePlayerPosition обновляет позицию игрока на основе его векторов движения.
+// nowNano передаётся из tick() чтобы избежать лишних time.Now() на горячем пути.
+func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) {
 	vx := player.GetVX()
 	vy := player.GetVY()
 	if vx == 0 && vy == 0 {
@@ -377,7 +354,7 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
 	// Update position atomically
 	player.SetX(newX)
 	player.SetY(newY)
-	player.SetLastUpdate(time.Now().UnixNano())
+	player.SetLastUpdate(nowNano)
 	gw.visibilityManager.MovePlayer(player.ID, newX, newY)
 }
 
