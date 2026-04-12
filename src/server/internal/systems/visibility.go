@@ -1,7 +1,7 @@
 package systems
 
 import (
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,8 +51,7 @@ func NewVisibilityManager(worldWidth, worldHeight, gridSize uint16) *VisibilityM
 		cacheAccess: make(map[uint64]int64),
 	}
 
-	log.Printf("🔍 VisibilityManager initialized: %dx%d grid with %d cell size",
-		gridW, gridH, gridSize)
+	slog.Info("visibility manager initialized", "grid_w", gridW, "grid_h", gridH, "cell_size", gridSize)
 
 	return vm
 }

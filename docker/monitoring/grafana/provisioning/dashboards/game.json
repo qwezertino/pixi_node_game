@@ -1,0 +1,180 @@
+{
+  "title": "Pixi Game Server",
+  "uid": "pixi-game",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Connected Players",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 500 }, { "color": "red", "value": 1000 }] } } },
+      "targets": [{ "expr": "game_players_connected", "legendFormat": "Players" }]
+    },
+    {
+      "id": 2,
+      "title": "Connections / Disconnections per sec",
+      "type": "timeseries",
+      "gridPos": { "x": 4, "y": 0, "w": 10, "h": 4 },
+      "targets": [
+        { "expr": "rate(game_connections_total[1m])", "legendFormat": "Connects/s" },
+        { "expr": "rate(game_disconnections_total[1m])", "legendFormat": "Disconnects/s" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Session Duration (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 14, "y": 0, "w": 10, "h": 4 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(game_session_duration_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(game_session_duration_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(game_session_duration_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Tick Duration (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 5 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(game_tick_duration_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(game_tick_duration_seconds_bucket[1m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(game_tick_duration_seconds_bucket[1m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Ticks / sec",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 4, "w": 4, "h": 5 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "rate(game_ticks_total[10s])", "legendFormat": "Ticks/s" }]
+    },
+    {
+      "id": 6,
+      "title": "Events Processed / sec (by type)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 4, "w": 8, "h": 5 },
+      "targets": [
+        { "expr": "rate(game_events_processed_total{type=\"move\"}[10s])", "legendFormat": "move" },
+        { "expr": "rate(game_events_processed_total{type=\"face\"}[10s])", "legendFormat": "face" },
+        { "expr": "rate(game_events_processed_total{type=\"attack\"}[10s])", "legendFormat": "attack" },
+        { "expr": "rate(game_events_processed_total{type=\"disconnect\"}[10s])", "legendFormat": "disconnect" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Event Channel Queue Length",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 9, "w": 8, "h": 4 },
+      "targets": [{ "expr": "game_event_channel_len", "legendFormat": "Queue" }]
+    },
+    {
+      "id": 8,
+      "title": "Events Dropped / sec",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 9, "w": 8, "h": 4 },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "targets": [{ "expr": "rate(game_events_dropped_total[10s])", "legendFormat": "Dropped events/s" }]
+    },
+    {
+      "id": 9,
+      "title": "Messages Received / sec (by type)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 9, "w": 8, "h": 4 },
+      "targets": [
+        { "expr": "rate(game_messages_received_total{type=\"move\"}[10s])", "legendFormat": "move" },
+        { "expr": "rate(game_messages_received_total{type=\"direction\"}[10s])", "legendFormat": "direction" },
+        { "expr": "rate(game_messages_received_total{type=\"attack\"}[10s])", "legendFormat": "attack" },
+        { "expr": "rate(game_messages_received_total{type=\"viewport\"}[10s])", "legendFormat": "viewport" }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Bandwidth",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 13, "w": 12, "h": 4 },
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "targets": [
+        { "expr": "rate(game_bytes_received_total[10s])", "legendFormat": "Received" },
+        { "expr": "rate(game_bytes_sent_total[10s])", "legendFormat": "Sent" }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Broadcast Dropped / sec",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 13, "w": 6, "h": 4 },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "orange", "mode": "fixed" } } },
+      "targets": [
+        { "expr": "rate(game_broadcasts_dropped_total[10s])", "legendFormat": "Dropped/s" },
+        { "expr": "rate(game_send_channel_dropped_total[10s])", "legendFormat": "Send chan dropped/s" }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Rate Limited / sec",
+      "type": "timeseries",
+      "gridPos": { "x": 18, "y": 13, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "rate(game_messages_rate_limited_total[10s])", "legendFormat": "Msg rate limited/s" },
+        { "expr": "rate(game_ip_rate_limited_total[10s])", "legendFormat": "IP rate limited/s" }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "WS Errors / sec",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 17, "w": 8, "h": 4 },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "targets": [
+        { "expr": "rate(game_ws_upgrade_errors_total[10s])", "legendFormat": "Upgrade errors" },
+        { "expr": "rate(game_ws_read_errors_total[10s])", "legendFormat": "Read errors" },
+        { "expr": "rate(game_ws_write_errors_total[10s])", "legendFormat": "Write errors" }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Go Goroutines",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 17, "w": 8, "h": 4 },
+      "targets": [{ "expr": "go_goroutines{job=\"pixi_game_server\"}", "legendFormat": "Goroutines" }]
+    },
+    {
+      "id": 15,
+      "title": "Go Heap Memory",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 17, "w": 8, "h": 4 },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "go_memstats_heap_alloc_bytes{job=\"pixi_game_server\"}", "legendFormat": "Heap Alloc" },
+        { "expr": "go_memstats_heap_sys_bytes{job=\"pixi_game_server\"}", "legendFormat": "Heap Sys" },
+        { "expr": "go_memstats_heap_inuse_bytes{job=\"pixi_game_server\"}", "legendFormat": "Heap InUse" }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "GC Pause Duration (p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 21, "w": 12, "h": 4 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, rate(go_gc_duration_seconds_bucket{job=\"pixi_game_server\"}[1m]))", "legendFormat": "GC p99" }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "GC Runs / sec",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 21, "w": 12, "h": 4 },
+      "targets": [
+        { "expr": "rate(go_gc_duration_seconds_count{job=\"pixi_game_server\"}[1m])", "legendFormat": "GC/s" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+# Build outputs
+dist/
+node_modules/
+
+# Version control
+.git/
+.gitignore
+
+# Local env overrides
+.env*
+
+# Logs
+*.log
+
+# Local server binary (from make build-server)
+src/server/server
+
+# Load testing utilities (not needed in image)
+utils/testing/
+
+# Editor / IDE
+.vscode/
+*.swp
+*.swo

@@ -1,13 +1,14 @@
 # Makefile for Pixi Node Game - 2D Multiplayer Game
 # Client: TypeScript + PixiJS, Server: Go
 
-.PHONY: all build build-client build-server run run-client run-server dev clean test
+.PHONY: all build build-client build-server run run-client run-server dev clean test docker-init docker-up docker-build docker-test docker-monitoring docker-down
 
 # Variables
 SERVER_DIR=src/server
 CLIENT_BUILD_DIR=dist
 SERVER_BINARY=server
 SERVER_OUTPUT_DIR=$(CLIENT_BUILD_DIR)
+COMPOSE=docker compose -f docker/docker-compose.yml --project-name pixi_game
 
 # Install dependencies for both client and server
 install:
@@ -58,20 +59,28 @@ dev-client:
 	@echo "🌐 Starting client development server..."
 	bun run dev:client
 
+# Запустить клиент и сервер параллельно (dev режим, без Docker)
+dev:
+	@echo "🚀 Starting dev: client (Vite :8109) + server (:8108)..."
+	@$(MAKE) build-server
+	@set -a && . ./.env && set +a && \
+		(cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY) &) && \
+		bun run dev:client
+
 # Run server in development mode
 dev-server: build-server
-	echo "🚀 Starting server in development mode..."
-	cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
+	@echo "🚀 Starting server in development mode..."
+	@set -a && . ./.env && set +a && cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
 
 
 dev-server-linux: build-server-linux
-	echo "🚀 Starting server in development mode..."
-	cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
+	@echo "🚀 Starting server in development mode..."
+	@set -a && . ./.env && set +a && cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
 
 # Run production build
 run: build
 	@echo "🚀 Starting production server..."
-	cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
+	@set -a && . ./.env && set +a && cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
 
 # Clean build artifacts
 clean:
@@ -87,7 +96,48 @@ lint:
 	golangci-lint run
 
 
-# Run server load tests
+# Docker: создать директории для хранения данных с нужными правами (только при первом запуске)
+docker/data/.initialized:
+	@echo "📁 Initializing data directories..."
+	@mkdir -p docker/data/prometheus docker/data/grafana docker/data/loki
+	@sudo chown 472:472 docker/data/grafana && sudo chmod 755 docker/data/grafana
+	@chmod 755 docker/data/prometheus docker/data/loki
+	@touch docker/data/.initialized
+	@echo "✅ Data directories ready"
+
+docker-init: docker/data/.initialized
+
+# Docker: запустить без пересборки
+docker-up: docker-init
+	@echo "🐳 Starting containers (no rebuild)..."
+	$(COMPOSE) up -d
+
+# Docker: запустить с пересборкой
+docker-upbuild: docker-init
+	@echo "🐳 Building and starting containers..."
+	$(COMPOSE) up --build -d
+
+# Docker: запустить нагрузочный тест через artillery
+docker-test:
+	@echo "⚡ Running artillery load test in Docker..."
+	$(COMPOSE) --profile test run --rm artillery
+
+# Docker: открыть ссылки на Prometheus и Grafana
+docker-monitoring:
+	@set -a && . ./.env && set +a && \
+		echo "📊 Prometheus: http://localhost:$${PROMETHEUS_PORT:-9090}" && \
+		echo "📈 Grafana:    http://localhost:$${GRAFANA_PORT:-3000}  (admin / $${GRAFANA_ADMIN_PASSWORD:-admin})"
+
+# Docker: запустить без пересборки
+docker-down:
+	@echo "🐳 Stopping containers..."
+	$(COMPOSE) down
+
+docker-ps:
+	@echo "🐳 Stopping containers..."
+	$(COMPOSE) ps
+
+# Run server load tests (локально, artillery должен быть установлен)
 load-test:
 	@echo "⚡ Running server load tests..."
 	artillery run utils/testing/artillery/artillery-config.yml

@@ -3,17 +3,19 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/game"
+	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/types"
 )
@@ -114,13 +116,16 @@ func (s *Server) Start() error {
 	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// Metrics endpoint
-	mux.HandleFunc("/metrics", s.handleMetrics)
+	// Metrics endpoint (Prometheus format)
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Legacy JSON metrics for backwards compat
+	mux.HandleFunc("/metrics/json", s.handleMetricsJSON)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
 
-	log.Printf("🚀 Starting server on %s", addr)
-	log.Printf("📁 Serving static files from %s", s.cfg.Server.StaticDir)
+	slog.Info("server listening", "addr", addr)
+	slog.Info("serving static files", "dir", s.cfg.Server.StaticDir)
 
 	return http.ListenAndServe(addr, mux)
 }
@@ -132,6 +137,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	limiter := s.getOrCreateRateLimiter(clientIP)
 
 	if !limiter.Allow() {
+		metrics.IPRateLimited.Inc()
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
@@ -139,7 +145,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Upgrade connection
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("❌ WebSocket upgrade failed: %v", err)
+		slog.Error("websocket upgrade failed", "error", err, "remote_addr", r.RemoteAddr)
+		metrics.WSUpgradeErrors.Inc()
 		return
 	}
 
@@ -154,6 +161,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Notify all existing players about the new player
 	s.notifyPlayerJoined(player)
+
+	// Update metrics
+	metrics.ConnectionsTotal.Inc()
+	metrics.PlayersConnected.Inc()
 
 	// Start connection handlers
 	go s.handleConnection(connection)
@@ -199,15 +210,21 @@ func (s *Server) handleConnection(connection *Connection) {
 		default:
 			_, message, err := connection.conn.ReadMessage()
 			if err != nil {
+				metrics.WSReadErrors.Inc()
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
-					log.Printf("❌ WebSocket error for player %d: %v", connection.player.ID, err)
+					slog.Warn("websocket unexpected close", "player_id", connection.player.ID, "error", err)
+				} else {
+					slog.Debug("websocket read closed", "player_id", connection.player.ID, "error", err)
 				}
 				return
 			}
 
+			metrics.BytesReceived.Add(float64(len(message)))
+
 			// Rate limiting
 			if !connection.rateLimiter.Allow() {
-				log.Printf("⚠️  Rate limit exceeded for player %d", connection.player.ID)
+				slog.Warn("rate limit exceeded", "player_id", connection.player.ID)
+				metrics.MessagesRateLimited.Inc()
 				continue
 			}
 
@@ -220,7 +237,7 @@ func (s *Server) handleConnection(connection *Connection) {
 func (s *Server) processMessage(connection *Connection, message []byte) {
 	clientMsg, err := s.protocol.DecodeClientMessage(message)
 	if err != nil {
-		log.Printf("❌ Failed to decode message from player %d: %v", connection.player.ID, err)
+		slog.Error("message decode failed", "player_id", connection.player.ID, "error", err)
 		return
 	}
 
@@ -228,6 +245,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 
 	switch clientMsg.Type {
 	case protocol.MessageMove:
+		metrics.MessagesReceived.WithLabelValues("move").Inc()
 		// Get client's reported position from the message
 		clientX := uint16(clientMsg.Position.X)
 		clientY := uint16(clientMsg.Position.Y)
@@ -293,7 +311,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		select {
 		case connection.sendChan <- ackData:
 		default:
-			log.Printf("⚠️  Failed to send movement ack to player %d", connection.player.ID)
+			slog.Warn("movement ack channel full", "player_id", connection.player.ID)
 		}
 
 		// Broadcast player movement to other clients
@@ -320,11 +338,12 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		select {
 		case s.broadcastChan <- broadcast:
 		default:
-			log.Printf("❌ Movement broadcast channel full, skipped")
+			slog.Warn("movement broadcast channel full, skipped")
 			// Broadcast channel full, skip
 		}
 
 	case protocol.MessageDirection:
+		metrics.MessagesReceived.WithLabelValues("direction").Inc()
 		s.gameWorld.ProcessEvent(types.GameEvent{
 			PlayerID:    connection.player.ID,
 			Type:        types.EventFace,
@@ -351,6 +370,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		}
 
 	case protocol.MessageAttack:
+		metrics.MessagesReceived.WithLabelValues("attack").Inc()
 		s.gameWorld.ProcessEvent(types.GameEvent{
 			PlayerID: connection.player.ID,
 			Type:     types.EventAttack,
@@ -379,6 +399,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		}
 
 	case protocol.MessageViewportUpdate:
+		metrics.MessagesReceived.WithLabelValues("viewport").Inc()
 		connection.player.ViewportWidth = clientMsg.ViewportWidth
 		connection.player.ViewportHeight = clientMsg.ViewportHeight
 	}
@@ -392,7 +413,7 @@ func (s *Server) sendInitialState(connection *Connection) {
 	select {
 	case connection.sendChan <- data:
 	default:
-		log.Printf("⚠️  Failed to send initial state to player %d", connection.player.ID)
+		slog.Warn("initial state send failed", "player_id", connection.player.ID)
 	}
 }
 
@@ -474,13 +495,13 @@ func (s *Server) connectionSender(connection *Connection) {
 		case data := <-connection.sendChan:
 			connection.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := connection.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-					// Normal close, don't log error
-					return
+				metrics.WSWriteErrors.Inc()
+				if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					slog.Warn("websocket write error", "player_id", connection.player.ID, "error", err)
 				}
-				// log.Printf("❌ Failed to send message to player %d: %v", connection.player.ID, err)
 				return
 			}
+			metrics.BytesSent.Add(float64(len(data)))
 
 		case <-ticker.C:
 			connection.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -494,6 +515,10 @@ func (s *Server) connectionSender(connection *Connection) {
 // cleanupConnection очищает соединение
 func (s *Server) cleanupConnection(connection *Connection) {
 	playerID := connection.player.ID
+
+	metrics.DisconnectionsTotal.Inc()
+	metrics.PlayersConnected.Dec()
+	metrics.SessionDuration.Observe(time.Since(connection.player.JoinTime).Seconds())
 
 	// Notify other players that this player left
 	s.notifyPlayerLeft(playerID)
@@ -544,13 +569,12 @@ func (s *Server) processBroadcast(broadcast BroadcastMessage) {
 			select {
 			case connection.sendChan <- broadcast.Data:
 				sentCount++
+				metrics.BroadcastsSent.Inc()
 			default:
-				log.Printf("   ❌ Channel full for Player %d", connection.player.ID)
-				// Channel full, skip this client
+				slog.Warn("send channel full", "player_id", connection.player.ID)
+				metrics.BroadcastsDropped.Inc()
 			}
-		} else {
-			log.Printf("   🚫 Player %d outside viewport", connection.player.ID)
-		}
+		} // viewport check removed from log
 
 		return true
 	})
@@ -585,17 +609,7 @@ func (s *Server) performanceMonitor() {
 
 // logPerformanceStats логирует статистику производительности
 func (s *Server) logPerformanceStats() {
-	playerCount := s.gameWorld.GetPlayerCount()
-	metrics := s.gameWorld.GetMetrics()
-
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	log.Printf("📊 Performance: Players=%d, TickTime=%v, Memory=%dMB, Goroutines=%d",
-		playerCount,
-		metrics.TickDuration,
-		m.Alloc/1024/1024,
-		runtime.NumGoroutine())
+	// Metrics are exposed via /metrics (Prometheus). Periodic log removed.
 }
 
 // handleHealth обрабатывает health check
@@ -607,9 +621,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		s.gameWorld.GetPlayerCount())
 }
 
-// handleMetrics обрабатывает запрос метрик
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	metrics := s.gameWorld.GetMetrics()
+// handleMetricsJSON обрабатывает запрос метрик в JSON (legacy)
+func (s *Server) handleMetricsJSON(w http.ResponseWriter, r *http.Request) {
+	m := s.gameWorld.GetMetrics()
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -618,13 +635,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"tick_duration_ns": %d,
 		"events_per_second": %d,
 		"uptime_seconds": %d,
-		"goroutines": %d
+		"goroutines": %d,
+		"heap_alloc_mb": %d
 	}`,
-		metrics.ConnectedPlayers,
-		metrics.TickDuration.Nanoseconds(),
-		metrics.EventsPerSecond,
+		m.ConnectedPlayers,
+		m.TickDuration.Nanoseconds(),
+		m.EventsPerSecond,
 		int(time.Since(s.startTime).Seconds()),
-		runtime.NumGoroutine())
+		runtime.NumGoroutine(),
+		mem.HeapAlloc/1024/1024)
 }
 
 // Helper function

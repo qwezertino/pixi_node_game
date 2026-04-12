@@ -1,30 +1,40 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"runtime"
-	"strconv"
+	"runtime/debug"
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/server"
 )
 
 func main() {
+	// Init structured JSON logger
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
+
 	// Optimize Go runtime for 10K connections
 	optimizeRuntime()
 
 	// Load configuration
 	cfg := config.Load()
 
-	log.Printf("🚀 Starting HIGH-PERFORMANCE Go game server")
-	log.Printf("📊 Config: Port=%d, TickRate=%dHz, Workers=%d",
-		cfg.Server.Port, cfg.Game.TickRate, cfg.Server.Workers)
+	slog.Info("server starting",
+		"port", cfg.Server.Port,
+		"tick_rate_hz", cfg.Game.TickRate,
+		"workers", cfg.Server.Workers,
+		"broadcast_workers", cfg.Net.BroadcastWorkers,
+		"max_connections", cfg.Net.MaxConnections,
+	)
 
 	// Create and start game server
 	gameServer := server.New(cfg)
 	if err := gameServer.Start(); err != nil {
-		log.Fatalf("❌ Failed to start server: %v", err)
+		slog.Error("failed to start server", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -36,16 +46,18 @@ func optimizeRuntime() {
 
 	// Optimize GC for high throughput
 	if os.Getenv("GOGC") == "" {
-		os.Setenv("GOGC", "800") // Reduce GC frequency
+		os.Setenv("GOGC", "400")
 	}
 
-	// Set memory limit if available
-	if memLimit := os.Getenv("GOMEMLIMIT"); memLimit != "" {
-		if limit, err := strconv.Atoi(memLimit); err == nil {
-			log.Printf("📈 Memory limit set to %d MB", limit/1024/1024)
-		}
+	// GOMEMLIMIT is read automatically by the Go runtime from the env var.
+	// Log the current value so it's visible in structured logs.
+	memLimit := debug.SetMemoryLimit(-1) // -1 = read current without changing
+	if memLimit != 9223372036854775807 { // math.MaxInt64 = no limit
+		slog.Info("memory limit active", "limit_mb", memLimit/1024/1024)
 	}
 
-	log.Printf("⚙️  Runtime optimized: GOMAXPROCS=%d, GOGC=%s",
-		runtime.GOMAXPROCS(0), os.Getenv("GOGC"))
+	slog.Info("runtime optimized",
+		"gomaxprocs", runtime.GOMAXPROCS(0),
+		"gogc", os.Getenv("GOGC"),
+	)
 }

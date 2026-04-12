@@ -10,8 +10,8 @@ type Player struct {
 	ID          uint32 // Atomic access
 	X           uint32 // Atomic access (stores uint16 value)
 	Y           uint32 // Atomic access (stores uint16 value)
-	VX          int8   // Vector X: -1, 0, 1
-	VY          int8   // Vector Y: -1, 0, 1
+	VX          uint32 // Atomic access (stores int8: -1, 0, 1)
+	VY          uint32 // Atomic access (stores int8: -1, 0, 1)
 	FacingRight uint32 // Atomic bool (0/1)
 	State       uint32 // Atomic player state
 	ClientTick  uint32 // Atomic client tick for reconciliation
@@ -123,6 +123,22 @@ func (p *Player) SetState(state uint8) {
 	atomic.StoreUint32(&p.State, uint32(state))
 }
 
+func (p *Player) GetVX() int8 {
+	return int8(atomic.LoadUint32(&p.VX))
+}
+
+func (p *Player) SetVX(vx int8) {
+	atomic.StoreUint32(&p.VX, uint32(vx))
+}
+
+func (p *Player) GetVY() int8 {
+	return int8(atomic.LoadUint32(&p.VY))
+}
+
+func (p *Player) SetVY(vy int8) {
+	atomic.StoreUint32(&p.VY, uint32(vy))
+}
+
 func (p *Player) GetClientTick() uint32 {
 	return atomic.LoadUint32(&p.ClientTick)
 }
@@ -153,8 +169,8 @@ func (p *Player) ToState() PlayerState {
 		ID:          p.ID,
 		X:           p.GetX(),
 		Y:           p.GetY(),
-		VX:          p.VX,
-		VY:          p.VY,
+		VX:          p.GetVX(),
+		VY:          p.GetVY(),
 		FacingRight: p.GetFacingRight(),
 		State:       p.GetState(),
 		ClientTick:  p.GetClientTick(),

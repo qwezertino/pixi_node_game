@@ -1,7 +1,7 @@
 package systems
 
 import (
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,7 +91,7 @@ func NewBroadcastManager(workerCount int) *BroadcastManager {
 	// Start batch processor
 	go bm.batchProcessor()
 
-	log.Printf("📡 BroadcastManager initialized with %d workers", workerCount)
+	slog.Info("broadcast manager initialized", "workers", workerCount)
 	return bm
 }
 
@@ -227,7 +227,7 @@ func (bm *BroadcastManager) sendBatch(batch *MessageBatch) {
 			}
 		}
 		// All workers busy, drop the batch (graceful degradation)
-		log.Printf("⚠️  All broadcast workers busy, dropping batch from player %d", batch.SenderID)
+		slog.Warn("all broadcast workers busy, dropping batch", "sender_id", batch.SenderID)
 	}
 }
 
@@ -296,8 +296,7 @@ func (w *BroadcastWorker) processJob(job BroadcastJob) {
 	// В реальной реализации здесь была бы отправка через WebSocket connections
 	// Для демонстрации просто логируем
 	if len(job.TargetIDs) > 10 { // Log only large broadcasts
-		log.Printf("📡 Worker %d: broadcasting %d bytes to %d players from player %d",
-			w.id, len(job.Message), len(job.TargetIDs), job.SenderID)
+		slog.Debug("broadcasting", "worker_id", w.id, "bytes", len(job.Message), "targets", len(job.TargetIDs), "sender_id", job.SenderID)
 	}
 }
 

@@ -1,13 +1,14 @@
 package game
 
 import (
-	"log"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"pixi_game_server/internal/config"
+	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/systems"
 	"pixi_game_server/internal/types"
 )
@@ -71,8 +72,7 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 	// Start game loop
 	go gw.gameLoop()
 
-	log.Printf("🌍 GameWorld initialized with %d workers, tick rate %dHz",
-		workerCount, cfg.Game.TickRate)
+	slog.Info("gameworld initialized", "workers", workerCount, "tick_rate_hz", cfg.Game.TickRate)
 
 	return gw
 }
@@ -126,13 +126,15 @@ func (gw *GameWorld) ProcessEvent(event types.GameEvent) {
 		// Event queued successfully
 	default:
 		// Channel full - drop event (graceful degradation)
-		log.Printf("⚠️  Event channel full, dropping event from player %d", event.PlayerID)
+		slog.Warn("event channel full, dropping event", "player_id", event.PlayerID)
+		metrics.EventsDropped.Inc()
 	}
+	metrics.EventChannelLen.Set(float64(len(gw.eventChan)))
 }
 
 // GetVisiblePlayers возвращает игроков видимых для данного игрока
 func (gw *GameWorld) GetVisiblePlayers(playerID uint32, viewport types.ViewportBounds) []types.PlayerState {
-	var visiblePlayers []types.PlayerState
+	visiblePlayers := make([]types.PlayerState, 0, 64)
 
 	gw.players.Range(func(key, value interface{}) bool {
 		player := value.(*types.Player)
@@ -157,7 +159,7 @@ func (gw *GameWorld) GetVisiblePlayers(playerID uint32, viewport types.ViewportB
 
 // GetAllPlayers возвращает всех игроков (для полной синхронизации)
 func (gw *GameWorld) GetAllPlayers() []types.PlayerState {
-	var allPlayers []types.PlayerState
+	allPlayers := make([]types.PlayerState, 0, gw.GetPlayerCount())
 
 	gw.players.Range(func(key, value interface{}) bool {
 		player := value.(*types.Player)
@@ -180,11 +182,11 @@ func (gw *GameWorld) GetPlayerCount() int {
 
 // gameLoop главный игровой цикл
 func (gw *GameWorld) gameLoop() {
-	tickRate := time.Duration(1000/gw.cfg.Game.TickRate) * time.Millisecond
-	gw.ticker = time.NewTicker(tickRate)
+	tickInterval := time.Second / time.Duration(gw.cfg.Game.TickRate)
+	gw.ticker = time.NewTicker(tickInterval)
 	defer gw.ticker.Stop()
 
-	log.Printf("🔄 Game loop started with %v tick interval", tickRate)
+	slog.Info("game loop started", "interval_ms", tickInterval.Milliseconds(), "tick_rate_hz", gw.cfg.Game.TickRate)
 
 	for {
 		select {
@@ -193,9 +195,11 @@ func (gw *GameWorld) gameLoop() {
 			gw.tick()
 			duration := time.Since(start)
 			atomic.StoreInt64(&gw.tickDuration, duration.Nanoseconds())
+			metrics.TickDuration.Observe(duration.Seconds())
+			metrics.TicksTotal.Inc()
 
 		case <-gw.stopChan:
-			log.Println("🛑 Game loop stopped")
+			slog.Info("game loop stopped")
 			return
 		}
 	}
@@ -220,7 +224,9 @@ func (gw *GameWorld) tick() {
 
 // updatePlayerPosition обновляет позицию игрока на основе его векторов движения
 func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
-	if player.VX == 0 && player.VY == 0 {
+	vx := player.GetVX()
+	vy := player.GetVY()
+	if vx == 0 && vy == 0 {
 		return // Player not moving
 	}
 
@@ -231,11 +237,11 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
 	newX32 := int32(currentX)
 	newY32 := int32(currentY)
 
-	if player.VX != 0 {
-		newX32 += int32(player.VX) * int32(gw.cfg.Game.PlayerSpeedPerTick)
+	if vx != 0 {
+		newX32 += int32(vx) * int32(gw.cfg.Game.PlayerSpeedPerTick)
 	}
-	if player.VY != 0 {
-		newY32 += int32(player.VY) * int32(gw.cfg.Game.PlayerSpeedPerTick)
+	if vy != 0 {
+		newY32 += int32(vy) * int32(gw.cfg.Game.PlayerSpeedPerTick)
 	}
 
 	// Apply world boundaries with wrapping
@@ -270,16 +276,17 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
 func (gw *GameWorld) eventWorker(workerID int) {
 	defer gw.workerWG.Done()
 
-	log.Printf("🔧 Event worker %d started", workerID)
+	slog.Debug("event worker started", "worker_id", workerID)
 
 	for {
 		select {
 		case event := <-gw.eventChan:
 			gw.handleEvent(event)
 			atomic.AddUint64(&gw.eventsProcessed, 1)
+			metrics.EventChannelLen.Set(float64(len(gw.eventChan)))
 
 		case <-gw.stopChan:
-			log.Printf("🔧 Event worker %d stopped", workerID)
+			slog.Debug("event worker stopped", "worker_id", workerID)
 			return
 		}
 	}
@@ -296,24 +303,29 @@ func (gw *GameWorld) handleEvent(event types.GameEvent) {
 
 	switch event.Type {
 	case types.EventMove:
+		metrics.EventsProcessed.WithLabelValues("move").Inc()
 		// Validate movement (prevent cheating)
 		if abs(int(event.VectorX)) <= 1 && abs(int(event.VectorY)) <= 1 {
 			// Always update movement vectors, including stopping (0,0)
-			player.VX = event.VectorX
-			player.VY = event.VectorY
+			player.SetVX(event.VectorX)
+			player.SetVY(event.VectorY)
 			player.SetClientTick(event.ClientTick)
 		}
 
 	case types.EventFace:
+		metrics.EventsProcessed.WithLabelValues("face").Inc()
 		player.SetFacingRight(event.FacingRight)
 
 	case types.EventAttack:
+		metrics.EventsProcessed.WithLabelValues("attack").Inc()
 		player.SetState(1) // Attack state
 
 	case types.EventDisconnect:
+		metrics.EventsProcessed.WithLabelValues("disconnect").Inc()
 		// Additional cleanup if needed
 
 	case types.EventViewportUpdate:
+		metrics.EventsProcessed.WithLabelValues("viewport").Inc()
 		// Viewport updates handled in connection layer
 	}
 }
@@ -331,7 +343,7 @@ func (gw *GameWorld) GetMetrics() types.PerformanceMetrics {
 func (gw *GameWorld) Stop() {
 	close(gw.stopChan)
 	gw.workerWG.Wait()
-	log.Println("🌍 GameWorld stopped")
+	slog.Info("gameworld stopped")
 }
 
 // Helper function

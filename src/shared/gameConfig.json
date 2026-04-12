@@ -1,19 +1,8 @@
 {
   "network": {
-    "tickRate": 32,
+    "tickRate": 40,
     "syncInterval": 30000,
-    "batchIntervalMs": 50,
-    "port": 8108,
-    "host": "0.0.0.0",
-    "maxConnections": 12000,
-    "eventChannelSize": 100000,
-    "sendChannelSize": 2048,
-    "broadcastWorkers": 0,
-    "messageRateLimit": 120,
-    "burstLimit": 20,
-    "readBufferSize": 4096,
-    "writeBufferSize": 4096,
-    "workers": 0
+    "batchIntervalMs": 50
   },
   "movement": {
     "playerSpeedPerTick": 4
