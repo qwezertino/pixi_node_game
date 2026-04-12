@@ -246,7 +246,28 @@ export class NetworkManager {
                             }
                         }
 
+                        const prevPlayers = this.players;
                         this.players = message.players;
+
+                        // Fire animation callbacks based on state changes
+                        Object.entries(message.players as Record<string, PlayerState>).forEach(([id, player]) => {
+                            const isLocalPlayer = id === this.playerId;
+                            const prev = prevPlayers[id];
+
+                            // Movement: skip local player (handled by MovementController)
+                            if (!isLocalPlayer && player.moving !== prev?.moving) {
+                                this.onPlayerMovementCallbacks.forEach((cb) =>
+                                    cb(id, player.vx ?? 0, player.vy ?? 0)
+                                );
+                            }
+                            // Attack: include local player — server is authoritative, no prediction
+                            if (player.attacking && !prev?.attacking) {
+                                this.onPlayerAttackCallbacks.forEach((cb) =>
+                                    cb(id, player.position)
+                                );
+                            }
+                        });
+
                         this.onGameStateCallbacks.forEach((callback) =>
                             callback(message.players)
                         );
@@ -317,12 +338,12 @@ export class NetworkManager {
     }
 
     // Send movement to server
-    public sendMovement(dx: number, dy: number, inputSequence?: number, position?: { x: number; y: number }): void {
+    public sendMovement(dx: number, dy: number, inputSequence?: number): void {
         const moveMsg = {
             type: "move" as const,
             movementVector: { dx, dy },
             inputSequence: inputSequence || 0,
-            position: position || { x: 0, y: 0 }, // Default position if not provided
+            position: { x: 0, y: 0 },
         };
 
         // Track ping if FPS display is available
@@ -336,7 +357,7 @@ export class NetworkManager {
         if (this.worker) {
             this.worker.postMessage({ type: 'send', data: binaryData });
         } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-            this.socket.send(binaryData);
+            this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
         }
     }
 
@@ -353,7 +374,7 @@ export class NetworkManager {
         if (this.worker) {
             this.worker.postMessage({ type: 'send', data: binaryData });
         } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-            this.socket.send(binaryData);
+            this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
         }
     }
 
@@ -362,7 +383,7 @@ export class NetworkManager {
         if (this.worker) {
             this.worker.postMessage({ type: 'send', data: binaryData });
         } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-            this.socket.send(binaryData);
+            this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
         }
     }
 
@@ -373,7 +394,7 @@ export class NetworkManager {
         if (this.worker) {
             this.worker.postMessage({ type: 'send', data: binaryData });
         } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-            this.socket.send(binaryData);
+            this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
         }
     }
 

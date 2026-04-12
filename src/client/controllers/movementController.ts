@@ -70,14 +70,15 @@ export class MovementController {
      * Обработать acknowledgment от сервера (server authoritative confirmation)
      */
     handleMovementAcknowledgment(acknowledgedPosition: {x: number, y: number}, inputSequence: number): void {
-        this._pendingInputs = this._pendingInputs.filter(input => input.sequence !== inputSequence);
+        // Remove all inputs up to and including the acknowledged sequence
+        this._pendingInputs = this._pendingInputs.filter(input => input.sequence > inputSequence);
 
         const deltaX = acknowledgedPosition.x - this._virtualPosition.x;
         const deltaY = acknowledgedPosition.y - this._virtualPosition.y;
         const distanceSquared = deltaX * deltaX + deltaY * deltaY;
 
-        // Simple correction: either position is accurate or we reconcile
-        if (distanceSquared > 16) { // 4 pixels tolerance - if bigger difference, reconcile
+        // Reconcile if server position differs by more than 1 tick of movement (4px per axis)
+        if (distanceSquared > 32) { // ~5.6 pixels tolerance
             this.reconcilePosition(acknowledgedPosition, inputSequence);
         }
         // If distanceSquared <= 16, client prediction is accurate enough
@@ -191,7 +192,7 @@ export class MovementController {
                         timestamp: Date.now()
                     });
 
-                    if (this._pendingInputs.length > 10) {
+                    if (this._pendingInputs.length > 30) {
                         this._pendingInputs.shift();
                     }
 
@@ -214,7 +215,7 @@ export class MovementController {
                     timestamp: now
                 });
 
-                if (this._pendingInputs.length > 10) {
+                if (this._pendingInputs.length > 30) {
                     this._pendingInputs.shift();
                 }
 
@@ -275,9 +276,7 @@ export class MovementController {
     private sendMovementToServer(dx: number, dy: number, inputSequence: number): void {
         if (!this._networkManager) return;
 
-        // Send current position to server for validation
-        const currentPosition = this.getVirtualPosition();
-        this._networkManager.sendMovement(dx, dy, inputSequence, currentPosition);
+        this._networkManager.sendMovement(dx, dy, inputSequence);
     }
 
     /**

@@ -28,6 +28,7 @@ type GameConfig struct {
 	SyncInterval       time.Duration
 	BatchInterval      time.Duration
 	PlayerSpeedPerTick int
+	AttackDuration     time.Duration
 }
 
 type WorldConfig struct {
@@ -83,8 +84,9 @@ type JSONConfig struct {
 		} `json:"boundaries"`
 	} `json:"world"`
 	Player struct {
-		BaseScale      float64 `json:"baseScale"`
-		AnimationSpeed float64 `json:"animationSpeed"`
+		BaseScale        float64 `json:"baseScale"`
+		AnimationSpeed   float64 `json:"animationSpeed"`
+		AttackDurationMs int     `json:"attackDurationMs"`
 	} `json:"player"`
 	Game struct {
 		DebugMode bool `json:"debugMode"`
@@ -124,6 +126,7 @@ func Load() *Config {
 			SyncInterval:       time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
 			BatchInterval:      time.Duration(getEnvInt("BATCH_INTERVAL_MS", jsonConfig.Network.BatchIntervalMs)) * time.Millisecond,
 			PlayerSpeedPerTick: getEnvInt("PLAYER_SPEED", jsonConfig.Movement.PlayerSpeedPerTick),
+			AttackDuration:     time.Duration(getEnvInt("ATTACK_DURATION_MS", jsonConfig.Player.AttackDurationMs)) * time.Millisecond,
 		},
 		World: WorldConfig{
 			Width:     uint16(getEnvInt("WORLD_WIDTH", jsonConfig.World.VirtualSize.Width)),

@@ -36,7 +36,7 @@ export class BinaryProtocol {
 
     // Encode client messages
     static encodeMove(moveMsg: MoveMessage): Uint8Array {
-        const buffer = new ArrayBuffer(14);
+        const buffer = new ArrayBuffer(6);
         const view = new DataView(buffer);
         view.setUint8(0, MessageType.MOVE);
 
@@ -46,8 +46,6 @@ export class BinaryProtocol {
 
         view.setUint8(1, packed);
         view.setUint32(2, moveMsg.inputSequence, true);
-        view.setUint32(6, moveMsg.position.x, true);
-        view.setUint32(10, moveMsg.position.y, true);
 
         return new Uint8Array(buffer);
     }
@@ -181,16 +179,18 @@ export class BinaryProtocol {
             const y = view.getUint16(offset, true);
             offset += 2;
 
-            // Skip vector bytes
-            offset += 2;
+            const vx = view.getInt8(offset);
+            offset++;
+            const vy = view.getInt8(offset);
+            offset++;
 
             const flags = view.getUint8(offset);
             offset++;
 
             const direction = (flags & 0x80) ? 1 : -1;
             const state = flags & 0x7F;
-            const moving = state === 1;
-            const attacking = state === 2;
+            const moving = vx !== 0 || vy !== 0;
+            const attacking = state === 1; // server: 1=attack
 
             players[playerId] = {
                 id: playerId,
@@ -198,6 +198,8 @@ export class BinaryProtocol {
                 moving,
                 attacking,
                 position: { x, y },
+                vx,
+                vy,
             };
         }
 
@@ -219,14 +221,16 @@ export class BinaryProtocol {
         const y = view.getUint16(offset, true);
         offset += 2;
 
-        // Skip vector bytes
-        offset += 2;
+        const vx = view.getInt8(offset);
+        offset++;
+        const vy = view.getInt8(offset);
+        offset++;
 
         const flags = view.getUint8(offset);
         const direction = (flags & 0x80) ? 1 : -1;
         const state = flags & 0x7F;
-        const moving = state === 1;
-        const attacking = state === 2;
+        const moving = vx !== 0 || vy !== 0;
+        const attacking = state === 1; // server: 1=attack
 
         return {
             type: 'playerJoined',
@@ -236,6 +240,8 @@ export class BinaryProtocol {
                 moving,
                 attacking,
                 position: { x, y },
+                vx,
+                vy,
             },
         };
     }

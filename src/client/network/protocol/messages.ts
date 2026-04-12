@@ -14,6 +14,8 @@ export interface PlayerState {
     direction: -1 | 1;  // -1 for left, 1 for right
     moving: boolean;
     attacking?: boolean;
+    vx?: number;
+    vy?: number;
     movementVector?: { dx: number; dy: number };
     inputSequence?: number;
 }

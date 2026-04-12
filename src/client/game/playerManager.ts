@@ -220,9 +220,9 @@ export class PlayerManager {
             for (const [playerId, playerState] of Object.entries(players)) {
 
                 if (playerId === currentPlayerId) {
-                    if (this.movementController) {
-                        this.movementController.setVirtualPosition(playerState.position.x, playerState.position.y);
-                    }
+                    // Local player position is managed exclusively by client-side prediction
+                    // and ACK-based reconciliation. Do NOT overwrite it from gameState —
+                    // server position lags 1+ tick behind and causes jitter.
                     continue;
                 }
 
@@ -243,12 +243,11 @@ export class PlayerManager {
                     existingPlayer.direction = playerState.direction;
                     existingPlayer.isMoving = playerState.moving;
 
-                    if (playerState.movementVector) {
-                        existingPlayer.setMovementVector(
-                            playerState.movementVector.dx,
-                            playerState.movementVector.dy
-                        );
-                    }
+                    // Always sync movement vector from gameState vx/vy
+                    existingPlayer.setMovementVector(
+                        playerState.vx ?? 0,
+                        playerState.vy ?? 0
+                    );
                 } else {
                     await this.addRemotePlayer(playerState);
                 }

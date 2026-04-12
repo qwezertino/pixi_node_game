@@ -7,14 +7,15 @@ import (
 
 // Player представляет игрока в системе
 type Player struct {
-	ID          uint32 // Atomic access
-	X           uint32 // Atomic access (stores uint16 value)
-	Y           uint32 // Atomic access (stores uint16 value)
-	VX          uint32 // Atomic access (stores int8: -1, 0, 1)
-	VY          uint32 // Atomic access (stores int8: -1, 0, 1)
-	FacingRight uint32 // Atomic bool (0/1)
-	State       uint32 // Atomic player state
-	ClientTick  uint32 // Atomic client tick for reconciliation
+	ID              uint32 // Atomic access
+	X               uint32 // Atomic access (stores uint16 value)
+	Y               uint32 // Atomic access (stores uint16 value)
+	VX              uint32 // Atomic access (stores int8: -1, 0, 1)
+	VY              uint32 // Atomic access (stores int8: -1, 0, 1)
+	FacingRight     uint32 // Atomic bool (0/1)
+	State           uint32 // Atomic player state
+	ClientTick      uint32 // Atomic client tick for reconciliation
+	AttackStartTime int64  // Atomic nanosecond timestamp of attack start (0 = not attacking)
 
 	// Viewport для оптимизации broadcasting
 	ViewportWidth  uint16
@@ -161,6 +162,14 @@ func (p *Player) IncrementMessageCount() uint64 {
 
 func (p *Player) GetMessageCount() uint64 {
 	return atomic.LoadUint64(&p.MessageCount)
+}
+
+func (p *Player) GetAttackStartTime() int64 {
+	return atomic.LoadInt64(&p.AttackStartTime)
+}
+
+func (p *Player) SetAttackStartTime(t int64) {
+	atomic.StoreInt64(&p.AttackStartTime, t)
 }
 
 // ToState преобразует Player в PlayerState для сериализации

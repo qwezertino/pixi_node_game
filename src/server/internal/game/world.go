@@ -13,14 +13,22 @@ import (
 	"pixi_game_server/internal/types"
 )
 
+// broadcastFuncHolder оборачивает функцию для хранения в atomic.Value.
+type broadcastFuncHolder struct {
+	fn func([]types.PlayerState)
+}
+
 // GameWorld управляет состоянием игрового мира
 type GameWorld struct {
 	cfg     *config.Config
 	players sync.Map // map[uint32]*types.Player - lock-free player storage
 
+	// Tick-driven broadcast: вызывается раз в тик с текущим состоянием всех игроков.
+	// Сервер регистрирует callback через SetTickBroadcaster.
+	tickBroadcast atomic.Value // хранит broadcastFuncHolder
+
 	// High-performance systems
 	visibilityManager *systems.VisibilityManager
-	broadcastManager  *systems.BroadcastManager
 
 	// Event processing
 	eventChan chan types.GameEvent
@@ -56,7 +64,6 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 	// Initialize high-performance systems
 	gw.visibilityManager = systems.NewVisibilityManager(
 		cfg.World.Width, cfg.World.Height, 100) // 100-unit grid cells
-	gw.broadcastManager = systems.NewBroadcastManager(cfg.Net.BroadcastWorkers)
 
 	// Start event processing workers
 	workerCount := cfg.Server.Workers
@@ -102,6 +109,7 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 	player.SetLastUpdate(time.Now().UnixNano())
 
 	gw.players.Store(playerID, player)
+	gw.visibilityManager.AddPlayer(playerID, spawnX, spawnY)
 
 	return player
 }
@@ -109,6 +117,7 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 // RemovePlayer удаляет игрока (lock-free)
 func (gw *GameWorld) RemovePlayer(playerID uint32) {
 	if _, loaded := gw.players.LoadAndDelete(playerID); loaded {
+		gw.visibilityManager.RemovePlayer(playerID)
 		// Send disconnect event to event processing
 		gw.eventChan <- types.GameEvent{
 			PlayerID:  playerID,
@@ -132,28 +141,21 @@ func (gw *GameWorld) ProcessEvent(event types.GameEvent) {
 	metrics.EventChannelLen.Set(float64(len(gw.eventChan)))
 }
 
-// GetVisiblePlayers возвращает игроков видимых для данного игрока
+// GetVisiblePlayers возвращает игроков видимых для данного игрока.
+// Использует пространственную сетку — O(ячейки в viewport × плотность) вместо O(N).
 func (gw *GameWorld) GetVisiblePlayers(playerID uint32, viewport types.ViewportBounds) []types.PlayerState {
-	visiblePlayers := make([]types.PlayerState, 0, 64)
+	ids := gw.visibilityManager.GetVisibleIDs(viewport)
+	defer gw.visibilityManager.ReleaseIDs(ids)
 
-	gw.players.Range(func(key, value interface{}) bool {
-		player := value.(*types.Player)
-
-		// Skip self
-		if player.ID == playerID {
-			return true
+	visiblePlayers := make([]types.PlayerState, 0, len(ids))
+	for _, id := range ids {
+		if id == playerID {
+			continue
 		}
-
-		// Check if player is in viewport
-		x, y := player.GetX(), player.GetY()
-		if x >= viewport.MinX && x <= viewport.MaxX &&
-			y >= viewport.MinY && y <= viewport.MaxY {
-			visiblePlayers = append(visiblePlayers, player.ToState())
+		if val, ok := gw.players.Load(id); ok {
+			visiblePlayers = append(visiblePlayers, val.(*types.Player).ToState())
 		}
-
-		return true
-	})
-
+	}
 	return visiblePlayers
 }
 
@@ -205,16 +207,75 @@ func (gw *GameWorld) gameLoop() {
 	}
 }
 
-// tick выполняет один тик игрового цикла
+// SetTickBroadcaster регистрирует функцию, вызываемую раз в тик со срезом
+// состояний всех игроков. Вызывается из server.New() до первого тика.
+func (gw *GameWorld) SetTickBroadcaster(fn func([]types.PlayerState)) {
+	gw.tickBroadcast.Store(broadcastFuncHolder{fn: fn})
+}
+
+// TryAttack проверяет cooldown и запускает атаку если она разрешена.
+// Возвращает (x, y, true) если атака принята, (0, 0, false) если в cooldown.
+// Потокобезопасно: использует атомарный CAS на AttackStartTime.
+func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
+	val, ok := gw.players.Load(playerID)
+	if !ok {
+		return 0, 0, false
+	}
+	player := val.(*types.Player)
+
+	now := time.Now().UnixNano()
+	cooldown := gw.cfg.Game.AttackDuration.Nanoseconds()
+	start := player.GetAttackStartTime()
+
+	// Reject if still in attack cooldown
+	if start > 0 && now-start < cooldown {
+		return 0, 0, false
+	}
+
+	player.SetState(1)
+	player.SetAttackStartTime(now)
+	metrics.EventsProcessed.WithLabelValues("attack").Inc()
+
+	return player.GetX(), player.GetY(), true
+}
+
+// tick выполняет один тик игрового цикла.
+// За один Range обновляет позиции и собирает состояния — ноль лишних итераций.
 func (gw *GameWorld) tick() {
-	// Process movement for all players
+	v := gw.tickBroadcast.Load()
+	hasBroadcaster := v != nil
+
+	var states []types.PlayerState
+	if hasBroadcaster {
+		states = make([]types.PlayerState, 0, 64)
+	}
+
+	nowNano := time.Now().UnixNano()
+	attackDurNano := gw.cfg.Game.AttackDuration.Nanoseconds()
+
 	gw.players.Range(func(key, value interface{}) bool {
 		player := value.(*types.Player)
+
+		// Server-authoritative attack timeout
+		if player.GetState() == 1 {
+			start := player.GetAttackStartTime()
+			if start > 0 && nowNano-start >= attackDurNano {
+				player.SetState(0)
+				player.SetAttackStartTime(0)
+			}
+		}
+
 		gw.updatePlayerPosition(player)
+		if hasBroadcaster {
+			states = append(states, player.ToState())
+		}
 		return true
 	})
 
-	// Check if full sync is needed
+	if hasBroadcaster && len(states) > 0 {
+		v.(broadcastFuncHolder).fn(states)
+	}
+
 	now := time.Now()
 	if now.Sub(gw.lastFullSync) >= gw.cfg.Game.SyncInterval {
 		atomic.StoreInt64(&gw.lastSyncTime, now.UnixNano())
@@ -244,22 +305,22 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
 		newY32 += int32(vy) * int32(gw.cfg.Game.PlayerSpeedPerTick)
 	}
 
-	// Apply world boundaries with wrapping
+	// Apply world boundaries with clamping (matches client-side behavior)
 	maxX := int32(gw.cfg.World.MaxX)
 	minX := int32(gw.cfg.World.MinX)
 	maxY := int32(gw.cfg.World.MaxY)
 	minY := int32(gw.cfg.World.MinY)
 
 	if newX32 >= maxX {
-		newX32 = minX
+		newX32 = maxX
 	} else if newX32 < minX {
-		newX32 = maxX - 1
+		newX32 = minX
 	}
 
 	if newY32 >= maxY {
-		newY32 = minY
+		newY32 = maxY
 	} else if newY32 < minY {
-		newY32 = maxY - 1
+		newY32 = minY
 	}
 
 	// Convert back to uint16 after boundary checks
@@ -270,6 +331,7 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
 	player.SetX(newX)
 	player.SetY(newY)
 	player.SetLastUpdate(time.Now().UnixNano())
+	gw.visibilityManager.MovePlayer(player.ID, newX, newY)
 }
 
 // eventWorker обрабатывает события в отдельной горутине
@@ -318,7 +380,13 @@ func (gw *GameWorld) handleEvent(event types.GameEvent) {
 
 	case types.EventAttack:
 		metrics.EventsProcessed.WithLabelValues("attack").Inc()
-		player.SetState(1) // Attack state
+		// Legacy path (via ProcessEvent queue) - TryAttack is now preferred.
+		// Guard against double-processing if called from old code paths.
+		if player.GetState() == 1 {
+			break
+		}
+		player.SetState(1)
+		player.SetAttackStartTime(time.Now().UnixNano())
 
 	case types.EventDisconnect:
 		metrics.EventsProcessed.WithLabelValues("disconnect").Inc()

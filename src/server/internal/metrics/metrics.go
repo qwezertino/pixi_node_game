@@ -1,9 +1,24 @@
 package metrics
 
 import (
+	"regexp"
+
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+func init() {
+	// Дефолтный GoCollector вызывает runtime.ReadMemStats() — это Stop-The-World.
+	// При scrape_interval=5s это даёт спайки p99 10-50ms в game loop.
+	// Заменяем на STW-free коллектор через runtime/metrics API (Go 1.17+).
+	prometheus.Unregister(collectors.NewGoCollector())
+	prometheus.MustRegister(collectors.NewGoCollector(
+		collectors.WithGoCollectorRuntimeMetrics(
+			collectors.GoRuntimeMetricsRule{Matcher: regexp.MustCompile(`.*`)},
+		),
+	))
+}
 
 var (
 	// ── Players ──────────────────────────────────────────────────────────────

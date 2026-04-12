@@ -30,10 +30,6 @@ type Server struct {
 	// Connection management
 	connections sync.Map // map[uint32]*Connection
 
-	// Broadcasting
-	broadcastChan chan BroadcastMessage
-	broadcastWG   sync.WaitGroup
-
 	// Rate limiting
 	rateLimiters sync.Map // map[string]*rate.Limiter
 
@@ -55,13 +51,6 @@ type Connection struct {
 	cancel      context.CancelFunc
 }
 
-// BroadcastMessage сообщение для рассылки
-type BroadcastMessage struct {
-	PlayerID uint32
-	Data     []byte
-	Viewport types.ViewportBounds
-}
-
 // New создает новый сервер
 func New(cfg *config.Config) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -69,9 +58,6 @@ func New(cfg *config.Config) *Server {
 	// Auto-detect worker count
 	if cfg.Server.Workers == 0 {
 		cfg.Server.Workers = runtime.NumCPU()
-	}
-	if cfg.Net.BroadcastWorkers == 0 {
-		cfg.Net.BroadcastWorkers = runtime.NumCPU() * 2
 	}
 
 	server := &Server{
@@ -85,22 +71,37 @@ func New(cfg *config.Config) *Server {
 				return true // Allow all origins for development
 			},
 		},
-		broadcastChan: make(chan BroadcastMessage, 10000), // Large buffer for broadcasts
-		ctx:           ctx,
-		cancel:        cancel,
-		startTime:     time.Now(),
+		ctx:       ctx,
+		cancel:    cancel,
+		startTime: time.Now(),
 	}
 
-	// Start broadcast workers
-	for i := 0; i < cfg.Net.BroadcastWorkers; i++ {
-		server.broadcastWG.Add(1)
-		go server.broadcastWorker(i)
-	}
+	// Регистрируем tick-driven broadcast: состояние кодируется один раз в тик, разосылается всем.
+	server.gameWorld.SetTickBroadcaster(server.broadcastTick)
 
 	// Start performance monitoring
 	go server.performanceMonitor()
 
 	return server
+}
+
+// broadcastTick кодирует состояние всех игроков ОДИН раз и разсылает один []byte всем.
+// Вызывается из game loop через SetTickBroadcaster callback.
+// O(N) вместо O(N²): одно кодирование, N non-blocking sendChan writes.
+func (s *Server) broadcastTick(players []types.PlayerState) {
+	if len(players) == 0 {
+		return
+	}
+	data := s.protocol.EncodeGameState(players)
+	s.connections.Range(func(_, v interface{}) bool {
+		conn := v.(*Connection)
+		select {
+		case conn.sendChan <- data:
+		default:
+			metrics.SendChannelDropped.Inc()
+		}
+		return true
+	})
 }
 
 // Start запускает сервер
@@ -246,65 +247,43 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 	switch clientMsg.Type {
 	case protocol.MessageMove:
 		metrics.MessagesReceived.WithLabelValues("move").Inc()
-		// Get client's reported position from the message
-		clientX := uint16(clientMsg.Position.X)
-		clientY := uint16(clientMsg.Position.Y)
 
-		// Get current server position for validation
-		serverX := connection.player.GetX()
-		serverY := connection.player.GetY()
+		// Server-authoritative: process movement vector, server computes position
+		event := types.GameEvent{
+			PlayerID:   connection.player.ID,
+			Type:       types.EventMove,
+			VectorX:    clientMsg.MovementVector.DX,
+			VectorY:    clientMsg.MovementVector.DY,
+			ClientTick: clientMsg.InputSequence,
+		}
+		s.gameWorld.ProcessEvent(event)
 
-		// Calculate position difference for validation
-		deltaX := int32(clientX) - int32(serverX)
-		deltaY := int32(clientY) - int32(serverY)
-		distanceSquared := deltaX*deltaX + deltaY*deltaY
+		// ACK with the position the client predicted (current + this move vector).
+		// The server will apply the same formula in its next tick.
+		// Sending this avoids false reconciliation: client delta = 0.
+		speed := int32(s.cfg.Game.PlayerSpeedPerTick)
+		dx := int32(clientMsg.MovementVector.DX)
+		dy := int32(clientMsg.MovementVector.DY)
+		ackX32 := int32(connection.player.GetX()) + dx*speed
+		ackY32 := int32(connection.player.GetY()) + dy*speed
 
-		// Threshold for acceptable position difference (in pixels)
-		const maxAllowedDistanceSquared = 50 * 50 // 50 pixels tolerance
-
-		var ackX, ackY uint16
-
-		// If client position is too far from server, reject it and send server position
-		if distanceSquared > maxAllowedDistanceSquared {
-			// Process movement from current server position
-			event := types.GameEvent{
-				PlayerID:   connection.player.ID,
-				Type:       types.EventMove,
-				VectorX:    clientMsg.MovementVector.DX,
-				VectorY:    clientMsg.MovementVector.DY,
-				ClientTick: clientMsg.InputSequence,
-			}
-			s.gameWorld.ProcessEvent(event)
-
-			// Send server's authoritative position
-			ackX = connection.player.GetX()
-			ackY = connection.player.GetY()
-		} else {
-			// Client position is acceptable, use it as starting point for movement
-			// Set player to client's reported position first
-			connection.player.SetX(clientX)
-			connection.player.SetY(clientY)
-
-			// Then process the movement from that position
-			event := types.GameEvent{
-				PlayerID:   connection.player.ID,
-				Type:       types.EventMove,
-				VectorX:    clientMsg.MovementVector.DX,
-				VectorY:    clientMsg.MovementVector.DY,
-				ClientTick: clientMsg.InputSequence,
-			}
-			s.gameWorld.ProcessEvent(event)
-
-			// Acknowledge the client's original position (lag compensation)
-			ackX = clientX
-			ackY = clientY
+		// Clamp to world bounds (same as updatePlayerPosition)
+		if ackX32 > int32(s.cfg.World.MaxX) {
+			ackX32 = int32(s.cfg.World.MaxX)
+		} else if ackX32 < int32(s.cfg.World.MinX) {
+			ackX32 = int32(s.cfg.World.MinX)
+		}
+		if ackY32 > int32(s.cfg.World.MaxY) {
+			ackY32 = int32(s.cfg.World.MaxY)
+		} else if ackY32 < int32(s.cfg.World.MinY) {
+			ackY32 = int32(s.cfg.World.MinY)
 		}
 
 		// Send movement acknowledgment
 		ackData := s.protocol.EncodeMovementAck(
 			connection.player.ID,
-			ackX,
-			ackY,
+			uint16(ackX32),
+			uint16(ackY32),
 			clientMsg.InputSequence,
 		)
 
@@ -314,33 +293,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			slog.Warn("movement ack channel full", "player_id", connection.player.ID)
 		}
 
-		// Broadcast player movement to other clients
-		stateData := s.protocol.EncodePlayerMovement(
-			connection.player.ID,
-			clientMsg.MovementVector.DX,
-			clientMsg.MovementVector.DY,
-		)
-
-		// Define broadcast viewport (for now, broadcast to all - can optimize later)
-		viewport := types.ViewportBounds{
-			MinX: 0,
-			MinY: 0,
-			MaxX: 65535,
-			MaxY: 65535,
-		}
-
-		broadcast := BroadcastMessage{
-			PlayerID: connection.player.ID,
-			Data:     stateData,
-			Viewport: viewport,
-		}
-
-		select {
-		case s.broadcastChan <- broadcast:
-		default:
-			slog.Warn("movement broadcast channel full, skipped")
-			// Broadcast channel full, skip
-		}
+		// Обновление позиции разошлётся через tick broadcast, не здесь.
 
 	case protocol.MessageDirection:
 		metrics.MessagesReceived.WithLabelValues("direction").Inc()
@@ -349,54 +302,15 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			Type:        types.EventFace,
 			FacingRight: clientMsg.Direction,
 		})
-
-		// Broadcast direction change
-		stateData := s.protocol.EncodePlayerDirection(
-			connection.player.ID,
-			clientMsg.Direction,
-		)
-
-		viewport := types.ViewportBounds{MinX: 0, MinY: 0, MaxX: 65535, MaxY: 65535}
-		broadcast := BroadcastMessage{
-			PlayerID: connection.player.ID,
-			Data:     stateData,
-			Viewport: viewport,
-		}
-
-		select {
-		case s.broadcastChan <- broadcast:
-		default:
-			// Broadcast channel full, skip
-		}
+		// Обновление направления разошлётся через tick broadcast.
 
 	case protocol.MessageAttack:
 		metrics.MessagesReceived.WithLabelValues("attack").Inc()
-		s.gameWorld.ProcessEvent(types.GameEvent{
-			PlayerID: connection.player.ID,
-			Type:     types.EventAttack,
-		})
+		s.gameWorld.TryAttack(connection.player.ID)
+		// State=1 будет разослан всем через tick broadcast.
 
-		// Broadcast attack state
-		playerX := connection.player.GetX()
-		playerY := connection.player.GetY()
-		stateData := s.protocol.EncodePlayerAttack(
-			connection.player.ID,
-			playerX,
-			playerY,
-		)
-
-		viewport := types.ViewportBounds{MinX: 0, MinY: 0, MaxX: 65535, MaxY: 65535}
-		broadcast := BroadcastMessage{
-			PlayerID: connection.player.ID,
-			Data:     stateData,
-			Viewport: viewport,
-		}
-
-		select {
-		case s.broadcastChan <- broadcast:
-		default:
-			// Broadcast channel full, skip
-		}
+	case protocol.MessageAttackEnd:
+		// Ignored: server is authoritative on attack duration.
 
 	case protocol.MessageViewportUpdate:
 		metrics.MessagesReceived.WithLabelValues("viewport").Inc()
@@ -492,6 +406,7 @@ func (s *Server) connectionSender(connection *Connection) {
 	for {
 		select {
 		case <-connection.ctx.Done():
+			return
 		case data := <-connection.sendChan:
 			connection.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := connection.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
@@ -527,57 +442,6 @@ func (s *Server) cleanupConnection(connection *Connection) {
 	connection.conn.Close()
 	s.connections.Delete(playerID)
 	s.gameWorld.RemovePlayer(playerID)
-}
-
-// broadcastWorker обрабатывает рассылку сообщений
-func (s *Server) broadcastWorker(workerID int) {
-	defer s.broadcastWG.Done()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-
-		case broadcast := <-s.broadcastChan:
-			s.processBroadcast(broadcast)
-		}
-	}
-}
-
-// processBroadcast обрабатывает рассылку
-func (s *Server) processBroadcast(broadcast BroadcastMessage) {
-
-	sentCount := 0
-	totalConnections := 0
-
-	s.connections.Range(func(key, value interface{}) bool {
-		connection := value.(*Connection)
-		totalConnections++
-
-		// Skip sender
-		if connection.player.ID == broadcast.PlayerID {
-			return true
-		}
-
-		// Check viewport visibility
-		playerX := connection.player.GetX()
-		playerY := connection.player.GetY()
-
-		if playerX >= broadcast.Viewport.MinX && playerX <= broadcast.Viewport.MaxX &&
-			playerY >= broadcast.Viewport.MinY && playerY <= broadcast.Viewport.MaxY {
-
-			select {
-			case connection.sendChan <- broadcast.Data:
-				sentCount++
-				metrics.BroadcastsSent.Inc()
-			default:
-				slog.Warn("send channel full", "player_id", connection.player.ID)
-				metrics.BroadcastsDropped.Inc()
-			}
-		} // viewport check removed from log
-
-		return true
-	})
 }
 
 // getOrCreateRateLimiter получает или создает rate limiter для IP

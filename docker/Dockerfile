@@ -62,8 +62,7 @@ RUN chown -R gameserver:gameserver /app
 USER gameserver
 
 ENV PORT=8108 \
-    STATIC_DIR=/app/static \
-    GOGC=800
+    STATIC_DIR=/app/static
 
 EXPOSE 8108
 

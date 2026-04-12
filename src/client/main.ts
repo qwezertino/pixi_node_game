@@ -190,20 +190,22 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     });
     console.log("Network connection established, starting game...");
 
-        // Attack handling with immediate feedback
-    app.canvas.addEventListener("mousedown", (e) => {
-        if (e.button === 0 && animationController.handleAttack()) {
-            // Immediate visual feedback - play attack animation instantly
-            animationController.setAnimation("attack");
+    // Local player attack animation — triggered by server confirmation via gameState
+    networkManager.onPlayerAttack((playerId, _position) => {
+        if (playerId === networkManager.getPlayerId()) {
+            animationController.handleAttack();
+        }
+    });
 
-            // Send attack to server in binary format
+        // Attack handling — no prediction, server-authoritative animation
+    app.canvas.addEventListener("mousedown", (e) => {
+        if (e.button === 0 && animationController.playerState !== PlayerState.ATTACKING) {
+            // Gate: don't spam while animation is still playing locally
             const position = { x: playerSprite.position.x, y: playerSprite.position.y };
             const attackMsg = {
                 type: 'attack' as const,
                 position
             };
-
-            // Use binary protocol for attack
             const binaryData = BinaryProtocol.encodeAttack(attackMsg);
             networkManager.sendAttack(binaryData);
         }

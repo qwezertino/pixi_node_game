@@ -76,16 +76,12 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (*ClientMessage, erro
 
 	switch msg.Type {
 	case MessageMove:
-		if len(data) < 14 { // Updated from 6 to 14 (6 + 8 for position)
+		if len(data) < 6 {
 			return nil, fmt.Errorf("move message too short")
 		}
 		movement := UnpackMovement(data[1])
 		msg.MovementVector = movement
 		msg.InputSequence = binary.LittleEndian.Uint32(data[2:6])
-
-		// Decode position (x, y as uint32)
-		msg.Position.X = binary.LittleEndian.Uint32(data[6:10])
-		msg.Position.Y = binary.LittleEndian.Uint32(data[10:14])
 
 	case MessageDirection:
 		if len(data) < 2 {

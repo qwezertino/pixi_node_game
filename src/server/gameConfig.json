@@ -1,6 +1,6 @@
 {
   "network": {
-    "tickRate": 20,
+    "tickRate": 40,
     "syncInterval": 30000,
     "batchIntervalMs": 50
   },
@@ -27,8 +27,7 @@
   },
   "player": {
     "baseScale": 2,
-    "animationSpeed": 0.1,
-    "attackDurationMs": 1000
+    "animationSpeed": 0.1
   },
   "game": {
     "debugMode": false
