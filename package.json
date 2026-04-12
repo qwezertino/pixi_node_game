@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev:client": "vite",
-    "build:client": "vite build"
+    "build:client": "vite build",
+    "test:load": "artillery run --target \"ws://localhost:8108/ws\" utils/testing/artillery/artillery-config.yml"
   },
   "dependencies": {
     "@pixi/devtools": "^2.0.1",
@@ -17,6 +18,7 @@
   "devDependencies": {
     "@eslint/js": "^9.16.0",
     "@types/bun": "latest",
+    "artillery": "^2.0.0",
     "eslint": "^9.16.0",
     "npm-run-all": "^4.1.5",
     "typescript": "~5.7.2",

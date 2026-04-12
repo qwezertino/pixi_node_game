@@ -211,12 +211,14 @@ module.exports = {
   // Log performance metrics on disconnect
   logDisconnect: function(context, events, done) {
     const sessionDuration = Date.now() - context.vars.sessionStart;
-    const messagesPerSecond = context.vars.messagesSent / (sessionDuration / 1000);
+    const messagesPerSecond = sessionDuration > 0 ? context.vars.messagesSent / (sessionDuration / 1000) : 0;
 
     events.emit('counter', 'game.session.completed', 1);
     events.emit('counter', 'game.session.total_messages', context.vars.messagesSent);
     events.emit('counter', 'game.session.errors', context.vars.errors);
-    events.emit('rate', 'game.session.messages_per_second', messagesPerSecond);
+    if (messagesPerSecond > 0) {
+      events.emit('rate', 'game.session.messages_per_second', messagesPerSecond);
+    }
     events.emit('histogram', 'game.session.duration_ms', sessionDuration);
 
     return done();
