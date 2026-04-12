@@ -27,3 +27,6 @@ dist-ssr
 
 # Local monitoring data (bind mounts)
 docker/data/
+
+# Artillery config (local targets/phases, use artillery-config.yml.example as template)
+utils/testing/artillery/artillery-config.yml
