@@ -15,7 +15,7 @@ import (
 
 // broadcastFuncHolder оборачивает функцию для хранения в atomic.Value.
 type broadcastFuncHolder struct {
-	fn func([]types.PlayerState)
+	fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool)
 }
 
 // GameWorld управляет состоянием игрового мира
@@ -25,19 +25,22 @@ type GameWorld struct {
 
 	// Tick-driven broadcast: вызывается раз в тик с текущим состоянием всех игроков.
 	// Сервер регистрирует callback через SetTickBroadcaster.
-	tickBroadcast atomic.Value // хранит broadcastFuncHolder
+	broadcastChan chan broadcastPayload
+	tickerDone    chan struct{} // closed when game loop exits
 
 	// High-performance systems
 	visibilityManager *systems.VisibilityManager
 
-	// Event processing
-	eventChan chan types.GameEvent
-	workerWG  sync.WaitGroup
-
+	// Delta tracking: previous tick state for each player
+	prevStates map[uint32]types.PlayerState
+	tickCount  uint32 // counts ticks for periodic full sync
+	// Reusable scratch buffers for tick() — only touched from gameLoop goroutine, no sync needed.
+	scratchStates  []types.PlayerState
+	scratchChanged []types.PlayerState
+	scratchSeenIDs map[uint32]struct{}
 	// Performance metrics
-	tickDuration    int64  // atomic
-	eventsProcessed uint64 // atomic
-	lastSyncTime    int64  // atomic
+	tickDuration int64 // atomic
+	lastSyncTime int64 // atomic
 
 	// Tick management
 	ticker   *time.Ticker
@@ -46,40 +49,44 @@ type GameWorld struct {
 	// Player ID generation
 	nextPlayerID uint32 // atomic
 
+	// Estimated player count for pre-allocation
+	playerCountEstimate uint32 // atomic
+
 	// State for full sync
 	lastFullSync time.Time
+}
+
+// broadcastPayload передаёт данные из tick в broadcast-горутину.
+type broadcastPayload struct {
+	all      []types.PlayerState
+	changed  []types.PlayerState
+	fullSync bool
 } // NewGameWorld создает новый игровой мир
 func NewGameWorld(cfg *config.Config) *GameWorld {
 	// Initialize random seed for spawn positions
 	rand.Seed(time.Now().UnixNano())
 
 	gw := &GameWorld{
-		cfg:          cfg,
-		eventChan:    make(chan types.GameEvent, cfg.Net.EventChannelSize),
-		stopChan:     make(chan struct{}),
-		nextPlayerID: 1000, // Start from 1000 for easy debugging
-		lastFullSync: time.Now(),
+		cfg:            cfg,
+		stopChan:       make(chan struct{}),
+		nextPlayerID:   1000, // Start from 1000 for easy debugging
+		lastFullSync:   time.Now(),
+		prevStates:     make(map[uint32]types.PlayerState, 256),
+		broadcastChan:  make(chan broadcastPayload, 2),
+		tickerDone:     make(chan struct{}),
+		scratchStates:  make([]types.PlayerState, 0, 256),
+		scratchChanged: make([]types.PlayerState, 0, 64),
+		scratchSeenIDs: make(map[uint32]struct{}, 256),
 	}
 
 	// Initialize high-performance systems
 	gw.visibilityManager = systems.NewVisibilityManager(
 		cfg.World.Width, cfg.World.Height, 100) // 100-unit grid cells
 
-	// Start event processing workers
-	workerCount := cfg.Server.Workers
-	if workerCount == 0 {
-		workerCount = 4 // Default worker count
-	}
-
-	for i := 0; i < workerCount; i++ {
-		gw.workerWG.Add(1)
-		go gw.eventWorker(i)
-	}
-
 	// Start game loop
 	go gw.gameLoop()
 
-	slog.Info("gameworld initialized", "workers", workerCount, "tick_rate_hz", cfg.Game.TickRate)
+	slog.Info("gameworld initialized", "tick_rate_hz", cfg.Game.TickRate)
 
 	return gw
 }
@@ -110,6 +117,7 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 
 	gw.players.Store(playerID, player)
 	gw.visibilityManager.AddPlayer(playerID, spawnX, spawnY)
+	atomic.AddUint32(&gw.playerCountEstimate, 1)
 
 	return player
 }
@@ -118,27 +126,14 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 func (gw *GameWorld) RemovePlayer(playerID uint32) {
 	if _, loaded := gw.players.LoadAndDelete(playerID); loaded {
 		gw.visibilityManager.RemovePlayer(playerID)
-		// Send disconnect event to event processing
-		gw.eventChan <- types.GameEvent{
-			PlayerID:  playerID,
-			Type:      types.EventDisconnect,
-			Timestamp: time.Now().UnixNano(),
-		}
+		atomic.AddUint32(&gw.playerCountEstimate, ^uint32(0)) // decrement
+		metrics.EventsProcessed.WithLabelValues("disconnect").Inc()
 	}
 }
 
-// ProcessEvent добавляет событие в очередь обработки
+// ProcessEvent обрабатывает событие инлайн (все операции atomic, нет нужды в канале/воркерах).
 func (gw *GameWorld) ProcessEvent(event types.GameEvent) {
-	event.Timestamp = time.Now().UnixNano()
-	select {
-	case gw.eventChan <- event:
-		// Event queued successfully
-	default:
-		// Channel full - drop event (graceful degradation)
-		slog.Warn("event channel full, dropping event", "player_id", event.PlayerID)
-		metrics.EventsDropped.Inc()
-	}
-	metrics.EventChannelLen.Set(float64(len(gw.eventChan)))
+	gw.handleEvent(event)
 }
 
 // GetVisiblePlayers возвращает игроков видимых для данного игрока.
@@ -209,8 +204,8 @@ func (gw *GameWorld) gameLoop() {
 
 // SetTickBroadcaster регистрирует функцию, вызываемую раз в тик со срезом
 // состояний всех игроков. Вызывается из server.New() до первого тика.
-func (gw *GameWorld) SetTickBroadcaster(fn func([]types.PlayerState)) {
-	gw.tickBroadcast.Store(broadcastFuncHolder{fn: fn})
+func (gw *GameWorld) SetTickBroadcaster(fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool)) {
+	go gw.broadcastLoop(fn)
 }
 
 // TryAttack проверяет cooldown и запускает атаку если она разрешена.
@@ -240,18 +235,20 @@ func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
 }
 
 // tick выполняет один тик игрового цикла.
-// За один Range обновляет позиции и собирает состояния — ноль лишних итераций.
+// За один Range обновляет позиции, собирает состояния и вычисляет дельту.
+// Scratch-буферы переиспользуются между тиками — нет аллокаций на горячем пути.
 func (gw *GameWorld) tick() {
-	v := gw.tickBroadcast.Load()
-	hasBroadcaster := v != nil
-
-	var states []types.PlayerState
-	if hasBroadcaster {
-		states = make([]types.PlayerState, 0, 64)
-	}
+	// Reset scratch buffers without allocating.
+	gw.scratchStates = gw.scratchStates[:0]
+	gw.scratchChanged = gw.scratchChanged[:0]
+	clear(gw.scratchSeenIDs)
 
 	nowNano := time.Now().UnixNano()
 	attackDurNano := gw.cfg.Game.AttackDuration.Nanoseconds()
+
+	gw.tickCount++
+	// Full sync every TickRate ticks (~1 second)
+	fullSync := gw.tickCount%uint32(gw.cfg.Game.TickRate) == 0
 
 	gw.players.Range(func(key, value interface{}) bool {
 		player := value.(*types.Player)
@@ -266,20 +263,70 @@ func (gw *GameWorld) tick() {
 		}
 
 		gw.updatePlayerPosition(player)
-		if hasBroadcaster {
-			states = append(states, player.ToState())
+		st := player.ToState()
+		gw.scratchStates = append(gw.scratchStates, st)
+		gw.scratchSeenIDs[st.ID] = struct{}{}
+
+		// Delta: compare with previous tick
+		if !fullSync {
+			prev, exists := gw.prevStates[st.ID]
+			if !exists || st.X != prev.X || st.Y != prev.Y ||
+				st.VX != prev.VX || st.VY != prev.VY ||
+				st.State != prev.State || st.FacingRight != prev.FacingRight {
+				gw.scratchChanged = append(gw.scratchChanged, st)
+			}
 		}
+
 		return true
 	})
 
-	if hasBroadcaster && len(states) > 0 {
-		v.(broadcastFuncHolder).fn(states)
+	// Update prevStates: remove departed players, update existing.
+	for id := range gw.prevStates {
+		if _, ok := gw.scratchSeenIDs[id]; !ok {
+			delete(gw.prevStates, id)
+		}
+	}
+	for _, st := range gw.scratchStates {
+		gw.prevStates[st.ID] = st
+	}
+
+	if len(gw.scratchStates) == 0 {
+		return
+	}
+
+	// Copy scratch slices before sending — broadcastLoop reads them asynchronously
+	// while tick() will overwrite scratch on the very next tick.
+	allCopy := make([]types.PlayerState, len(gw.scratchStates))
+	copy(allCopy, gw.scratchStates)
+
+	var changedCopy []types.PlayerState
+	if !fullSync && len(gw.scratchChanged) > 0 {
+		changedCopy = make([]types.PlayerState, len(gw.scratchChanged))
+		copy(changedCopy, gw.scratchChanged)
+	}
+
+	select {
+	case gw.broadcastChan <- broadcastPayload{all: allCopy, changed: changedCopy, fullSync: fullSync}:
+	default:
+		// broadcast goroutine is still busy — skip this tick's payload.
 	}
 
 	now := time.Now()
 	if now.Sub(gw.lastFullSync) >= gw.cfg.Game.SyncInterval {
 		atomic.StoreInt64(&gw.lastSyncTime, now.UnixNano())
 		gw.lastFullSync = now
+	}
+}
+
+// broadcastLoop выделенная горутина для broadcast (вместо go-per-tick).
+func (gw *GameWorld) broadcastLoop(fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool)) {
+	for {
+		select {
+		case payload := <-gw.broadcastChan:
+			fn(payload.all, payload.changed, payload.fullSync)
+		case <-gw.stopChan:
+			return
+		}
 	}
 }
 
@@ -334,27 +381,7 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player) {
 	gw.visibilityManager.MovePlayer(player.ID, newX, newY)
 }
 
-// eventWorker обрабатывает события в отдельной горутине
-func (gw *GameWorld) eventWorker(workerID int) {
-	defer gw.workerWG.Done()
-
-	slog.Debug("event worker started", "worker_id", workerID)
-
-	for {
-		select {
-		case event := <-gw.eventChan:
-			gw.handleEvent(event)
-			atomic.AddUint64(&gw.eventsProcessed, 1)
-			metrics.EventChannelLen.Set(float64(len(gw.eventChan)))
-
-		case <-gw.stopChan:
-			slog.Debug("event worker stopped", "worker_id", workerID)
-			return
-		}
-	}
-}
-
-// handleEvent обрабатывает одно событие
+// handleEvent обрабатывает одно событие инлайн (atomic-операции, потокобезопасно)
 func (gw *GameWorld) handleEvent(event types.GameEvent) {
 	playerInterface, exists := gw.players.Load(event.PlayerID)
 	if !exists {
@@ -387,14 +414,6 @@ func (gw *GameWorld) handleEvent(event types.GameEvent) {
 		}
 		player.SetState(1)
 		player.SetAttackStartTime(time.Now().UnixNano())
-
-	case types.EventDisconnect:
-		metrics.EventsProcessed.WithLabelValues("disconnect").Inc()
-		// Additional cleanup if needed
-
-	case types.EventViewportUpdate:
-		metrics.EventsProcessed.WithLabelValues("viewport").Inc()
-		// Viewport updates handled in connection layer
 	}
 }
 
@@ -403,14 +422,12 @@ func (gw *GameWorld) GetMetrics() types.PerformanceMetrics {
 	return types.PerformanceMetrics{
 		ConnectedPlayers: uint32(gw.GetPlayerCount()),
 		TickDuration:     time.Duration(atomic.LoadInt64(&gw.tickDuration)),
-		EventsPerSecond:  atomic.LoadUint64(&gw.eventsProcessed),
 	}
 }
 
 // Stop останавливает игровой мир
 func (gw *GameWorld) Stop() {
 	close(gw.stopChan)
-	gw.workerWG.Wait()
 	slog.Info("gameworld stopped")
 }
 

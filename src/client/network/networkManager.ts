@@ -231,14 +231,13 @@ export class NetworkManager {
                         break;
 
                     case "gameState":
+                    case "deltaGameState":
 
                         // If we don't have a player ID yet, determine it from the game state
                         if (!this.playerId && message.players) {
                             const playerIds = Object.keys(message.players);
                             if (playerIds.length > 0) {
-                                // For now, assume we're the first player in the list
-                                // This is a simplified approach - in real game this should be handled differently
-                                this.playerId = playerIds[playerIds.length - 1]; // Take the last player (most recently joined)
+                                this.playerId = playerIds[playerIds.length - 1];
 
                                 if (message.players[this.playerId]) {
                                     this.initialPosition = message.players[this.playerId].position;
@@ -247,7 +246,17 @@ export class NetworkManager {
                         }
 
                         const prevPlayers = this.players;
-                        this.players = message.players;
+
+                        if (message.type === "deltaGameState") {
+                            // Delta: merge changed players into existing state
+                            this.players = { ...this.players };
+                            for (const [id, player] of Object.entries(message.players as Record<string, PlayerState>)) {
+                                this.players[id] = player;
+                            }
+                        } else {
+                            // Full state: replace entirely
+                            this.players = message.players;
+                        }
 
                         // Fire animation callbacks based on state changes
                         Object.entries(message.players as Record<string, PlayerState>).forEach(([id, player]) => {
@@ -269,7 +278,7 @@ export class NetworkManager {
                         });
 
                         this.onGameStateCallbacks.forEach((callback) =>
-                            callback(message.players)
+                            callback(this.players)
                         );
                         break;
 

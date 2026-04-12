@@ -1,6 +1,6 @@
 {
   "network": {
-    "tickRate": 20,
+    "tickRate": 30,
     "syncInterval": 30000,
     "batchIntervalMs": 50
   },

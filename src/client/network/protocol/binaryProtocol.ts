@@ -87,6 +87,7 @@ export class BinaryProtocol {
             case MessageType.ATTACK: return this.decodeAttack(data, view);
             case MessageType.ATTACK_END: return this.decodeAttackEnd();
             case MessageType.GAME_STATE: return this.decodeGameState(data, view);
+            case MessageType.DELTA_GAME_STATE: return this.decodeDeltaGameState(data, view);
             case MessageType.PLAYER_JOINED: return this.decodePlayerJoined(data, view);
             case MessageType.PLAYER_LEFT: return this.decodePlayerLeft(data, view);
             case MessageType.MOVEMENT_ACK: return this.decodeMovementAck(data, view);
@@ -164,6 +165,22 @@ export class BinaryProtocol {
     }
 
     private static decodeGameState(data: Uint8Array, view: DataView): GameStateMessage {
+        return {
+            type: 'gameState',
+            players: this.decodePlayerBlock(data, view),
+            timestamp: Date.now()
+        };
+    }
+
+    private static decodeDeltaGameState(data: Uint8Array, view: DataView) {
+        return {
+            type: 'deltaGameState',
+            players: this.decodePlayerBlock(data, view),
+            timestamp: Date.now()
+        };
+    }
+
+    private static decodePlayerBlock(data: Uint8Array, view: DataView): Record<string, PlayerState> {
         const playerCount = view.getUint32(1, true);
         const players: Record<string, PlayerState> = {};
 
@@ -203,11 +220,7 @@ export class BinaryProtocol {
             };
         }
 
-        return {
-            type: 'gameState',
-            players,
-            timestamp: Date.now()
-        };
+        return players;
     }
 
     private static decodePlayerJoined(_data: Uint8Array, view: DataView): PlayerJoinedMessage {

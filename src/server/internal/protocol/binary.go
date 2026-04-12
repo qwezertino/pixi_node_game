@@ -18,12 +18,13 @@ const (
 	MessageViewportUpdate = 13 // Custom viewport (separate from attack)
 
 	// Server -> Client messages
-	MessageGameState    = 7  // GAME_STATE
-	MessageMovementAck  = 8  // MOVEMENT_ACK
-	MessageCorrection   = 9  // CORRECTION
-	MessageInitialState = 10 // INITIAL_STATE
-	MessagePlayerJoined = 11 // PLAYER_JOINED
-	MessagePlayerLeft   = 12 // PLAYER_LEFT
+	MessageGameState      = 7  // GAME_STATE (full)
+	MessageMovementAck    = 8  // MOVEMENT_ACK
+	MessageCorrection     = 9  // CORRECTION
+	MessageInitialState   = 10 // INITIAL_STATE
+	MessagePlayerJoined   = 11 // PLAYER_JOINED
+	MessagePlayerLeft     = 12 // PLAYER_LEFT
+	MessageDeltaGameState = 14 // DELTA_GAME_STATE (only changed players)
 )
 
 // BinaryProtocol обрабатывает сериализацию/десериализацию сообщений
@@ -150,6 +151,45 @@ func (bp *BinaryProtocol) EncodeGameState(players []types.PlayerState) []byte {
 		flags := uint8(player.State & 0x7F) // 7 bits for state
 		if player.FacingRight {
 			flags |= 0x80 // Set bit 7 for FacingRight
+		}
+		buffer[offset] = flags
+		offset++
+	}
+
+	return buffer
+}
+
+// EncodeDeltaGameState кодирует дельту — только изменившихся игроков.
+// Формат идентичен EncodeGameState (11 байт/игрок), но тип сообщения = MessageDeltaGameState.
+// Клиент мёржит дельту в своё состояние вместо полной замены.
+func (bp *BinaryProtocol) EncodeDeltaGameState(players []types.PlayerState) []byte {
+	headerSize := 5
+	playerSize := 11
+	totalSize := headerSize + len(players)*playerSize
+
+	buffer := make([]byte, totalSize)
+	offset := 0
+
+	buffer[offset] = MessageDeltaGameState
+	offset++
+
+	binary.LittleEndian.PutUint32(buffer[offset:], uint32(len(players)))
+	offset += 4
+
+	for _, player := range players {
+		binary.LittleEndian.PutUint32(buffer[offset:], player.ID)
+		offset += 4
+		binary.LittleEndian.PutUint16(buffer[offset:], player.X)
+		offset += 2
+		binary.LittleEndian.PutUint16(buffer[offset:], player.Y)
+		offset += 2
+		buffer[offset] = uint8(player.VX)
+		offset++
+		buffer[offset] = uint8(player.VY)
+		offset++
+		flags := uint8(player.State & 0x7F)
+		if player.FacingRight {
+			flags |= 0x80
 		}
 		buffer[offset] = flags
 		offset++

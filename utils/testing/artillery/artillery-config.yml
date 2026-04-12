@@ -16,21 +16,21 @@ config:
     #   name: "500 clients sustained test"
 
 
-    # Test 2400 clients
-    - duration: 60
-      arrivalRate: 10
-      name: "Ramp to 1200 clients"
-    - duration: 60
-      arrivalRate: 10
-      name: "1200 clients sustained test"
+    # # Test 2400 clients
+    # - duration: 60
+    #   arrivalRate: 10
+    #   name: "Ramp to 1200 clients"
+    # - duration: 60
+    #   arrivalRate: 10
+    #   name: "1200 clients sustained test"
 
-    #  # Test 2400 clients
-    # - duration: 60
-    #   arrivalRate: 20
-    #   name: "Ramp to 2400 clients"
-    # - duration: 60
-    #   arrivalRate: 20
-    #   name: "2400 clients sustained test"
+     # Test 2400 clients
+    - duration: 60
+      arrivalRate: 20
+      name: "Ramp to 2400 clients"
+    - duration: 60
+      arrivalRate: 20
+      name: "2400 clients sustained test"
 
     # # Test 5000 clients
     # - duration: 180

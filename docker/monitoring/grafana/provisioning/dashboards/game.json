@@ -164,7 +164,8 @@
       "gridPos": { "x": 0, "y": 21, "w": 12, "h": 4 },
       "fieldConfig": { "defaults": { "unit": "s" } },
       "targets": [
-        { "expr": "histogram_quantile(0.99, rate(go_gc_duration_seconds_bucket{job=\"pixi_game_server\"}[1m]))", "legendFormat": "GC p99" }
+        { "expr": "histogram_quantile(0.99, rate(go_gc_pauses_seconds_bucket{job=\"pixi_game_server\"}[1m]))", "legendFormat": "GC pause p99" },
+        { "expr": "histogram_quantile(0.50, rate(go_gc_pauses_seconds_bucket{job=\"pixi_game_server\"}[1m]))", "legendFormat": "GC pause p50" }
       ]
     },
     {

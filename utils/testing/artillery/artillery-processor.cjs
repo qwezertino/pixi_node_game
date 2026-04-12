@@ -22,9 +22,9 @@ function packMovement(dx, dy) {
   return packed;
 }
 
-// Encode binary move message with position (compatible with current server)
-function encodeMove(movementVector, inputSequence, position = { x: 400, y: 300 }) {
-  const buffer = new ArrayBuffer(14); // Updated to 14 bytes to include position
+// Encode binary move message (6 bytes: type + packed movement + inputSequence)
+function encodeMove(movementVector, inputSequence) {
+  const buffer = new ArrayBuffer(6);
   const view = new DataView(buffer);
   view.setUint8(0, MessageType.MOVE);
 
@@ -34,10 +34,6 @@ function encodeMove(movementVector, inputSequence, position = { x: 400, y: 300 }
 
   view.setUint8(1, packed);
   view.setUint32(2, inputSequence, true);
-
-  // Add position data (x, y as uint32)
-  view.setUint32(6, Math.floor(position.x), true);
-  view.setUint32(10, Math.floor(position.y), true);
 
   return new Uint8Array(buffer);
 }
@@ -111,8 +107,8 @@ module.exports = {
       movement = patterns[Math.floor(Math.random() * patterns.length)];
     }
 
-    // Encode as binary and send directly with current position
-    const binaryMessage = encodeMove(movement, context.vars.inputSequence++, context.vars.position);
+    // Encode as binary and send directly
+    const binaryMessage = encodeMove(movement, context.vars.inputSequence++);
 
     // Update position based on movement for next message
     if (movement.dx !== 0 || movement.dy !== 0) {

@@ -128,4 +128,5 @@ export enum MessageType {
     INITIAL_STATE = 10,
     PLAYER_JOINED = 11,
     PLAYER_LEFT = 12,
+    DELTA_GAME_STATE = 14,
 }

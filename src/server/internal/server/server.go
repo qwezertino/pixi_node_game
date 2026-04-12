@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* handlers on DefaultServeMux
 	"runtime"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ type Server struct {
 
 	// Connection management
 	connections sync.Map // map[uint32]*Connection
+	shards      []*shard // write shards: N workers instead of 2400 goroutines
 
 	// Rate limiting
 	rateLimiters sync.Map // map[string]*rate.Limiter
@@ -46,7 +48,6 @@ type Connection struct {
 	player      *types.Player
 	conn        *websocket.Conn
 	rateLimiter *rate.Limiter
-	sendChan    chan []byte
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -67,6 +68,7 @@ func New(cfg *config.Config) *Server {
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  cfg.Server.ReadBufferSize,
 			WriteBufferSize: cfg.Server.WriteBufferSize,
+			WriteBufferPool: &sync.Pool{},
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for development
 			},
@@ -76,6 +78,9 @@ func New(cfg *config.Config) *Server {
 		startTime: time.Now(),
 	}
 
+	// Инициализируем write-шарды (N = GOMAXPROCS воркеров вместо 2400 горутин).
+	server.initShards(ctx)
+
 	// Регистрируем tick-driven broadcast: состояние кодируется один раз в тик, разосылается всем.
 	server.gameWorld.SetTickBroadcaster(server.broadcastTick)
 
@@ -83,25 +88,6 @@ func New(cfg *config.Config) *Server {
 	go server.performanceMonitor()
 
 	return server
-}
-
-// broadcastTick кодирует состояние всех игроков ОДИН раз и разсылает один []byte всем.
-// Вызывается из game loop через SetTickBroadcaster callback.
-// O(N) вместо O(N²): одно кодирование, N non-blocking sendChan writes.
-func (s *Server) broadcastTick(players []types.PlayerState) {
-	if len(players) == 0 {
-		return
-	}
-	data := s.protocol.EncodeGameState(players)
-	s.connections.Range(func(_, v interface{}) bool {
-		conn := v.(*Connection)
-		select {
-		case conn.sendChan <- data:
-		default:
-			metrics.SendChannelDropped.Inc()
-		}
-		return true
-	})
 }
 
 // Start запускает сервер
@@ -122,6 +108,16 @@ func (s *Server) Start() error {
 
 	// Legacy JSON metrics for backwards compat
 	mux.HandleFunc("/metrics/json", s.handleMetricsJSON)
+
+	// pprof endpoints — /debug/pprof/, /debug/pprof/trace, /debug/pprof/block etc.
+	// Включаем block и mutex profiler: показывают где горутины блокируются (source of p99).
+	runtime.SetBlockProfileRate(1)     // record every blocking event
+	runtime.SetMutexProfileFraction(1) // record every mutex contention event
+	mux.Handle("/debug/pprof/", http.DefaultServeMux)
+	mux.Handle("/debug/pprof/cmdline", http.DefaultServeMux)
+	mux.Handle("/debug/pprof/profile", http.DefaultServeMux)
+	mux.Handle("/debug/pprof/symbol", http.DefaultServeMux)
+	mux.Handle("/debug/pprof/trace", http.DefaultServeMux)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
 
@@ -171,29 +167,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go s.handleConnection(connection)
 }
 
-// createConnection создает новое соединение
+// createConnection создает новое соединение и регистрирует его в шарде.
 func (s *Server) createConnection(player *types.Player, conn *websocket.Conn) *Connection {
 	ctx, cancel := context.WithCancel(s.ctx)
 
-	return &Connection{
+	c := &Connection{
 		player: player,
 		conn:   conn,
 		rateLimiter: rate.NewLimiter(
 			rate.Limit(s.cfg.Net.MessageRateLimit),
 			s.cfg.Net.BurstLimit,
 		),
-		sendChan: make(chan []byte, s.cfg.Net.SendChannelSize), // Buffer for outgoing messages
-		ctx:      ctx,
-		cancel:   cancel,
+		ctx:    ctx,
+		cancel: cancel,
 	}
+	s.shardFor(player.ID).add(c)
+	return c
 }
 
 // handleConnection обрабатывает соединение
 func (s *Server) handleConnection(connection *Connection) {
 	defer s.cleanupConnection(connection)
-
-	// Start message sender
-	go s.connectionSender(connection)
 
 	// Set timeouts
 	connection.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -279,19 +273,14 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			ackY32 = int32(s.cfg.World.MinY)
 		}
 
-		// Send movement acknowledgment
+		// Send movement acknowledgment via shard directChan (priority over broadcast).
 		ackData := s.protocol.EncodeMovementAck(
 			connection.player.ID,
 			uint16(ackX32),
 			uint16(ackY32),
 			clientMsg.InputSequence,
 		)
-
-		select {
-		case connection.sendChan <- ackData:
-		default:
-			slog.Warn("movement ack channel full", "player_id", connection.player.ID)
-		}
+		s.sendDirect(connection, ackData)
 
 		// Обновление позиции разошлётся через tick broadcast, не здесь.
 
@@ -319,114 +308,6 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 	}
 }
 
-// sendInitialState отправляет начальное состояние клиенту
-func (s *Server) sendInitialState(connection *Connection) {
-	allPlayers := s.gameWorld.GetAllPlayers()
-	data := s.protocol.EncodeGameState(allPlayers)
-
-	select {
-	case connection.sendChan <- data:
-	default:
-		slog.Warn("initial state send failed", "player_id", connection.player.ID)
-	}
-}
-
-// notifyPlayerJoined уведомляет всех игроков о присоединении нового игрока
-func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
-
-	playerState := types.PlayerState{
-		ID:          newPlayer.ID,
-		X:           uint16(newPlayer.GetX()),
-		Y:           uint16(newPlayer.GetY()),
-		VX:          0,
-		VY:          0,
-		FacingRight: true,
-		State:       0, // IDLE
-		ClientTick:  0,
-	}
-
-	data := s.protocol.EncodePlayerJoined(playerState)
-
-	sentCount := 0
-	totalConnections := 0
-
-	s.connections.Range(func(key, value interface{}) bool {
-		connection := value.(*Connection)
-		totalConnections++
-
-		// Skip the new player - they already got the full state
-		if connection.player.ID == newPlayer.ID {
-			return true
-		}
-
-		select {
-		case connection.sendChan <- data:
-			sentCount++
-		default:
-		}
-
-		return true
-	})
-
-}
-
-// notifyPlayerLeft уведомляет всех игроков об отключении игрока
-func (s *Server) notifyPlayerLeft(leftPlayerID uint32) {
-
-	data := s.protocol.EncodePlayerLeft(leftPlayerID)
-
-	sentCount := 0
-	totalConnections := 0
-
-	s.connections.Range(func(key, value interface{}) bool {
-		connection := value.(*Connection)
-		totalConnections++
-
-		// Skip the leaving player - they're already disconnected
-		if connection.player.ID == leftPlayerID {
-			return true
-		}
-
-		select {
-		case connection.sendChan <- data:
-			sentCount++
-		default:
-		}
-
-		return true
-	})
-
-}
-
-// connectionSender отправляет сообщения клиенту
-func (s *Server) connectionSender(connection *Connection) {
-	ticker := time.NewTicker(time.Second * 30) // Ping interval
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-connection.ctx.Done():
-			return
-		case data := <-connection.sendChan:
-			connection.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := connection.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				metrics.WSWriteErrors.Inc()
-				if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-					slog.Warn("websocket write error", "player_id", connection.player.ID, "error", err)
-				}
-				return
-			}
-			metrics.BytesSent.Add(float64(len(data)))
-
-		case <-ticker.C:
-			connection.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := connection.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-		}
-	}
-}
-
 // cleanupConnection очищает соединение
 func (s *Server) cleanupConnection(connection *Connection) {
 	playerID := connection.player.ID
@@ -437,6 +318,9 @@ func (s *Server) cleanupConnection(connection *Connection) {
 
 	// Notify other players that this player left
 	s.notifyPlayerLeft(playerID)
+
+	// Дерегистрируем из шарда до закрытия соединения.
+	s.shardFor(playerID).remove(playerID)
 
 	connection.cancel()
 	connection.conn.Close()
