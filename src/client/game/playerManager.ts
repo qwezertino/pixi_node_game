@@ -193,7 +193,7 @@ export class PlayerManager {
             if (player) {
                 player.setMovementVector(dx, dy);
             } else {
-                console.log("❌ Player not found in remotePlayers:", playerId, "Available players:", Array.from(this.remotePlayers.keys()));
+
             }
         });
 
@@ -202,7 +202,7 @@ export class PlayerManager {
             if (player) {
                 player.setDirection(direction);
             } else {
-                console.log("❌ Player not found for direction:", playerId);
+
             }
         });
 
@@ -214,9 +214,7 @@ export class PlayerManager {
         });
 
         this.networkManager.onGameState(async (players) => {
-            console.log("🌍 PlayerManager: Game state received", players);
             const currentPlayerId = this.networkManager.getPlayerId();
-            console.log("My player ID:", currentPlayerId);
 
             for (const [playerId, playerState] of Object.entries(players)) {
 

@@ -168,18 +168,15 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
 
     // Wait for network connection and initial position
-    console.log("Waiting for network connection and player ID...");
     await new Promise<void>((resolve) => {
         const checkInterval = setInterval(() => {
             // If we have a player ID, we're connected
             const playerId = networkManager.getPlayerId();
             if (playerId) {
                 clearInterval(checkInterval);
-                console.log("Got player ID:", playerId);
 
-                                // Set player position from server (server sends world coordinates)
+                // Set player position from server (server sends world coordinates)
                 const initialPosition = networkManager.getInitialPosition();
-                console.log("Initial position:", initialPosition);
 
                 // Only set the movement controller - it will handle coordinate conversion
                 movementController.setInitialPosition(initialPosition.x, initialPosition.y);

@@ -103,15 +103,9 @@ export class NetworkManager {
         this.setupSocketEvents();
     }
 
-    private onSocketOpen() {
-        // Handle connection established
-        console.log('WebSocket connected via worker');
-    }
+    private onSocketOpen() {}
 
-    private onSocketClose() {
-        // Handle connection closed
-        console.log('WebSocket closed');
-    }
+    private onSocketClose() {}
 
     private onSocketError() {
         // Handle connection error
@@ -122,9 +116,7 @@ export class NetworkManager {
         if (!this.socket) return;
 
         // Connection established
-        this.socket.addEventListener("open", () => {
-            console.log('WebSocket connected directly');
-        });
+        this.socket.addEventListener("open", () => {});
 
         // Receive messages from server
         this.socket.addEventListener("message", async (event) => {
@@ -143,9 +135,7 @@ export class NetworkManager {
         });
 
         // Connection closed
-        this.socket.addEventListener("close", () => {
-            console.log('WebSocket closed');
-        });
+        this.socket.addEventListener("close", () => {});
 
         // Connection error
         this.socket.addEventListener("error", () => {
@@ -180,8 +170,6 @@ export class NetworkManager {
                                     message.movementVector.dy
                                 )
                             );
-                        } else {
-                            console.log("⏭️  Skipping own movement or invalid data");
                         }
                         break;
 
@@ -286,8 +274,6 @@ export class NetworkManager {
                             this.onMovementAckCallbacks.forEach((callback) =>
                                 callback(message.position, message.inputSequence)
                             );
-                        } else {
-                            console.log("⏭️  Skipping other player's movement ack");
                         }
                         break;
 
