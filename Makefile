@@ -8,7 +8,7 @@ SERVER_DIR=src/server
 CLIENT_BUILD_DIR=dist
 SERVER_BINARY=server
 SERVER_OUTPUT_DIR=$(CLIENT_BUILD_DIR)
-COMPOSE=docker compose -f docker/docker-compose.yml --project-name pixi_game
+COMPOSE=docker compose -f docker/docker-compose.yml --project-name pixi_game --env-file .env
 
 # Install dependencies for both client and server
 install:
