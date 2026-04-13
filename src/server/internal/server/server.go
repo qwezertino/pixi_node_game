@@ -41,6 +41,20 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// Throttled diagnostics
+	lastSlowFanoutLog int64 // atomic UnixNano timestamp
+	lastBatchTuneLog  int64 // atomic UnixNano timestamp
+
+	// Adaptive broadcast pacing
+	adaptiveBatchNs int64 // atomic
+	lastBroadcastNs int64 // atomic
+
+	// Parallel fanout enqueue workers
+	fanoutWorkers   int
+	fanoutJobs      chan fanoutJob
+	fanoutDropLimit int32
+	writeBatchSize  int
+
 	// Performance monitoring
 	startTime time.Time
 }
@@ -62,6 +76,7 @@ type Connection struct {
 	closeOnce     sync.Once     // ensures cleanupConnection body runs once
 	lastActivity  int64         // UnixNano, updated on each received frame (atomic)
 	writeFailures int32         // consecutive write timeouts/errors (atomic); reset on success
+	fanoutDrops   int32         // consecutive dropped broadcast enqueues (atomic)
 	ctx           context.Context
 	cancel        context.CancelFunc
 }
@@ -84,6 +99,22 @@ func New(cfg *config.Config) *Server {
 		cancel:      cancel,
 		startTime:   time.Now(),
 	}
+
+	if cfg.Game.BatchInterval > 0 {
+		server.adaptiveBatchNs = cfg.Game.BatchInterval.Nanoseconds()
+		metrics.AdaptiveBatchIntervalMs.Set(float64(cfg.Game.BatchInterval.Milliseconds()))
+	}
+
+	server.fanoutDropLimit = int32(cfg.Net.FanoutDropStreak)
+	if server.fanoutDropLimit < 1 {
+		server.fanoutDropLimit = 1
+	}
+	server.writeBatchSize = cfg.Net.WriteBatchSize
+	if server.writeBatchSize < 1 {
+		server.writeBatchSize = 1
+	}
+
+	server.initFanoutWorkers()
 
 	// Start ping/keepalive loop (replaces per-shard ping ticker).
 	go server.runPingLoop()

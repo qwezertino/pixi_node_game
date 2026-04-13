@@ -2,6 +2,7 @@ package server
 
 import (
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,6 +72,13 @@ var broadcastFramePool = sync.Pool{
 	},
 }
 
+var connectionSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]*Connection, 0, 4096)
+		return &s
+	},
+}
+
 // Write timeouts.
 const (
 	// broadcastWriteTimeout — per-connection deadline during mass-write.
@@ -91,6 +99,9 @@ const (
 	// With broadcastWriteTimeout=100ms the write goroutine is busy ≤3 ticks = 3 slots,
 	// so the channel will not fill under normal load.
 	writeChanSize = 32
+
+	// maxWriteBatchSizeLimit clamps WRITE_BATCH_SIZE from env.
+	maxWriteBatchSizeLimit = 64
 )
 
 // writeJob is the value type sent over Connection.writeCh.
@@ -103,6 +114,67 @@ type writeJob struct {
 	frame   *tickFrame // non-nil for broadcast (shared, ref-counted)
 	direct  []byte     // non-nil for ACK / pong / initial-state
 	timeout time.Duration
+}
+
+type fanoutJob struct {
+	conns   []*Connection
+	frame   *tickFrame
+	dropped *int64
+	wg      *sync.WaitGroup
+}
+
+func (s *Server) initFanoutWorkers() {
+	workers := s.cfg.Net.FanoutWorkers
+	if workers <= 0 {
+		workers = s.cfg.Server.Workers * 2
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	s.fanoutWorkers = workers
+	s.fanoutJobs = make(chan fanoutJob, workers*2)
+
+	for i := 0; i < workers; i++ {
+		go s.runFanoutWorker()
+	}
+}
+
+func (s *Server) runFanoutWorker() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case job := <-s.fanoutJobs:
+			localDropped := 0
+			for _, conn := range job.conns {
+				if !s.enqueueBroadcastJob(conn, job.frame) {
+					localDropped++
+				}
+			}
+			if localDropped > 0 {
+				atomic.AddInt64(job.dropped, int64(localDropped))
+			}
+			job.wg.Done()
+		}
+	}
+}
+
+func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame) bool {
+	select {
+	case conn.writeCh <- writeJob{frame: frame, timeout: broadcastWriteTimeout}:
+		if atomic.LoadInt32(&conn.fanoutDrops) != 0 {
+			atomic.StoreInt32(&conn.fanoutDrops, 0)
+		}
+		return true
+	default:
+		frame.release()
+		metrics.BroadcastsDropped.Inc()
+		if atomic.AddInt32(&conn.fanoutDrops, 1) == s.fanoutDropLimit {
+			go s.cleanupConnection(conn)
+		}
+		return false
+	}
 }
 
 // startWriteLoop starts the persistent write goroutine for conn.
@@ -124,20 +196,59 @@ type writeJob struct {
 // long-lived. GC only scans these stacks during STW — it does not create/destroy them.
 func (s *Server) startWriteLoop(c *Connection) {
 	go func() {
+		batchSize := s.writeBatchSize
+		if batchSize < 1 {
+			batchSize = 1
+		} else if batchSize > maxWriteBatchSizeLimit {
+			batchSize = maxWriteBatchSizeLimit
+		}
+
+		jobs := make([]writeJob, batchSize)
+		frames := make([][]byte, batchSize)
+
 		for {
 			select {
-			case job := <-c.writeCh:
-				var frameBytes []byte
-				if job.frame != nil {
-					frameBytes = job.frame.frame
+			case first := <-c.writeCh:
+				jobs[0] = first
+				if first.frame != nil {
+					frames[0] = first.frame.frame
 				} else {
-					frameBytes = job.direct
+					frames[0] = first.direct
 				}
-				c.rawConn.SetWriteDeadline(time.Now().Add(job.timeout))
-				_, err := c.rawConn.Write(frameBytes)
-				if job.frame != nil {
-					job.frame.release()
+
+				count := 1
+				maxTimeout := first.timeout
+				for count < batchSize {
+					select {
+					case job := <-c.writeCh:
+						jobs[count] = job
+						if job.frame != nil {
+							frames[count] = job.frame.frame
+						} else {
+							frames[count] = job.direct
+						}
+						if job.timeout > maxTimeout {
+							maxTimeout = job.timeout
+						}
+						count++
+					default:
+						goto writeBatch
+					}
 				}
+
+			writeBatch:
+				c.rawConn.SetWriteDeadline(time.Now().Add(maxTimeout))
+				buffers := net.Buffers(frames[:count])
+				n, err := buffers.WriteTo(c.rawConn)
+
+				for i := 0; i < count; i++ {
+					if jobs[i].frame != nil {
+						jobs[i].frame.release()
+					}
+					frames[i] = nil
+					jobs[i] = writeJob{}
+				}
+
 				if err != nil {
 					metrics.WSWriteErrors.Inc()
 					if atomic.AddInt32(&c.writeFailures, 1) >= maxWriteFailures {
@@ -150,7 +261,7 @@ func (s *Server) startWriteLoop(c *Connection) {
 					}
 				} else {
 					atomic.StoreInt32(&c.writeFailures, 0)
-					metrics.BytesSent.Add(float64(len(frameBytes)))
+					metrics.BytesSent.Add(float64(n))
 				}
 
 			case <-c.ctx.Done():
@@ -190,23 +301,41 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	if len(allPlayers) == 0 {
 		return
 	}
+	if !fullSync && len(changed) == 0 {
+		return
+	}
+
+	if !fullSync {
+		batchNs := atomic.LoadInt64(&s.adaptiveBatchNs)
+		if batchNs > 0 {
+			now := time.Now().UnixNano()
+			last := atomic.LoadInt64(&s.lastBroadcastNs)
+			if now-last < batchNs {
+				return
+			}
+			atomic.StoreInt64(&s.lastBroadcastNs, now)
+		}
+	}
 
 	t0 := time.Now()
 	f := broadcastFramePool.Get().(*tickFrame)
 	f.data = f.data[:0]
 	// Reserve 10 bytes at front for the WS binary frame header (filled by wsFrameSlice below).
 	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-	if fullSync || len(changed) == 0 {
+	if fullSync {
 		f.data = s.protocol.AppendGameState(f.data, allPlayers)
 	} else {
 		f.data = s.protocol.AppendDeltaGameState(f.data, changed)
 	}
 	f.frame = wsFrameSlice(f.data)
+	if payloadSize := len(f.data) - 10; payloadSize > 0 {
+		metrics.BroadcastPayloadBytes.Observe(float64(payloadSize))
+	}
 	metrics.TickPhaseDuration.WithLabelValues("encode").Observe(time.Since(t0).Seconds())
 
 	t1 := time.Now()
-	// Snapshot connection count and set refs atomically before any send can call release().
-	// RLock prevents additions/removals during the fan-out loop.
+	// Snapshot connections under RLock, then release the lock before fanout.
+	// This avoids holding the map lock while enqueueing O(N) jobs.
 	s.connectionsMu.RLock()
 	n := len(s.connections)
 	if n == 0 {
@@ -216,23 +345,117 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		broadcastFramePool.Put(f)
 		return
 	}
-	atomic.StoreInt32(&f.refs, int32(n))
+	buf := connectionSlicePool.Get().(*[]*Connection)
+	conns := (*buf)[:0]
+	if cap(conns) < n {
+		conns = make([]*Connection, 0, n)
+	}
 	for _, conn := range s.connections {
-		// Non-blocking send into the connection's persistent write-loop goroutine.
-		// Zero allocation: writeJob is a 40-byte value — no closure, no heap alloc.
-		select {
-		case conn.writeCh <- writeJob{frame: f, timeout: broadcastWriteTimeout}:
-		default:
-			// Channel full: write goroutine is busy with a previous frame (backpressure).
-			// This is NOT a connection error — do not increment writeFailures.
-			// Dead connections are caught by: write timeout (broadcastWriteTimeout ×
-			// maxWriteFailures) and the ping loop (90s inactivity).
-			f.release()
-			metrics.BroadcastsDropped.Inc()
+		conns = append(conns, conn)
+	}
+	metrics.BroadcastTargets.Observe(float64(n))
+	atomic.StoreInt32(&f.refs, int32(n))
+	s.connectionsMu.RUnlock()
+
+	dropped := 0
+	if s.fanoutWorkers <= 1 || n < s.fanoutWorkers*64 {
+		for _, conn := range conns {
+			if !s.enqueueBroadcastJob(conn, f) {
+				dropped++
+			}
+		}
+	} else {
+		chunkSize := (n + s.fanoutWorkers - 1) / s.fanoutWorkers
+		var wg sync.WaitGroup
+		var droppedAtomic int64
+
+		for start := 0; start < n; start += chunkSize {
+			end := start + chunkSize
+			if end > n {
+				end = n
+			}
+			wg.Add(1)
+			s.fanoutJobs <- fanoutJob{
+				conns:   conns[start:end],
+				frame:   f,
+				dropped: &droppedAtomic,
+				wg:      &wg,
+			}
+		}
+		wg.Wait()
+		dropped = int(atomic.LoadInt64(&droppedAtomic))
+	}
+
+	for i := range conns {
+		conns[i] = nil
+	}
+	*buf = conns[:0]
+	connectionSlicePool.Put(buf)
+
+	fanoutDur := time.Since(t1)
+	metrics.TickPhaseDuration.WithLabelValues("fanout_send").Observe(fanoutDur.Seconds())
+	metrics.TickFanoutDuration.Observe(fanoutDur.Seconds())
+
+	if base := s.cfg.Game.BatchInterval; base > 0 {
+		curr := time.Duration(atomic.LoadInt64(&s.adaptiveBatchNs))
+		if curr <= 0 {
+			curr = base
+		}
+
+		next := curr
+		if fanoutDur > 30*time.Millisecond {
+			next = minDuration(curr+10*time.Millisecond, 120*time.Millisecond)
+		} else if fanoutDur > 15*time.Millisecond {
+			next = minDuration(curr+5*time.Millisecond, 120*time.Millisecond)
+		} else if fanoutDur < 6*time.Millisecond && curr > base {
+			next = maxDuration(curr-3*time.Millisecond, base)
+		}
+
+		if next != curr {
+			atomic.StoreInt64(&s.adaptiveBatchNs, next.Nanoseconds())
+			metrics.AdaptiveBatchIntervalMs.Set(float64(next.Milliseconds()))
+
+			nowNano := time.Now().UnixNano()
+			prev := atomic.LoadInt64(&s.lastBatchTuneLog)
+			if nowNano-prev >= int64(5*time.Second) &&
+				atomic.CompareAndSwapInt64(&s.lastBatchTuneLog, prev, nowNano) {
+				slog.Info("adaptive batch interval updated",
+					"from_ms", curr.Milliseconds(),
+					"to_ms", next.Milliseconds(),
+					"fanout_ms", fanoutDur.Milliseconds())
+			}
 		}
 	}
-	s.connectionsMu.RUnlock()
-	metrics.TickPhaseDuration.WithLabelValues("shard_send").Observe(time.Since(t1).Seconds())
+
+	if fanoutDur > 20*time.Millisecond {
+		nowNano := time.Now().UnixNano()
+		prev := atomic.LoadInt64(&s.lastSlowFanoutLog)
+		if nowNano-prev >= int64(5*time.Second) &&
+			atomic.CompareAndSwapInt64(&s.lastSlowFanoutLog, prev, nowNano) {
+			slog.Warn("slow broadcast fanout",
+				"duration_ms", fanoutDur.Milliseconds(),
+				"connections", n,
+				"dropped_jobs", dropped,
+				"payload_bytes", len(f.data)-10,
+				"full_sync", fullSync,
+				"changed_players", len(changed),
+				"all_players", len(allPlayers))
+		}
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // broadcastEvent sends a pre-compiled WS frame to every connected client.

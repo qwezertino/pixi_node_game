@@ -24,6 +24,7 @@ type ServerConfig struct {
 type GameConfig struct {
 	TickRate           int
 	SyncInterval       time.Duration
+	BatchInterval      time.Duration
 	PlayerSpeedPerTick int
 	AttackDuration     time.Duration
 }
@@ -47,14 +48,18 @@ type NetworkConfig struct {
 	BurstLimit       int
 	IPConnRate       float64 // connections/sec per IP; 0 = disabled
 	IPConnBurst      int
+	FanoutWorkers    int
+	FanoutDropStreak int
+	WriteBatchSize   int
 }
 
 // JSONConfig mirrors the structure of gameConfig.json (shared with the TypeScript client).
 // Only game-rule values live here; server infrastructure is configured via .env.
 type JSONConfig struct {
 	Network struct {
-		TickRate     int `json:"tickRate"`
-		SyncInterval int `json:"syncInterval"`
+		TickRate        int `json:"tickRate"`
+		SyncInterval    int `json:"syncInterval"`
+		BatchIntervalMs int `json:"batchIntervalMs"`
 	} `json:"network"`
 	Movement struct {
 		PlayerSpeedPerTick int `json:"playerSpeedPerTick"`
@@ -116,6 +121,7 @@ func Load() *Config {
 		Game: GameConfig{
 			TickRate:           getEnvInt("TICK_RATE", jsonConfig.Network.TickRate),
 			SyncInterval:       time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
+			BatchInterval:      time.Duration(getEnvInt("BATCH_INTERVAL_MS", jsonConfig.Network.BatchIntervalMs)) * time.Millisecond,
 			PlayerSpeedPerTick: getEnvInt("PLAYER_SPEED", jsonConfig.Movement.PlayerSpeedPerTick),
 			AttackDuration:     time.Duration(getEnvInt("ATTACK_DURATION_MS", jsonConfig.Player.AttackDurationMs)) * time.Millisecond,
 		},
@@ -139,6 +145,9 @@ func Load() *Config {
 			BurstLimit:       getEnvInt("RATE_LIMIT_BURST", 20),
 			IPConnRate:       getEnvFloat("IP_CONN_RATE", 10.0),
 			IPConnBurst:      getEnvInt("IP_CONN_BURST", 20),
+			FanoutWorkers:    getEnvInt("FANOUT_WORKERS", 0),
+			FanoutDropStreak: getEnvInt("FANOUT_DROP_STREAK", 120),
+			WriteBatchSize:   getEnvInt("WRITE_BATCH_SIZE", 8),
 		},
 	}
 }

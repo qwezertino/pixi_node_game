@@ -44,7 +44,8 @@
       "targets": [
         { "expr": "histogram_quantile(0.50, rate(game_tick_duration_seconds_bucket[1m]))", "legendFormat": "p50" },
         { "expr": "histogram_quantile(0.95, rate(game_tick_duration_seconds_bucket[1m]))", "legendFormat": "p95" },
-        { "expr": "histogram_quantile(0.99, rate(game_tick_duration_seconds_bucket[1m]))", "legendFormat": "p99" }
+        { "expr": "game:tick_duration:p99_1m", "legendFormat": "p99 current" },
+        { "expr": "game:tick_duration:p99_peak_15m", "legendFormat": "p99 peak(15m)" }
       ]
     },
     {
@@ -107,14 +108,14 @@
     },
     {
       "id": 11,
-      "title": "Broadcast Dropped / sec",
+      "title": "Broadcast Pressure",
       "type": "timeseries",
       "gridPos": { "x": 12, "y": 13, "w": 6, "h": 4 },
-      "fieldConfig": { "defaults": { "color": { "fixedColor": "orange", "mode": "fixed" } } },
+      "fieldConfig": { "defaults": { "unit": "short" } },
       "targets": [
         { "expr": "rate(game_broadcasts_dropped_total[10s])", "legendFormat": "Dropped/s" },
-        { "expr": "rate(game_broadcast_shard_dropped_total[10s])", "legendFormat": "Shard tick dropped/s" },
-        { "expr": "rate(game_direct_channel_dropped_total[10s])", "legendFormat": "Direct chan dropped/s" }
+        { "expr": "histogram_quantile(0.99, rate(game_broadcast_targets_bucket[1m]))", "legendFormat": "Targets p99" },
+        { "expr": "histogram_quantile(0.99, rate(game_broadcast_payload_bytes_bucket[1m]))", "legendFormat": "Payload bytes p99" }
       ]
     },
     {
@@ -181,38 +182,40 @@
     {
       "id": 18,
       "title": "Tick Phase Breakdown p99",
-      "description": "Время каждой фазы тика на уровне p99. range=sync.Map.Range, delta=prevStates diff, encode=marshal+PreparedMessage, shard_send=channel sends. Сумма ≈ полный tick_duration.",
+      "description": "Фазы тика на p99: world_step (снимок + обработка мира), delta (diff), encode (бинарный кадр), fanout_send (enqueue в write очереди).",
       "type": "timeseries",
       "gridPos": { "x": 0, "y": 25, "w": 12, "h": 5 },
       "fieldConfig": { "defaults": { "unit": "s" } },
       "targets": [
-        { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"range\"}[1m]))", "legendFormat": "range p99" },
+        { "expr": "game:tick_phase_world_step:p99_1m", "legendFormat": "world_step p99" },
         { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"delta\"}[1m]))", "legendFormat": "delta p99" },
         { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"encode\"}[1m]))", "legendFormat": "encode p99" },
-        { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"shard_send\"}[1m]))", "legendFormat": "shard_send p99" }
+        { "expr": "game:tick_phase_fanout_send:p99_1m", "legendFormat": "fanout_send p99" }
       ]
     },
     {
       "id": 19,
-      "title": "Shard Write Duration p99",
-      "description": "Сколько времени шард-воркер пишет один тик всем своим (~N/shards) клиентам. Если > 33ms (1 tick budget) — шарды не успевают, нужно увеличить BROADCAST_WORKERS.",
+      "title": "Fanout Send Duration p99",
+      "description": "Время enqueue в пер-соединенческие write очереди. Рост p99 напрямую увеличивает хвост tick_duration.",
       "type": "timeseries",
       "gridPos": { "x": 12, "y": 25, "w": 6, "h": 5 },
       "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.016 }, { "color": "red", "value": 0.033 }] } } },
       "targets": [
-        { "expr": "histogram_quantile(0.50, rate(game_shard_write_seconds_bucket[1m]))", "legendFormat": "p50" },
-        { "expr": "histogram_quantile(0.99, rate(game_shard_write_seconds_bucket[1m]))", "legendFormat": "p99" }
+        { "expr": "histogram_quantile(0.50, rate(game_tick_fanout_send_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "game:tick_fanout_send:p99_1m", "legendFormat": "p99 current" },
+        { "expr": "game:tick_phase_fanout_send:p99_peak_15m", "legendFormat": "p99 peak(15m)" }
       ]
     },
     {
       "id": 20,
-      "title": "Broadcast Shard Drops / sec",
-      "description": "Тики дропнутые из-за того что шард не успел обработать предыдущий (broadcastChan cap=2 полон). Ненулевое значение = шарды тормозят.",
+      "title": "Adaptive Batch Interval",
+      "description": "Текущий адаптивный batch interval для throttle fanout под всплесками.",
       "type": "timeseries",
       "gridPos": { "x": 18, "y": 25, "w": 6, "h": 5 },
-      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "fieldConfig": { "defaults": { "unit": "ms" } },
       "targets": [
-        { "expr": "rate(game_broadcast_shard_dropped_total[10s])", "legendFormat": "Shard drops/s" }
+        { "expr": "game_adaptive_batch_interval_ms", "legendFormat": "current" },
+        { "expr": "game:adaptive_batch_interval_ms:last_1m", "legendFormat": "1m max" }
       ]
     },
     {

@@ -125,3 +125,8 @@ Graceful degradation - LOD система при перегрузке
 <3ms average latency
 60 FPS stable tick rate
 ~95% network traffic reduction vs naive approach
+
+11. Future feature backlog
+
+- [ ] Рассмотреть миграцию write-path на event-driven модель (reactor/netpoll-гибрид)
+	для снижения tail-latency при 4k+ соединениях и уменьшения давления на scheduler.

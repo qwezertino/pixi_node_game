@@ -47,7 +47,7 @@ var (
 	TickDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "game_tick_duration_seconds",
 		Help:    "Time spent processing a single game tick",
-		Buckets: prometheus.ExponentialBucketsRange(0.0001, 0.1, 12),
+		Buckets: prometheus.ExponentialBucketsRange(0.0001, 0.5, 14),
 	})
 
 	TicksTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -88,6 +88,18 @@ var (
 		Help: "Total bytes sent to clients",
 	})
 
+	BroadcastPayloadBytes = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_broadcast_payload_bytes",
+		Help:    "Encoded payload size (without WebSocket header) for each broadcast tick",
+		Buckets: []float64{64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072},
+	})
+
+	BroadcastTargets = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_broadcast_targets",
+		Help:    "Number of active connections fanned out to in each broadcast tick",
+		Buckets: []float64{1, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000},
+	})
+
 	// ── WebSocket errors ──────────────────────────────────────────────────────
 	WSUpgradeErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_ws_upgrade_errors_total",
@@ -111,14 +123,32 @@ var (
 	})
 
 	// ── Tick phase breakdown ──────────────────────────────────────────────────
-	// Labels: "range" (sync.Map scan), "delta" (prevStates diff),
-	//         "encode" (EncodeGameState + NewPreparedMessage), "shard_send" (channel sends).
+	// Labels: "world_step" (snapshot + movement update + state build),
+	//         "range" (legacy alias), "delta" (prevStates diff),
+	//         "encode" (binary state encoding), "fanout_send" (broadcast enqueue).
 	// Sum of all four ≈ total tick duration.
 	TickPhaseDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "game_tick_phase_seconds",
 		Help:    "Time spent in each phase of the game tick",
-		Buckets: prometheus.ExponentialBucketsRange(0.00005, 0.05, 12),
+		Buckets: prometheus.ExponentialBucketsRange(0.00005, 0.25, 14),
 	}, []string{"phase"})
+
+	TickWorldStepDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_tick_world_step_seconds",
+		Help:    "Time spent in world step phase (snapshot + movement + state collection)",
+		Buckets: prometheus.ExponentialBucketsRange(0.00005, 0.25, 14),
+	})
+
+	TickFanoutDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_tick_fanout_send_seconds",
+		Help:    "Time spent enqueueing broadcast jobs to per-connection write queues",
+		Buckets: prometheus.ExponentialBucketsRange(0.00005, 0.25, 14),
+	})
+
+	AdaptiveBatchIntervalMs = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "game_adaptive_batch_interval_ms",
+		Help: "Current adaptive batch interval in milliseconds for broadcast pacing",
+	})
 
 	// ── Delta tracking ────────────────────────────────────────────────────────
 	// How many players actually had state changes this tick.

@@ -1,0 +1,30 @@
+groups:
+  - name: pixi_game_latency
+    interval: 5s
+    rules:
+      - record: game:tick_duration:p99_1m
+        expr: histogram_quantile(0.99, rate(game_tick_duration_seconds_bucket[1m]))
+
+      - record: game:tick_duration:p99_peak_15m
+        expr: max_over_time(game:tick_duration:p99_1m[15m])
+
+      - record: game:tick_phase_fanout_send:p99_1m
+        expr: histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase="fanout_send"}[1m]))
+
+      - record: game:tick_phase_fanout_send:p99_peak_15m
+        expr: max_over_time(game:tick_phase_fanout_send:p99_1m[15m])
+
+      - record: game:tick_phase_world_step:p99_1m
+        expr: histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase="world_step"}[1m]))
+
+      - record: game:tick_phase_world_step:p99_peak_15m
+        expr: max_over_time(game:tick_phase_world_step:p99_1m[15m])
+
+      - record: game:tick_world_step:p99_1m
+        expr: histogram_quantile(0.99, rate(game_tick_world_step_seconds_bucket[1m]))
+
+      - record: game:tick_fanout_send:p99_1m
+        expr: histogram_quantile(0.99, rate(game_tick_fanout_send_seconds_bucket[1m]))
+
+      - record: game:adaptive_batch_interval_ms:last_1m
+        expr: max_over_time(game_adaptive_batch_interval_ms[1m])

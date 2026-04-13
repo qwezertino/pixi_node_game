@@ -75,7 +75,11 @@ type GameWorld struct {
 	playerCountEstimate uint32 // atomic
 
 	// State for full sync
-	lastFullSync time.Time
+	lastFullSync      time.Time
+	lastBroadcastNano int64
+
+	// Throttled diagnostics
+	lastSlowTickLog int64 // atomic UnixNano timestamp
 }
 
 // NewGameWorld создает новый игровой мир
@@ -113,7 +117,9 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 	// Start game loop
 	go gw.gameLoop()
 
-	slog.Info("gameworld initialized", "tick_rate_hz", cfg.Game.TickRate)
+	slog.Info("gameworld initialized",
+		"tick_rate_hz", cfg.Game.TickRate,
+		"batch_interval_ms", cfg.Game.BatchInterval.Milliseconds())
 
 	return gw
 }
@@ -213,6 +219,18 @@ func (gw *GameWorld) gameLoop() {
 			metrics.TickDuration.Observe(duration.Seconds())
 			metrics.TicksTotal.Inc()
 
+			if duration > tickInterval {
+				nowNano := time.Now().UnixNano()
+				prev := atomic.LoadInt64(&gw.lastSlowTickLog)
+				if nowNano-prev >= int64(5*time.Second) &&
+					atomic.CompareAndSwapInt64(&gw.lastSlowTickLog, prev, nowNano) {
+					slog.Warn("slow tick detected",
+						"duration_ms", duration.Milliseconds(),
+						"budget_ms", tickInterval.Milliseconds(),
+						"players", gw.GetPlayerCount())
+				}
+			}
+
 		case <-gw.stopChan:
 			slog.Info("game loop stopped")
 			return
@@ -268,9 +286,14 @@ func (gw *GameWorld) tick() {
 	attackDurNano := gw.cfg.Game.AttackDuration.Nanoseconds()
 
 	gw.tickCount++
-	// Full sync every second — corrects drift from lost delta packets.
-	// Entity interpolation on the client smooths out any position correction.
-	fullSync := gw.tickCount%uint32(gw.cfg.Game.TickRate) == 0
+	// Full sync is controlled by configured SyncInterval (usually tens of seconds),
+	// not by tick rate. Full-sync every second explodes outbound traffic.
+	lastSync := atomic.LoadInt64(&gw.lastSyncTime)
+	fullSync := lastSync == 0 || time.Duration(nowNano-lastSync) >= gw.cfg.Game.SyncInterval
+	if fullSync {
+		atomic.StoreInt64(&gw.lastSyncTime, nowNano)
+		gw.lastFullSync = time.Unix(0, nowNano)
+	}
 
 	t0 := time.Now()
 	// Snapshot player pointers under a minimal RLock — only protects the map structure.
@@ -336,6 +359,8 @@ func (gw *GameWorld) tick() {
 	}
 	t1 := time.Now()
 	metrics.TickPhaseDuration.WithLabelValues("range").Observe(t1.Sub(t0).Seconds())
+	metrics.TickPhaseDuration.WithLabelValues("world_step").Observe(t1.Sub(t0).Seconds())
+	metrics.TickWorldStepDuration.Observe(t1.Sub(t0).Seconds())
 
 	// Update prevStates: remove departed players, update existing.
 	for id := range gw.prevStates {
@@ -353,28 +378,40 @@ func (gw *GameWorld) tick() {
 		return
 	}
 
+	// Delta metrics: how many players changed state this tick.
+	changedCount := len(gw.scratchChanged)
+	if fullSync {
+		changedCount = len(gw.scratchStates)
+	}
+	metrics.DeltaPlayersCount.Observe(float64(changedCount))
+	metrics.DeltaRatio.Set(float64(changedCount) / float64(len(gw.scratchStates)))
+
+	// No-op tick: avoid broadcasting identical state when no player changed.
+	if !fullSync && changedCount == 0 {
+		return
+	}
+
+	batchIntervalNano := gw.cfg.Game.BatchInterval.Nanoseconds()
+	shouldBroadcast := fullSync || gw.lastBroadcastNano == 0 ||
+		batchIntervalNano <= 0 || nowNano-gw.lastBroadcastNano >= batchIntervalNano
+
+	if !shouldBroadcast {
+		return
+	}
+
+	gw.lastBroadcastNano = nowNano
+
 	// Call broadcastFn synchronously — it enqueues one push() per connection (non-blocking
 	// lock+append), then returns in microseconds. No allCopy/changedCopy allocations needed:
 	// EncodeGameState serialises scratchStates into bytes before tick() returns.
 	if holder, ok := gw.broadcastFn.Load().(broadcastFuncHolder); ok {
-		var changed []types.PlayerState
-		if !fullSync && len(gw.scratchChanged) > 0 {
-			changed = gw.scratchChanged
-		}
-		// Delta metrics: how many players changed state this tick.
-		changedCount := len(changed)
 		if fullSync {
-			changedCount = len(gw.scratchStates)
+			holder.fn(gw.scratchStates, nil, true)
+		} else {
+			holder.fn(gw.scratchStates, gw.scratchChanged, false)
 		}
-		metrics.DeltaPlayersCount.Observe(float64(changedCount))
-		metrics.DeltaRatio.Set(float64(changedCount) / float64(len(gw.scratchStates)))
-		holder.fn(gw.scratchStates, changed, fullSync)
 	}
 
-	if time.Duration(nowNano-atomic.LoadInt64(&gw.lastSyncTime)) >= gw.cfg.Game.SyncInterval {
-		atomic.StoreInt64(&gw.lastSyncTime, nowNano)
-		gw.lastFullSync = time.Unix(0, nowNano)
-	}
 }
 
 // updatePlayerPosition обновляет позицию игрока на основе его векторов движения.
@@ -426,6 +463,10 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) {
 	player.SetX(newX)
 	player.SetY(newY)
 	player.SetLastUpdate(nowNano)
+
+	if newX != currentX || newY != currentY {
+		gw.visibilityManager.MovePlayer(player.ID, newX, newY)
+	}
 }
 
 // handleEvent обрабатывает одно событие инлайн (atomic-операции, потокобезопасно)
