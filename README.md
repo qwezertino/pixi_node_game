@@ -1,180 +1,147 @@
 # pixi_node_game
 
-A high-performance multiplayer 2D game built with Pixi.js and Bun.js, designed to handle 10000+ concurrent players with optimized networking and rendering.
+A 2D multiplayer browser game. The client is built with TypeScript and Pixi.js; the server is a high-performance Go WebSocket server designed for up to ~12 000 simultaneous connections. Communication uses a compact binary protocol over WebSocket. Sprite assets cover six races: Dark Elves, Dwarves, High Elves, Humans, Items, and Orcs.
 
-## 🚀 Features
+---
 
-- **High Concurrency**: Supports 10000+ simultaneous players
-- **Real-time Networking**: WebSocket-based communication with binary protocol
-- **Smooth Gameplay**: 60Hz tick rate with lag compensation and interpolation
-- **Efficient Rendering**: Pixi.js WebGL rendering with sprite animation system
-- **Optimized Bandwidth**: Binary data format with delta movement and state batching
-- **Server Authoritative**: All game logic runs on server with client prediction
-- **Grid-based Movement**: Integer-based positioning system for consistent gameplay
+## Stack
 
-## 🏗️ Architecture
+| Layer | Technology |
+|---|---|
+| Client renderer | Pixi.js 8.6+ |
+| Client language | TypeScript 5.7 |
+| Client bundler | Vite 6 / Bun 1.2 |
+| Server language | Go 1.23 |
+| WebSocket library | Gorilla WebSocket 1.5.1 |
+| Metrics | Prometheus (client_golang 1.23.2) |
+| Monitoring | Prometheus + Grafana + Loki + Promtail |
 
-### Client-Side
-- **Pixi.js**: WebGL rendering engine for smooth 2D graphics
-- **Input Management**: Captures and processes player input with immediate local feedback
-- **Network Manager**: Handles WebSocket communication and server synchronization
-- **Animation System**: Sprite-based animations with state management
-- **Interpolation**: Smooth movement interpolation for network latency compensation
+---
 
-### Server-Side
-- **Bun.js**: High-performance JavaScript runtime with native WebSocket support
-- **Game Loop**: 60Hz authoritative game simulation
-- **World State**: Complete game state synchronization every 30 seconds
-- **Delta Updates**: Efficient state change broadcasting
-- **Connection Management**: Optimized handling of concurrent connections
+## Prerequisites
 
-## 🛠️ Technical Stack
+| Tool | Version |
+|---|---|
+| Bun | 1.2+ |
+| Go | 1.23+ (`/usr/local/go/bin/go`) |
+| Docker + Compose | any recent |
 
-- **Frontend**: Pixi.js 8.6+, TypeScript, Vite
-- **Backend**: Bun.js 1.2+, Node.js-compatible APIs
-- **Networking**: WebSockets with custom binary protocol
-- **Build Tools**: Vite, TypeScript, ESLint
-- **Assets**: Sprite sheets and individual sprites for characters and items
+---
 
-## 📦 Installation
+## Quick start
 
-### Prerequisites
-- Node.js 18+ or Bun 1.0+
-- npm or bun package manager
+### Development (local, no Docker)
 
-### Setup
 ```bash
-# Clone the repository
-git clone https://github.com/qwezertino/pixi_node_game.git
-cd pixi_node_game
+# Install all dependencies
+make install
 
-# Install dependencies
-npm install
-# or
-bun install
+# Terminal 1 — Vite dev server (http://localhost:8109, HMR)
+make dev-client
 
-# Start development server
-npm run dev
-# or
-bun run dev
+# Terminal 2 — Go game server (http://localhost:8108)
+make dev-server
 ```
 
-### Build for Production
+Or run both together (server in background, Vite in foreground):
+
 ```bash
-# Build client and server
-npm run build
-# or
-bun run build
-
-# Start production server
-npm start
-# or
-bun run dist/assets/server.js
+make dev
 ```
 
-## 🎮 Usage
+The Go server reads `.env` from the project root. Copy `.env.example` (if present) or create `.env` with any overrides before starting.
 
-### Development
+### Production build (local)
+
 ```bash
-# Start both client and server in development mode
-npm run dev
+make build       # build client → dist/  +  server → dist/server
+make run         # build + start server (loads .env)
 ```
-- Client runs on: http://localhost:8109
-- Server runs on: http://localhost:8108
 
-### Production
+### Docker
+
 ```bash
-# Build and start
-npm run build && npm start
+# First run — set up data directory permissions
+make docker-init
+
+# Build image and start all services (game + Prometheus + Grafana + Loki + Promtail)
+make docker-upbuild
+
+# Start without rebuilding
+make docker-up
+
+# Stop
+make docker-down
 ```
 
-## 🌐 Networking Details
+Service URLs after `docker-up`:
 
-### Binary Protocol
-- **Movement**: Delta-based (dx, dy) instead of absolute positions
-- **States**: Numeric encoding (idle=0, move=1, attack=2)
-- **Direction**: Binary facing (-1=left, 1=right)
-- **Batching**: Multiple actions sent together to reduce packet frequency
-- **Change Detection**: Only sends data when player state actually changes
+| Service | URL | Default credentials |
+|---|---|---|
+| Game | http://localhost:8108 | — |
+| Prometheus | http://localhost:9090 | — |
+| Grafana | http://localhost:3000 | admin / admin |
+| Loki | http://localhost:3100 | — |
 
-### Connection Flow
-1. Client connects via WebSocket to `/ws` endpoint
-2. Server assigns unique player ID
-3. Client receives initial world state
-4. Real-time delta updates for state changes
-5. Full world sync every 30 seconds to prevent desynchronization
+Run `make docker-monitoring` to print the current URLs with resolved ports.
 
-### Performance Optimizations
-- **WebSocket Binary Frames**: Raw binary data instead of JSON
-- **Bit Packing**: Minimized message sizes through efficient encoding
-- **Connection Pooling**: Optimized concurrent connection handling
-- **Worker Threads**: Multi-threaded server processing (planned)
+### Load testing (Artillery)
 
-## 📁 Project Structure
+```bash
+# Locally (artillery must be installed)
+make load-test
 
-```
-src/
-├── client/                 # Frontend application
-│   ├── main.ts            # Application entry point
-│   ├── controllers/       # Input and animation controllers
-│   ├── game/             # Game logic and player management
-│   ├── network/          # WebSocket communication
-│   └── utils/            # Utilities (sprites, input, coordinates)
-├── server/                # Backend server
-│   ├── main.ts           # Server entry point
-│   ├── game/            # Game world and logic
-│   ├── handlers/        # WebSocket connection handling
-│   └── workers/         # Multi-threading support (planned)
-├── common/               # Shared types and constants
-└── protocol/            # Network protocol definitions
+# Via Docker (no local install needed)
+make docker-test
 ```
 
-## 🎯 Game Features
+Before a high-load run locally, raise the file descriptor limit:
+```bash
+ulimit -n 65536
+```
 
-- **Character Movement**: 8-directional movement with smooth animation
-- **Sprite Animation**: Multi-frame animations for different states
-- **Real-time Multiplayer**: See other players move in real-time
-- **Lag Compensation**: Client-side prediction with server correction
-- **World Synchronization**: Periodic full state sync to prevent desync
-- **Debug Tools**: FPS display and connection monitoring
+---
 
-## 🔧 Configuration
+## Make targets reference
 
-### Game Settings
-Located in `src/common/gameSettings.ts`:
-- Player movement speed
-- Animation frame rates
-- Network tick rates
-- World boundaries
+| Target | Description |
+|---|---|
+| `make install` | `bun install` + `go mod tidy && go mod download` |
+| `make build` | Build client and server |
+| `make build-client` | Vite build → `dist/` |
+| `make build-server` | Go build → `dist/server` (copies gameConfig.json for embed, cleans up after) |
+| `make build-server-linux` | Same + `CGO_ENABLED=0 GOOS=linux` |
+| `make build-release` | `build-client` + `build-server-linux` |
+| `make dev-client` | Vite dev server on `:8109` with HMR |
+| `make dev-server` | Build server + start with `.env` |
+| `make dev` | Build server, then run server + Vite client in parallel |
+| `make run` | Full build + start server |
+| `make clean` | Remove `dist/` and temp build files |
+| `make lint` | `golangci-lint run` |
+| `make load-test` | Artillery load test (local) |
+| `make docker-init` | Create and chown data directories for Prometheus/Grafana/Loki |
+| `make docker-up` | Start Docker services without rebuilding |
+| `make docker-upbuild` | Build image and start Docker services |
+| `make docker-down` | Stop Docker services |
+| `make docker-test` | Run Artillery load test inside Docker |
+| `make docker-monitoring` | Print Prometheus and Grafana URLs |
 
-### Network Protocol
-Located in `src/protocol/`:
-- Message types and formats
-- Binary encoding/decoding
-- Protocol versioning
+---
 
-## 🚀 Performance Benchmarks
+## Key endpoints (game server, port 8108)
 
-- **Concurrent Players**: Tested with 10000+ connections
-- **Tick Rate**: 60Hz server simulation
-- **Latency**: <50ms round-trip for local networks
-- **Bandwidth**: <10KB/s per player with optimizations
-- **Memory**: Efficient object pooling and cleanup
+| Path | Description |
+|---|---|
+| `/ws` | WebSocket game connection |
+| `/health` | JSON health check |
+| `/metrics` | Prometheus metrics |
+| `/metrics/json` | Legacy JSON metrics |
+| `/debug/pprof/` | Go pprof profiling (block + mutex profilers enabled) |
 
-## 🤝 Contributing
+---
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test with multiple clients
-5. Submit a pull request
+## Configuration
 
-## 📄 License
+Game rules (tick rate, world size, player speed, etc.) live in `src/shared/gameConfig.json` — the single source of truth shared between the TypeScript client and the Go server (embedded at compile time via `//go:embed`).
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- Pixi.js for excellent WebGL rendering
-- Bun.js for high-performance JavaScript runtime
-- The gaming community for inspiration and feedback
+Server infrastructure (port, worker counts, rate limits, memory limits, etc.) is configured via environment variables, typically in `.env`. See `src/server/internal/config/config.go` for all supported variables.
