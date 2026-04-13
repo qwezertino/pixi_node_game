@@ -17,13 +17,6 @@ type Player struct {
 	ClientTick      uint32 // Atomic client tick for reconciliation
 	AttackStartTime int64  // Atomic nanosecond timestamp of attack start (0 = not attacking)
 
-	// Viewport для оптимизации broadcasting
-	ViewportWidth  uint16
-	ViewportHeight uint16
-
-	// Network connection (set separately to avoid atomic operations)
-	ConnPtr uintptr // Pointer to websocket connection
-
 	// Timestamps для performance tracking
 	LastUpdate   int64 // Atomic timestamp
 	LastActivity int64 // Atomic timestamp
@@ -51,8 +44,6 @@ const (
 	EventMove EventType = iota
 	EventAttack
 	EventFace
-	EventDisconnect
-	EventViewportUpdate
 )
 
 // PlayerState содержит состояние игрока для сериализации
@@ -67,24 +58,10 @@ type PlayerState struct {
 	ClientTick  uint32
 }
 
-// ViewportBounds определяет границы viewport'а
-type ViewportBounds struct {
-	MinX uint16
-	MinY uint16
-	MaxX uint16
-	MaxY uint16
-}
-
 // PerformanceMetrics содержит метрики производительности
 type PerformanceMetrics struct {
-	ConnectedPlayers  uint32
-	TickDuration      time.Duration
-	AverageTickTime   time.Duration
-	MaxTickTime       time.Duration
-	EventsPerSecond   uint64
-	MessagesPerSecond uint64
-	MemoryUsage       uint64
-	GoroutineCount    int
+	ConnectedPlayers uint32
+	TickDuration     time.Duration
 }
 
 // Atomic операции для Player

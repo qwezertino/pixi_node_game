@@ -3,8 +3,6 @@ package systems
 import (
 	"log/slog"
 	"sync"
-
-	"pixi_game_server/internal/types"
 )
 
 // gridCell — одна ячейка пространственной сетки.
@@ -30,9 +28,6 @@ type VisibilityManager struct {
 
 	// playerCells: playerID → текущая ячейка (для перемещения)
 	playerCells sync.Map
-
-	// pool для временных слайсов ID внутри GetVisibleIDs
-	idPool sync.Pool
 }
 
 // NewVisibilityManager создает менеджер видимости.
@@ -45,12 +40,6 @@ func NewVisibilityManager(worldWidth, worldHeight, gridSize uint16) *VisibilityM
 		gridWidth:  gridW,
 		gridHeight: gridH,
 		cells:      make([]gridCell, int(gridW)*int(gridH)),
-		idPool: sync.Pool{
-			New: func() any {
-				s := make([]uint32, 0, 128)
-				return &s
-			},
-		},
 	}
 
 	slog.Info("visibility manager initialized", "grid_w", gridW, "grid_h", gridH, "cell_size", gridSize)
@@ -108,33 +97,6 @@ func (vm *VisibilityManager) MovePlayer(playerID uint32, newX, newY uint16) {
 	vm.removeFromCell(pc.gridX, pc.gridY, playerID)
 	vm.addToCell(newGX, newGY, playerID)
 	vm.playerCells.Store(playerID, playerCell{newGX, newGY})
-}
-
-// GetVisibleIDs возвращает ID игроков во всех ячейках, пересекающихся с viewport.
-// Результат берётся из пула — вызывающий должен вернуть его через ReleaseIDs.
-func (vm *VisibilityManager) GetVisibleIDs(viewport types.ViewportBounds) []uint32 {
-	minGX, minGY := vm.worldToGrid(viewport.MinX, viewport.MinY)
-	maxGX, maxGY := vm.worldToGrid(viewport.MaxX, viewport.MaxY)
-
-	ptr := vm.idPool.Get().(*[]uint32)
-	result := (*ptr)[:0]
-
-	for gy := minGY; gy <= maxGY; gy++ {
-		for gx := minGX; gx <= maxGX; gx++ {
-			cell := &vm.cells[vm.cellIndex(gx, gy)]
-			cell.mu.RLock()
-			result = append(result, cell.players...)
-			cell.mu.RUnlock()
-		}
-	}
-
-	*ptr = result
-	return result
-}
-
-// ReleaseIDs возвращает слайс в пул после использования.
-func (vm *VisibilityManager) ReleaseIDs(ids []uint32) {
-	vm.idPool.Put(&ids)
 }
 
 func (vm *VisibilityManager) addToCell(gx, gy uint16, playerID uint32) {

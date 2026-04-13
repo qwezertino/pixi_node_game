@@ -15,18 +15,15 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port            int
-	Host            string
-	Workers         int
-	ReadBufferSize  int
-	WriteBufferSize int
-	StaticDir       string
+	Port      int
+	Host      string
+	Workers   int
+	StaticDir string
 }
 
 type GameConfig struct {
 	TickRate           int
 	SyncInterval       time.Duration
-	BatchInterval      time.Duration
 	PlayerSpeedPerTick int
 	AttackDuration     time.Duration
 }
@@ -46,21 +43,18 @@ type WorldConfig struct {
 
 type NetworkConfig struct {
 	MaxConnections   int
-	EventChannelSize int
-	SendChannelSize  int
-	BroadcastWorkers int
 	MessageRateLimit int
 	BurstLimit       int
-	RateLimitWindow  time.Duration
+	IPConnRate       float64 // connections/sec per IP; 0 = disabled
+	IPConnBurst      int
 }
 
 // JSONConfig mirrors the structure of gameConfig.json (shared with the TypeScript client).
 // Only game-rule values live here; server infrastructure is configured via .env.
 type JSONConfig struct {
 	Network struct {
-		TickRate        int `json:"tickRate"`
-		SyncInterval    int `json:"syncInterval"`
-		BatchIntervalMs int `json:"batchIntervalMs"`
+		TickRate     int `json:"tickRate"`
+		SyncInterval int `json:"syncInterval"`
 	} `json:"network"`
 	Movement struct {
 		PlayerSpeedPerTick int `json:"playerSpeedPerTick"`
@@ -112,19 +106,16 @@ func Load() *Config {
 		// ── Server infrastructure ─────────────────────────────────────────────
 		// Defaults are hardcoded here; override via .env for deployment tuning.
 		Server: ServerConfig{
-			Port:            getEnvInt("PORT", 8108),
-			Host:            getEnvString("HOST", "0.0.0.0"),
-			Workers:         getEnvInt("WORKERS", 0),
-			ReadBufferSize:  getEnvInt("READ_BUFFER_SIZE", 4096),
-			WriteBufferSize: getEnvInt("WRITE_BUFFER_SIZE", 4096),
-			StaticDir:       getEnvString("STATIC_DIR", "../dist"),
+			Port:      getEnvInt("PORT", 8108),
+			Host:      getEnvString("HOST", "0.0.0.0"),
+			Workers:   getEnvInt("WORKERS", 0),
+			StaticDir: getEnvString("STATIC_DIR", "../dist"),
 		},
 		// ── Game rules ────────────────────────────────────────────────────────
 		// Defaults come from embedded gameConfig.json so they always match the client.
 		Game: GameConfig{
 			TickRate:           getEnvInt("TICK_RATE", jsonConfig.Network.TickRate),
 			SyncInterval:       time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
-			BatchInterval:      time.Duration(getEnvInt("BATCH_INTERVAL_MS", jsonConfig.Network.BatchIntervalMs)) * time.Millisecond,
 			PlayerSpeedPerTick: getEnvInt("PLAYER_SPEED", jsonConfig.Movement.PlayerSpeedPerTick),
 			AttackDuration:     time.Duration(getEnvInt("ATTACK_DURATION_MS", jsonConfig.Player.AttackDurationMs)) * time.Millisecond,
 		},
@@ -144,12 +135,10 @@ func Load() *Config {
 		// All configurable via .env; hardcoded values are production-tested defaults.
 		Net: NetworkConfig{
 			MaxConnections:   getEnvInt("MAX_CONNECTIONS", 12000),
-			EventChannelSize: getEnvInt("EVENT_CHANNEL_SIZE", 100000),
-			SendChannelSize:  getEnvInt("SEND_CHANNEL_SIZE", 2048),
-			BroadcastWorkers: getEnvInt("BROADCAST_WORKERS", 0),
 			MessageRateLimit: getEnvInt("RATE_LIMIT_MSG_SEC", 120),
 			BurstLimit:       getEnvInt("RATE_LIMIT_BURST", 20),
-			RateLimitWindow:  time.Duration(getEnvInt("RATE_LIMIT_WINDOW_MS", 1000)) * time.Millisecond,
+			IPConnRate:       getEnvFloat("IP_CONN_RATE", 10.0),
+			IPConnBurst:      getEnvInt("IP_CONN_BURST", 20),
 		},
 	}
 }
@@ -165,6 +154,15 @@ func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
 			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatValue, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatValue
 		}
 	}
 	return defaultValue

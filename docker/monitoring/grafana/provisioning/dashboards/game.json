@@ -113,7 +113,8 @@
       "fieldConfig": { "defaults": { "color": { "fixedColor": "orange", "mode": "fixed" } } },
       "targets": [
         { "expr": "rate(game_broadcasts_dropped_total[10s])", "legendFormat": "Dropped/s" },
-        { "expr": "rate(game_send_channel_dropped_total[10s])", "legendFormat": "Send chan dropped/s" }
+        { "expr": "rate(game_broadcast_shard_dropped_total[10s])", "legendFormat": "Shard tick dropped/s" },
+        { "expr": "rate(game_direct_channel_dropped_total[10s])", "legendFormat": "Direct chan dropped/s" }
       ]
     },
     {
@@ -175,6 +176,66 @@
       "gridPos": { "x": 12, "y": 21, "w": 12, "h": 4 },
       "targets": [
         { "expr": "rate(go_gc_duration_seconds_count{job=\"pixi_game_server\"}[1m])", "legendFormat": "GC/s" }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Tick Phase Breakdown p99",
+      "description": "Время каждой фазы тика на уровне p99. range=sync.Map.Range, delta=prevStates diff, encode=marshal+PreparedMessage, shard_send=channel sends. Сумма ≈ полный tick_duration.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 25, "w": 12, "h": 5 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"range\"}[1m]))", "legendFormat": "range p99" },
+        { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"delta\"}[1m]))", "legendFormat": "delta p99" },
+        { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"encode\"}[1m]))", "legendFormat": "encode p99" },
+        { "expr": "histogram_quantile(0.99, rate(game_tick_phase_seconds_bucket{phase=\"shard_send\"}[1m]))", "legendFormat": "shard_send p99" }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Shard Write Duration p99",
+      "description": "Сколько времени шард-воркер пишет один тик всем своим (~N/shards) клиентам. Если > 33ms (1 tick budget) — шарды не успевают, нужно увеличить BROADCAST_WORKERS.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 25, "w": 6, "h": 5 },
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.016 }, { "color": "red", "value": 0.033 }] } } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(game_shard_write_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.99, rate(game_shard_write_seconds_bucket[1m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Broadcast Shard Drops / sec",
+      "description": "Тики дропнутые из-за того что шард не успел обработать предыдущий (broadcastChan cap=2 полон). Ненулевое значение = шарды тормозят.",
+      "type": "timeseries",
+      "gridPos": { "x": 18, "y": 25, "w": 6, "h": 5 },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "targets": [
+        { "expr": "rate(game_broadcast_shard_dropped_total[10s])", "legendFormat": "Shard drops/s" }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Delta Players per Tick",
+      "description": "Сколько игроков реально изменили состояние за тик. Если ≈ total players — дельта-оптимизация не работает (все двигаются). Если мало — delta frame маленький.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 30, "w": 12, "h": 5 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(game_delta_players_count_bucket[1m]))", "legendFormat": "p50 changed" },
+        { "expr": "histogram_quantile(0.99, rate(game_delta_players_count_bucket[1m]))", "legendFormat": "p99 changed" },
+        { "expr": "game_players_connected", "legendFormat": "total players" }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Delta Ratio",
+      "description": "Доля игроков с изменением стейта (0.0–1.0). 1.0 при fullSync (каждую секунду) или когда все двигаются. Низкое значение = delta frames эффективны.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 30, "w": 12, "h": 5 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [
+        { "expr": "game_delta_ratio", "legendFormat": "Delta ratio" }
       ]
     }
   ]

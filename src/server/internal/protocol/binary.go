@@ -20,8 +20,6 @@ const (
 	// Server -> Client messages
 	MessageGameState      = 7  // GAME_STATE (full)
 	MessageMovementAck    = 8  // MOVEMENT_ACK
-	MessageCorrection     = 9  // CORRECTION
-	MessageInitialState   = 10 // INITIAL_STATE
 	MessagePlayerJoined   = 11 // PLAYER_JOINED
 	MessagePlayerLeft     = 12 // PLAYER_LEFT
 	MessageDeltaGameState = 14 // DELTA_GAME_STATE (only changed players)
@@ -42,12 +40,6 @@ type ClientMessage struct {
 	MovementVector MovementVector
 	Direction      bool // FacingRight
 	InputSequence  uint32
-	ViewportWidth  uint16
-	ViewportHeight uint16
-	Position       struct { // Player position when sending movement
-		X uint32
-		Y uint32
-	}
 }
 
 // PackMovement упаковывает движение в один байт (совместимо с artillery-processor.cjs)
@@ -94,11 +86,7 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (*ClientMessage, erro
 		// No additional data needed for these messages
 
 	case MessageViewportUpdate:
-		if len(data) < 5 {
-			return nil, fmt.Errorf("viewport message too short")
-		}
-		msg.ViewportWidth = binary.LittleEndian.Uint16(data[1:3])
-		msg.ViewportHeight = binary.LittleEndian.Uint16(data[3:5])
+		// Accepted but not processed — viewport-based culling not yet implemented.
 
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msg.Type)
@@ -109,124 +97,113 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (*ClientMessage, erro
 
 // EncodeGameState кодирует состояние игры для отправки клиенту
 func (bp *BinaryProtocol) EncodeGameState(players []types.PlayerState) []byte {
-	// Header: message type (1) + player count (4) = 5 bytes
-	headerSize := 5
-	playerSize := 11 // ID(4) + X(2) + Y(2) + VX(1) + VY(1) + Flags(1) = 11 bytes
-	totalSize := headerSize + len(players)*playerSize
+	return bp.AppendGameState(nil, players)
+}
 
-	buffer := make([]byte, totalSize)
-	offset := 0
+// AppendGameState encodes full game state and appends it to dst (preserves existing content).
+// When dst has a header prefix (e.g. 10 reserved WS frame bytes), the payload is written
+// after those bytes — dst[len(dst):len(dst)+payloadSize] — with no allocation if
+// cap(dst) is sufficient (ring slot pre-allocated to 64 KB).
+func (bp *BinaryProtocol) AppendGameState(dst []byte, players []types.PlayerState) []byte {
+	// Header: message type (1) + player count (4) = 5 bytes
+	playerSize := 11 // ID(4) + X(2) + Y(2) + VX(1) + VY(1) + Flags(1) = 11 bytes
+	startOffset := len(dst)
+	payloadSize := 5 + len(players)*playerSize
+	totalSize := startOffset + payloadSize
+
+	if cap(dst) < totalSize {
+		newDst := make([]byte, totalSize, totalSize+payloadSize)
+		copy(newDst, dst)
+		dst = newDst
+	} else {
+		dst = dst[:totalSize]
+	}
+
+	offset := startOffset
 
 	// Message type
-	buffer[offset] = MessageGameState
+	dst[offset] = MessageGameState
 	offset++
 
 	// Player count
-	binary.LittleEndian.PutUint32(buffer[offset:], uint32(len(players)))
+	binary.LittleEndian.PutUint32(dst[offset:], uint32(len(players)))
 	offset += 4
 
 	// Players data
 	for _, player := range players {
-		// Player ID (4 bytes)
-		binary.LittleEndian.PutUint32(buffer[offset:], player.ID)
+		binary.LittleEndian.PutUint32(dst[offset:], player.ID)
 		offset += 4
-
-		// Position X (2 bytes)
-		binary.LittleEndian.PutUint16(buffer[offset:], player.X)
+		binary.LittleEndian.PutUint16(dst[offset:], player.X)
 		offset += 2
-
-		// Position Y (2 bytes)
-		binary.LittleEndian.PutUint16(buffer[offset:], player.Y)
+		binary.LittleEndian.PutUint16(dst[offset:], player.Y)
 		offset += 2
-
-		// Vector X (1 byte, signed)
-		buffer[offset] = uint8(player.VX)
+		dst[offset] = uint8(player.VX)
 		offset++
-
-		// Vector Y (1 byte, signed)
-		buffer[offset] = uint8(player.VY)
+		dst[offset] = uint8(player.VY)
 		offset++
-
-		// Flags: FacingRight (1 bit) + State (7 bits)
-		flags := uint8(player.State & 0x7F) // 7 bits for state
+		flags := uint8(player.State & 0x7F)
 		if player.FacingRight {
-			flags |= 0x80 // Set bit 7 for FacingRight
+			flags |= 0x80
 		}
-		buffer[offset] = flags
+		dst[offset] = flags
 		offset++
 	}
 
-	return buffer
+	return dst
 }
 
 // EncodeDeltaGameState кодирует дельту — только изменившихся игроков.
 // Формат идентичен EncodeGameState (11 байт/игрок), но тип сообщения = MessageDeltaGameState.
 // Клиент мёржит дельту в своё состояние вместо полной замены.
 func (bp *BinaryProtocol) EncodeDeltaGameState(players []types.PlayerState) []byte {
-	headerSize := 5
+	return bp.AppendDeltaGameState(nil, players)
+}
+
+// AppendDeltaGameState encodes a delta game state and appends it to dst (preserves existing content).
+// Формат идентичен AppendGameState (11 байт/игрок), но тип сообщения = MessageDeltaGameState.
+// Клиент мёржит дельту в своё состояние вместо полной замены.
+func (bp *BinaryProtocol) AppendDeltaGameState(dst []byte, players []types.PlayerState) []byte {
 	playerSize := 11
-	totalSize := headerSize + len(players)*playerSize
+	startOffset := len(dst)
+	payloadSize := 5 + len(players)*playerSize
+	totalSize := startOffset + payloadSize
 
-	buffer := make([]byte, totalSize)
-	offset := 0
+	if cap(dst) < totalSize {
+		newDst := make([]byte, totalSize, totalSize+payloadSize)
+		copy(newDst, dst)
+		dst = newDst
+	} else {
+		dst = dst[:totalSize]
+	}
 
-	buffer[offset] = MessageDeltaGameState
+	offset := startOffset
+
+	dst[offset] = MessageDeltaGameState
 	offset++
 
-	binary.LittleEndian.PutUint32(buffer[offset:], uint32(len(players)))
+	binary.LittleEndian.PutUint32(dst[offset:], uint32(len(players)))
 	offset += 4
 
 	for _, player := range players {
-		binary.LittleEndian.PutUint32(buffer[offset:], player.ID)
+		binary.LittleEndian.PutUint32(dst[offset:], player.ID)
 		offset += 4
-		binary.LittleEndian.PutUint16(buffer[offset:], player.X)
+		binary.LittleEndian.PutUint16(dst[offset:], player.X)
 		offset += 2
-		binary.LittleEndian.PutUint16(buffer[offset:], player.Y)
+		binary.LittleEndian.PutUint16(dst[offset:], player.Y)
 		offset += 2
-		buffer[offset] = uint8(player.VX)
+		dst[offset] = uint8(player.VX)
 		offset++
-		buffer[offset] = uint8(player.VY)
+		dst[offset] = uint8(player.VY)
 		offset++
 		flags := uint8(player.State & 0x7F)
 		if player.FacingRight {
 			flags |= 0x80
 		}
-		buffer[offset] = flags
+		dst[offset] = flags
 		offset++
 	}
 
-	return buffer
-}
-
-// EncodeDeltaUpdate кодирует дельта-обновление для эффективности
-func (bp *BinaryProtocol) EncodeDeltaUpdate(updates []types.PlayerState) []byte {
-	// Simplified delta encoding - only positions that changed
-	headerSize := 5
-	deltaSize := 7 // ID(4) + X(2) + Y(2) = 7 bytes per update
-	totalSize := headerSize + len(updates)*deltaSize
-
-	buffer := make([]byte, totalSize)
-	offset := 0
-
-	// Message type for delta
-	buffer[offset] = 0x20 // Delta update type
-	offset++
-
-	// Update count
-	binary.LittleEndian.PutUint32(buffer[offset:], uint32(len(updates)))
-	offset += 4
-
-	// Updates data
-	for _, update := range updates {
-		binary.LittleEndian.PutUint32(buffer[offset:], update.ID)
-		offset += 4
-		binary.LittleEndian.PutUint16(buffer[offset:], update.X)
-		offset += 2
-		binary.LittleEndian.PutUint16(buffer[offset:], update.Y)
-		offset += 2
-	}
-
-	return buffer
+	return dst
 }
 
 // EncodePlayerJoined кодирует сообщение о присоединении игрока
@@ -291,78 +268,6 @@ func (bp *BinaryProtocol) EncodeMovementAck(playerID uint32, x, y uint16, inputS
 	// Input sequence (4 bytes)
 	binary.LittleEndian.PutUint32(buffer[offset:], inputSequence)
 	offset += 4
-
-	return buffer
-}
-
-// EncodePlayerMovement кодирует сообщение о движении игрока
-func (bp *BinaryProtocol) EncodePlayerMovement(playerID uint32, dx, dy int8) []byte {
-	buffer := make([]byte, 7) // 1 + 4 + 1 + 1
-	offset := 0
-
-	// Message type (1 byte) - использует тип из TypeScript
-	buffer[offset] = 255 // Custom type for player movement broadcast
-	offset++
-
-	// Player ID (4 bytes)
-	binary.LittleEndian.PutUint32(buffer[offset:], playerID)
-	offset += 4
-
-	// Movement vector DX (1 byte)
-	buffer[offset] = byte(dx)
-	offset++
-
-	// Movement vector DY (1 byte)
-	buffer[offset] = byte(dy)
-	offset++
-
-	return buffer
-}
-
-// EncodePlayerDirection кодирует сообщение о повороте игрока
-func (bp *BinaryProtocol) EncodePlayerDirection(playerID uint32, facingRight bool) []byte {
-	buffer := make([]byte, 6) // 1 + 4 + 1
-	offset := 0
-
-	// Message type (1 byte)
-	buffer[offset] = 254 // Custom type for player direction broadcast
-	offset++
-
-	// Player ID (4 bytes)
-	binary.LittleEndian.PutUint32(buffer[offset:], playerID)
-	offset += 4
-
-	// Direction (1 byte) - 0 for left, 1 for right
-	if facingRight {
-		buffer[offset] = 1
-	} else {
-		buffer[offset] = 0
-	}
-	offset++
-
-	return buffer
-}
-
-// EncodePlayerAttack кодирует сообщение об атаке игрока
-func (bp *BinaryProtocol) EncodePlayerAttack(playerID uint32, x, y uint16) []byte {
-	buffer := make([]byte, 9) // 1 + 4 + 2 + 2
-	offset := 0
-
-	// Message type (1 byte)
-	buffer[offset] = 253 // Custom type for player attack broadcast
-	offset++
-
-	// Player ID (4 bytes)
-	binary.LittleEndian.PutUint32(buffer[offset:], playerID)
-	offset += 4
-
-	// Position X (2 bytes)
-	binary.LittleEndian.PutUint16(buffer[offset:], x)
-	offset += 2
-
-	// Position Y (2 bytes)
-	binary.LittleEndian.PutUint16(buffer[offset:], y)
-	offset += 2
 
 	return buffer
 }

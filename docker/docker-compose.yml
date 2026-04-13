@@ -11,6 +11,16 @@ services:
       # Override path to static files inside the container
       STATIC_DIR: "/app/static"
     restart: unless-stopped
+    # Allow up to 65 536 open file descriptors (= WebSocket connections + epoll fds).
+    # Default Docker/Linux limit is 1024 — server hits EMFILE at ~1020 connections.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Increase TCP listen backlog so the kernel doesn't silently drop SYN packets
+    # during mass-connect bursts. Default is 128; 10K clients need 65535.
+    sysctls:
+      net.core.somaxconn: 65535
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8108/health"]
       interval: 30s

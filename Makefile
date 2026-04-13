@@ -31,8 +31,6 @@ build-server:
 	@echo "📋 Copying config for embedding..."
 	cp src/shared/gameConfig.json src/server/internal/config/
 	cd $(SERVER_DIR) && go build -ldflags="-s -w" -trimpath -o ../../$(SERVER_OUTPUT_DIR)/$(SERVER_BINARY) cmd/server/main.go
-	@echo "🧹 Cleaning up temporary config file..."
-	rm -f src/server/internal/config/gameConfig.json
 	@echo "📋 Copying config files to dist..."
 
 build-server-linux:
@@ -40,8 +38,6 @@ build-server-linux:
 	@echo "📋 Copying config for embedding..."
 	cp src/shared/gameConfig.json src/server/internal/config/
 	cd $(SERVER_DIR) && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o ../../$(SERVER_OUTPUT_DIR)/$(SERVER_BINARY) cmd/server/main.go
-	@echo "🧹 Cleaning up temporary config file..."
-	rm -f src/server/internal/config/gameConfig.json
 	@echo "📋 Copying config files to dist..."
 
 # Build optimized release version
@@ -50,8 +46,6 @@ build-release: build-client
 	@echo "📋 Copying config for embedding..."
 	cp src/shared/gameConfig.json src/server/internal/config/
 	cd $(SERVER_DIR) && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o ../../$(SERVER_OUTPUT_DIR)/$(SERVER_BINARY) cmd/server/main.go
-	@echo "🧹 Cleaning up temporary config file..."
-	rm -f src/server/internal/config/gameConfig.json
 	@echo "📋 Copying config files to dist..."
 
 # Run client development server

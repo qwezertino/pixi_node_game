@@ -61,16 +61,6 @@ var (
 		Help: "Total game events processed, by type",
 	}, []string{"type"})
 
-	EventsDropped = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "game_events_dropped_total",
-		Help: "Total events dropped due to full event channel",
-	})
-
-	EventChannelLen = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "game_event_channel_len",
-		Help: "Current number of events queued in the event channel",
-	})
-
 	// ── Messages ─────────────────────────────────────────────────────────────
 	MessagesReceived = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "game_messages_received_total",
@@ -88,19 +78,9 @@ var (
 	})
 
 	// ── Broadcast ─────────────────────────────────────────────────────────────
-	BroadcastsSent = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "game_broadcasts_sent_total",
-		Help: "Total broadcast messages delivered to individual connections",
-	})
-
 	BroadcastsDropped = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_broadcasts_dropped_total",
 		Help: "Total broadcast messages dropped (send channel full)",
-	})
-
-	BroadcastChannelLen = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "game_broadcast_channel_len",
-		Help: "Current number of pending broadcast jobs",
 	})
 
 	BytesSent = promauto.NewCounter(prometheus.CounterOpts{
@@ -124,14 +104,35 @@ var (
 		Help: "Total WebSocket write errors",
 	})
 
-	SendChannelDropped = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "game_send_channel_dropped_total",
-		Help: "Total messages dropped due to full per-player send channel",
-	})
-
 	// ── Connection rate limiting ───────────────────────────────────────────────
 	IPRateLimited = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_ip_rate_limited_total",
 		Help: "Total connection attempts rejected by IP rate limiter",
+	})
+
+	// ── Tick phase breakdown ──────────────────────────────────────────────────
+	// Labels: "range" (sync.Map scan), "delta" (prevStates diff),
+	//         "encode" (EncodeGameState + NewPreparedMessage), "shard_send" (channel sends).
+	// Sum of all four ≈ total tick duration.
+	TickPhaseDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "game_tick_phase_seconds",
+		Help:    "Time spent in each phase of the game tick",
+		Buckets: prometheus.ExponentialBucketsRange(0.00005, 0.05, 12),
+	}, []string{"phase"})
+
+	// ── Delta tracking ────────────────────────────────────────────────────────
+	// How many players actually had state changes this tick.
+	// If this equals PlayersConnected every tick — delta optimisation does nothing.
+	DeltaPlayersCount = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_delta_players_count",
+		Help:    "Number of players with changed state per tick",
+		Buckets: []float64{0, 10, 50, 100, 250, 500, 1000, 2000, 5000},
+	})
+
+	// Fraction of players that changed state (0.0–1.0).
+	// 1.0 on a fullSync tick or when everyone is moving.
+	DeltaRatio = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "game_delta_ratio",
+		Help: "Fraction of players with changed state in the last tick (0.0–1.0)",
 	})
 )

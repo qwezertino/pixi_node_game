@@ -3,6 +3,7 @@ package game
 import (
 	"log/slog"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,10 +19,20 @@ type broadcastFuncHolder struct {
 	fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool)
 }
 
+// tickWorkerInput — chunk of player pointers dispatched to a persistent tick worker.
+// Workers do only the CPU-heavy part (position update + attack timeout).
+// State snapshot (ToState + delta) remains sequential in the gameLoop goroutine.
+type tickWorkerInput struct {
+	ptrs          []*types.Player
+	nowNano       int64
+	attackDurNano int64
+}
+
 // GameWorld управляет состоянием игрового мира
 type GameWorld struct {
-	cfg     *config.Config
-	players sync.Map // map[uint32]*types.Player - lock-free player storage
+	cfg        *config.Config
+	playersMu  sync.RWMutex
+	playersMap map[uint32]*types.Player
 
 	// Tick-driven broadcast: вызывается раз в тик с текущим состоянием всех игроков.
 	// Хранится в atomic.Value — записывается один раз из SetTickBroadcaster,
@@ -38,9 +49,20 @@ type GameWorld struct {
 	scratchStates  []types.PlayerState
 	scratchChanged []types.PlayerState
 	scratchSeenIDs map[uint32]struct{}
-	// Performance metrics
-	tickDuration int64 // atomic
-	lastSyncTime int64 // atomic
+	// scratchPtrs holds a snapshot of player pointers taken under a brief RLock each tick.
+	// Processing (position update + ToState) happens outside the lock since all Player
+	// fields are atomic — the lock only protects the map structure itself.
+	scratchPtrs []*types.Player
+	// Persistent tick worker pool (pattern from nbio/nakama).
+	// Workers are created once in NewGameWorld; each tick dispatches a chunk of players
+	// via a buffered channel. Workers do only the expensive part (updatePlayerPosition +
+	// attack timeout). State collection (ToState + delta) stays in gameLoop goroutine.
+	// Avoids per-tick goroutine spawn overhead (~2µs/goroutine × N workers).
+	nTickWorkers  int
+	tickWorkerChs []chan tickWorkerInput
+	tickWorkerWg  sync.WaitGroup // Performance metrics
+	tickDuration  int64          // atomic
+	lastSyncTime  int64          // atomic
 
 	// Tick management
 	ticker   *time.Ticker
@@ -58,11 +80,9 @@ type GameWorld struct {
 
 // NewGameWorld создает новый игровой мир
 func NewGameWorld(cfg *config.Config) *GameWorld {
-	// Initialize random seed for spawn positions
-	rand.Seed(time.Now().UnixNano())
-
 	gw := &GameWorld{
 		cfg:            cfg,
+		playersMap:     make(map[uint32]*types.Player, 256),
 		stopChan:       make(chan struct{}),
 		nextPlayerID:   1000, // Start from 1000 for easy debugging
 		lastFullSync:   time.Now(),
@@ -70,6 +90,20 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 		scratchStates:  make([]types.PlayerState, 0, 256),
 		scratchChanged: make([]types.PlayerState, 0, 64),
 		scratchSeenIDs: make(map[uint32]struct{}, 256),
+		scratchPtrs:    make([]*types.Player, 0, 256),
+	}
+
+	// Spawn persistent tick workers — one per logical CPU.
+	// Pattern: nbio TaskPool / nakama runtime worker pool.
+	// Workers receive chunks of player pointers, process them, signal done via WaitGroup.
+	// Channels are buffered=1 so gameLoop never blocks on dispatch.
+	n := runtime.GOMAXPROCS(0)
+	gw.nTickWorkers = n
+	gw.tickWorkerChs = make([]chan tickWorkerInput, n)
+	for i := range gw.tickWorkerChs {
+		ch := make(chan tickWorkerInput, 1)
+		gw.tickWorkerChs[i] = ch
+		go gw.runTickWorker(ch)
 	}
 
 	// Initialize high-performance systems
@@ -96,10 +130,8 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 	spawnY := gw.cfg.World.SpawnMinY + uint16(rand.Intn(int(spawnRangeY)))
 
 	player := &types.Player{
-		ID:             playerID,
-		ViewportWidth:  800, // Default viewport
-		ViewportHeight: 600,
-		JoinTime:       time.Now(),
+		ID:       playerID,
+		JoinTime: time.Now(),
 	}
 
 	player.SetX(spawnX)
@@ -108,7 +140,9 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 	player.SetState(0) // idle state
 	player.SetLastUpdate(time.Now().UnixNano())
 
-	gw.players.Store(playerID, player)
+	gw.playersMu.Lock()
+	gw.playersMap[playerID] = player
+	gw.playersMu.Unlock()
 	gw.visibilityManager.AddPlayer(playerID, spawnX, spawnY)
 	atomic.AddUint32(&gw.playerCountEstimate, 1)
 
@@ -117,7 +151,13 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 
 // RemovePlayer удаляет игрока (lock-free)
 func (gw *GameWorld) RemovePlayer(playerID uint32) {
-	if _, loaded := gw.players.LoadAndDelete(playerID); loaded {
+	gw.playersMu.Lock()
+	_, loaded := gw.playersMap[playerID]
+	if loaded {
+		delete(gw.playersMap, playerID)
+	}
+	gw.playersMu.Unlock()
+	if loaded {
 		gw.visibilityManager.RemovePlayer(playerID)
 		atomic.AddUint32(&gw.playerCountEstimate, ^uint32(0)) // decrement
 		metrics.EventsProcessed.WithLabelValues("disconnect").Inc()
@@ -129,54 +169,39 @@ func (gw *GameWorld) ProcessEvent(event types.GameEvent) {
 	gw.handleEvent(event)
 }
 
-// GetVisiblePlayers возвращает игроков видимых для данного игрока.
-// Использует пространственную сетку — O(ячейки в viewport × плотность) вместо O(N).
-func (gw *GameWorld) GetVisiblePlayers(playerID uint32, viewport types.ViewportBounds) []types.PlayerState {
-	ids := gw.visibilityManager.GetVisibleIDs(viewport)
-	defer gw.visibilityManager.ReleaseIDs(ids)
-
-	visiblePlayers := make([]types.PlayerState, 0, len(ids))
-	for _, id := range ids {
-		if id == playerID {
-			continue
-		}
-		if val, ok := gw.players.Load(id); ok {
-			visiblePlayers = append(visiblePlayers, val.(*types.Player).ToState())
-		}
-	}
-	return visiblePlayers
-}
-
 // GetAllPlayers возвращает всех игроков (для полной синхронизации)
 func (gw *GameWorld) GetAllPlayers() []types.PlayerState {
-	allPlayers := make([]types.PlayerState, 0, gw.GetPlayerCount())
-
-	gw.players.Range(func(key, value interface{}) bool {
-		player := value.(*types.Player)
+	gw.playersMu.RLock()
+	allPlayers := make([]types.PlayerState, 0, len(gw.playersMap))
+	for _, player := range gw.playersMap {
 		allPlayers = append(allPlayers, player.ToState())
-		return true
-	})
-
+	}
+	gw.playersMu.RUnlock()
 	return allPlayers
 }
 
 // GetPlayerCount возвращает количество подключенных игроков
 func (gw *GameWorld) GetPlayerCount() int {
-	count := 0
-	gw.players.Range(func(key, value interface{}) bool {
-		count++
-		return true
-	})
+	gw.playersMu.RLock()
+	count := len(gw.playersMap)
+	gw.playersMu.RUnlock()
 	return count
 }
 
 // gameLoop главный игровой цикл
 func (gw *GameWorld) gameLoop() {
+	// Automatic GC: epoll refactor reduced goroutines from ~2400 to ~70.
+	// STW now takes ~70 × 3µs ≈ 0.2ms — safe to let Go run GC automatically.
+	// Manual runtime.GC() every 5s caused 100ms blocking pauses because
+	// GOGC=-1 allowed memory to accumulate without incremental marking.
+
 	tickInterval := time.Second / time.Duration(gw.cfg.Game.TickRate)
 	gw.ticker = time.NewTicker(tickInterval)
 	defer gw.ticker.Stop()
 
-	slog.Info("game loop started", "interval_ms", tickInterval.Milliseconds(), "tick_rate_hz", gw.cfg.Game.TickRate)
+	slog.Info("game loop started",
+		"interval_ms", tickInterval.Milliseconds(),
+		"tick_rate_hz", gw.cfg.Game.TickRate)
 
 	for {
 		select {
@@ -197,8 +222,8 @@ func (gw *GameWorld) gameLoop() {
 
 // SetTickBroadcaster регистрирует функцию, вызываемую раз в тик со срезом
 // состояний всех игроков. Вызывается из server.New() до первого тика.
-// Функция вызывается синхронно из tick() — broadcastTick делает только
-// 8 non-blocking channel sends, поэтому задержка tick'а минимальна.
+// Функция вызывается синхронно из tick() — broadcastTick делает push() в
+// writeQueue каждого соединения (non-blocking), поэтому задержка tick'а минимальна.
 func (gw *GameWorld) SetTickBroadcaster(fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool)) {
 	gw.broadcastFn.Store(broadcastFuncHolder{fn: fn})
 }
@@ -207,11 +232,12 @@ func (gw *GameWorld) SetTickBroadcaster(fn func(all []types.PlayerState, changed
 // Возвращает (x, y, true) если атака принята, (0, 0, false) если в cooldown.
 // Потокобезопасно: использует атомарный CAS на AttackStartTime.
 func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
-	val, ok := gw.players.Load(playerID)
+	gw.playersMu.RLock()
+	player, ok := gw.playersMap[playerID]
+	gw.playersMu.RUnlock()
 	if !ok {
 		return 0, 0, false
 	}
-	player := val.(*types.Player)
 
 	now := time.Now().UnixNano()
 	cooldown := gw.cfg.Game.AttackDuration.Nanoseconds()
@@ -246,19 +272,54 @@ func (gw *GameWorld) tick() {
 	// Entity interpolation on the client smooths out any position correction.
 	fullSync := gw.tickCount%uint32(gw.cfg.Game.TickRate) == 0
 
-	gw.players.Range(func(key, value interface{}) bool {
-		player := value.(*types.Player)
+	t0 := time.Now()
+	// Snapshot player pointers under a minimal RLock — only protects the map structure.
+	// All Player fields (X, Y, VX, VY, State, ...) are atomic and safe to read/write
+	// without holding the lock. Lock hold time: ~N×8ns (pointer copy) instead of ~N×200ns
+	// (atomic reads + position math), reducing contention with epoll movement writers.
+	gw.scratchPtrs = gw.scratchPtrs[:0]
+	gw.playersMu.RLock()
+	for _, p := range gw.playersMap {
+		gw.scratchPtrs = append(gw.scratchPtrs, p)
+	}
+	gw.playersMu.RUnlock()
 
-		// Server-authoritative attack timeout
-		if player.GetState() == 1 {
-			start := player.GetAttackStartTime()
-			if start > 0 && nowNano-start >= attackDurNano {
-				player.SetState(0)
-				player.SetAttackStartTime(0)
+	// Parallel position update: dispatch chunks to persistent workers (one per CPU).
+	// Workers do attack timeout + updatePlayerPosition (atomic writes to player fields).
+	// IMPORTANT: wg.Add(n) must be called BEFORE sending to channels, otherwise a fast
+	// worker could call wg.Done() before wg.Add(), causing a panic or missed wait.
+	n := gw.nTickWorkers
+	total := len(gw.scratchPtrs)
+	if total > 0 {
+		chunkSize := (total + n - 1) / n
+		activeWorkers := 0
+		for i := range gw.tickWorkerChs {
+			start := i * chunkSize
+			if start >= total {
+				break
+			}
+			activeWorkers++
+		}
+		// Add BEFORE any send — prevents Done() racing ahead of Add().
+		gw.tickWorkerWg.Add(activeWorkers)
+		for i, ch := range gw.tickWorkerChs {
+			start := i * chunkSize
+			if start >= total {
+				break
+			}
+			end := min(start+chunkSize, total)
+			ch <- tickWorkerInput{
+				ptrs:          gw.scratchPtrs[start:end],
+				nowNano:       nowNano,
+				attackDurNano: attackDurNano,
 			}
 		}
+		gw.tickWorkerWg.Wait()
+	}
 
-		gw.updatePlayerPosition(player, nowNano)
+	// Sequential state collection — ToState() is fast (atomic reads only).
+	// No synchronisation needed: only the gameLoop goroutine writes scratchStates.
+	for _, player := range gw.scratchPtrs {
 		st := player.ToState()
 		gw.scratchStates = append(gw.scratchStates, st)
 		gw.scratchSeenIDs[st.ID] = struct{}{}
@@ -272,9 +333,9 @@ func (gw *GameWorld) tick() {
 				gw.scratchChanged = append(gw.scratchChanged, st)
 			}
 		}
-
-		return true
-	})
+	}
+	t1 := time.Now()
+	metrics.TickPhaseDuration.WithLabelValues("range").Observe(t1.Sub(t0).Seconds())
 
 	// Update prevStates: remove departed players, update existing.
 	for id := range gw.prevStates {
@@ -285,19 +346,28 @@ func (gw *GameWorld) tick() {
 	for _, st := range gw.scratchStates {
 		gw.prevStates[st.ID] = st
 	}
+	t2 := time.Now()
+	metrics.TickPhaseDuration.WithLabelValues("delta").Observe(t2.Sub(t1).Seconds())
 
 	if len(gw.scratchStates) == 0 {
 		return
 	}
 
-	// Call broadcastFn synchronously — it does only 8 non-blocking channel sends,
-	// so it returns in microseconds. No allCopy/changedCopy allocations needed:
+	// Call broadcastFn synchronously — it enqueues one push() per connection (non-blocking
+	// lock+append), then returns in microseconds. No allCopy/changedCopy allocations needed:
 	// EncodeGameState serialises scratchStates into bytes before tick() returns.
 	if holder, ok := gw.broadcastFn.Load().(broadcastFuncHolder); ok {
 		var changed []types.PlayerState
 		if !fullSync && len(gw.scratchChanged) > 0 {
 			changed = gw.scratchChanged
 		}
+		// Delta metrics: how many players changed state this tick.
+		changedCount := len(changed)
+		if fullSync {
+			changedCount = len(gw.scratchStates)
+		}
+		metrics.DeltaPlayersCount.Observe(float64(changedCount))
+		metrics.DeltaRatio.Set(float64(changedCount) / float64(len(gw.scratchStates)))
 		holder.fn(gw.scratchStates, changed, fullSync)
 	}
 
@@ -356,17 +426,16 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) {
 	player.SetX(newX)
 	player.SetY(newY)
 	player.SetLastUpdate(nowNano)
-	gw.visibilityManager.MovePlayer(player.ID, newX, newY)
 }
 
 // handleEvent обрабатывает одно событие инлайн (atomic-операции, потокобезопасно)
 func (gw *GameWorld) handleEvent(event types.GameEvent) {
-	playerInterface, exists := gw.players.Load(event.PlayerID)
+	gw.playersMu.RLock()
+	player, exists := gw.playersMap[event.PlayerID]
+	gw.playersMu.RUnlock()
 	if !exists {
 		return // Player no longer exists
 	}
-
-	player := playerInterface.(*types.Player)
 
 	switch event.Type {
 	case types.EventMove:
@@ -406,7 +475,33 @@ func (gw *GameWorld) GetMetrics() types.PerformanceMetrics {
 // Stop останавливает игровой мир
 func (gw *GameWorld) Stop() {
 	close(gw.stopChan)
+	// Close worker channels so runTickWorker goroutines exit cleanly.
+	for _, ch := range gw.tickWorkerChs {
+		close(ch)
+	}
 	slog.Info("gameworld stopped")
+}
+
+// runTickWorker is a persistent goroutine (one per logical CPU) that processes
+// a chunk of players per tick: attack timeout + position update.
+// Only the CPU-heavy atomic operations run here; state snapshot (ToState + delta)
+// stays sequential in the gameLoop goroutine to avoid synchronisation on scratch slices.
+// Pattern sourced from nbio TaskPool and nakama runtime worker pool.
+func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
+	for input := range ch {
+		for _, player := range input.ptrs {
+			// Server-authoritative attack timeout
+			if player.GetState() == 1 {
+				start := player.GetAttackStartTime()
+				if start > 0 && input.nowNano-start >= input.attackDurNano {
+					player.SetState(0)
+					player.SetAttackStartTime(0)
+				}
+			}
+			gw.updatePlayerPosition(player, input.nowNano)
+		}
+		gw.tickWorkerWg.Done()
+	}
 }
 
 // Helper function

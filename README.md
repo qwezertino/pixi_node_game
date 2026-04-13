@@ -11,8 +11,8 @@ A 2D multiplayer browser game. The client is built with TypeScript and Pixi.js; 
 | Client renderer | Pixi.js 8.6+ |
 | Client language | TypeScript 5.7 |
 | Client bundler | Vite 6 / Bun 1.2 |
-| Server language | Go 1.23 |
-| WebSocket library | Gorilla WebSocket 1.5.1 |
+| Server language | Go 1.25 |
+| WebSocket library | gobwas/ws 1.4.0 (raw net.Conn, zero-copy framing) |
 | Metrics | Prometheus (client_golang 1.23.2) |
 | Monitoring | Prometheus + Grafana + Loki + Promtail |
 
@@ -23,7 +23,7 @@ A 2D multiplayer browser game. The client is built with TypeScript and Pixi.js; 
 | Tool | Version |
 |---|---|
 | Bun | 1.2+ |
-| Go | 1.23+ (`/usr/local/go/bin/go`) |
+| Go | 1.25+ (`/usr/local/go/bin/go`) |
 | Docker + Compose | any recent |
 
 ---
@@ -137,6 +137,18 @@ ulimit -n 65536
 | `/metrics` | Prometheus metrics |
 | `/metrics/json` | Legacy JSON metrics |
 | `/debug/pprof/` | Go pprof profiling (block + mutex profilers enabled) |
+
+---
+
+## Server architecture
+
+The Go server is built for minimal goroutine count at scale:
+
+- **Read path**: Linux epoll (`EPOLLONESHOT`) — 1 wait loop + `2×GOMAXPROCS` read workers. No goroutine-per-connection. At 10 000 clients: ~25 read goroutines total.
+- **Write path**: per-connection `writeCh chan writeJob` (buffered 4) with one persistent goroutine per connection (`startWriteLoop`). `writeJob` is a 40-byte value struct — no heap allocation on sends. Goroutines are long-lived, never created per tick.
+- **Game loop**: single `gameLoop` goroutine running at 30 Hz. Position updates are parallelised across `GOMAXPROCS` persistent worker goroutines. Delta tracking sends only changed state each tick; full sync every 1 s.
+- **GC tuning**: `GOGC=400` + `GOMEMLIMIT=2GiB` eliminates mark-assist latency spikes.
+- **Goroutine count at 10 000 clients**: `2×GOMAXPROCS` (epoll readers) + `GOMAXPROCS` (tick workers) + 10 000 (persistent write loops) + a few system goroutines. Write goroutines are long-lived and blocked on channel receive — GC scans stacks but never creates/destroys them during gameplay.
 
 ---
 

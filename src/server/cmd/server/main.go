@@ -26,7 +26,6 @@ func main() {
 		"port", cfg.Server.Port,
 		"tick_rate_hz", cfg.Game.TickRate,
 		"workers", cfg.Server.Workers,
-		"broadcast_workers", cfg.Net.BroadcastWorkers,
 		"max_connections", cfg.Net.MaxConnections,
 	)
 

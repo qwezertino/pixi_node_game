@@ -1,258 +1,300 @@
 package server
 
 import (
-	"context"
 	"log/slog"
-	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/gobwas/ws"
 
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/types"
 )
 
-// directMsg — срочное сообщение конкретному соединению (ACK, join, left).
-// Маршрутизируется через shard.directChan с приоритетом перед broadcast.
-type directMsg struct {
-	connID uint32
-	data   []byte
-}
-
-// shard управляет фиксированным подмножеством соединений.
-// Один shard-воркер пишет ~(total/N) соединениям последовательно —
-// вместо 2400 горутин-connectionSender мы имеем N горутин (N = GOMAXPROCS).
-type shard struct {
-	mu    sync.RWMutex
-	conns map[uint32]*Connection
-
-	// broadcastChan получает PreparedMessage раз в тик.
-	// Буфер 2: если воркер не успел — tick всё равно не блокируется.
-	broadcastChan chan *websocket.PreparedMessage
-
-	// eventChan получает join/left PreparedMessage — редкие события для всех.
-	// Буфер 256: при рампе 20 join/sec и N=8 шардов — ~2.5 event/sec/shard.
-	eventChan chan *websocket.PreparedMessage
-
-	// directChan получает срочные per-connection сообщения (ACK).
-	// Обрабатывается с приоритетом перед broadcast.
-	directChan chan directMsg
-}
-
-func newShard() *shard {
-	return &shard{
-		conns:         make(map[uint32]*Connection),
-		broadcastChan: make(chan *websocket.PreparedMessage, 2),
-		eventChan:     make(chan *websocket.PreparedMessage, 256),
-		directChan:    make(chan directMsg, 4096),
-	}
-}
-
-// add регистрирует соединение в шарде.
-func (sh *shard) add(conn *Connection) {
-	sh.mu.Lock()
-	sh.conns[conn.player.ID] = conn
-	sh.mu.Unlock()
-}
-
-// remove удаляет соединение из шарда.
-func (sh *shard) remove(playerID uint32) {
-	sh.mu.Lock()
-	delete(sh.conns, playerID)
-	sh.mu.Unlock()
-}
-
-// sendDirect отправляет срочное сообщение конкретному соединению.
-// non-blocking: если directChan забит — дропаем с метрикой.
-func (sh *shard) sendDirect(connID uint32, data []byte) {
-	select {
-	case sh.directChan <- directMsg{connID: connID, data: data}:
+// wsFrameSlice fills the 10-byte WS binary frame header into the start of slot
+// and returns the sub-slice [headerStart:] containing header+payload.
+// slot layout: [10 reserved bytes][payload bytes].
+// No allocation: returns a slice into slot's existing backing array.
+func wsFrameSlice(slot []byte) []byte {
+	payloadLen := len(slot) - 10
+	switch {
+	case payloadLen < 126:
+		slot[8] = 0x82 // FIN + binary opcode
+		slot[9] = byte(payloadLen)
+		return slot[8:]
+	case payloadLen <= 65535:
+		slot[6] = 0x82 // FIN + binary opcode
+		slot[7] = 0x7E // extended 16-bit length
+		slot[8] = byte(payloadLen >> 8)
+		slot[9] = byte(payloadLen)
+		return slot[6:]
 	default:
-		metrics.SendChannelDropped.Inc()
+		slot[0] = 0x82 // FIN + binary opcode
+		slot[1] = 0x7F // extended 64-bit length
+		slot[2] = byte(payloadLen >> 56)
+		slot[3] = byte(payloadLen >> 48)
+		slot[4] = byte(payloadLen >> 40)
+		slot[5] = byte(payloadLen >> 32)
+		slot[6] = byte(payloadLen >> 24)
+		slot[7] = byte(payloadLen >> 16)
+		slot[8] = byte(payloadLen >> 8)
+		slot[9] = byte(payloadLen)
+		return slot
 	}
 }
 
-// run — основной цикл воркера шарда.
-// Архитектура приоритетов:
-//  1. Неблокирующий drain directChan — ACK всегда идёт раньше broadcast.
-//  2. Blocking select на broadcastChan | directChan | ping | ctx.
+// tickFrame — reference-counted broadcast frame buffer obtained from broadcastFramePool.
+// broadcastTick fills it once per tick; each shard calls release() after writing its connections.
+// When the last shard releases (refs reaches 0), the buffer returns to the pool.
+// This replaces the ring buffer which had an unsafe data race: shards held slices into the
+// ring slot's backing array while broadcastTick could overwrite it 32 ticks later.
+type tickFrame struct {
+	data  []byte // pre-allocated: [10 WS header prefix bytes][payload bytes]
+	frame []byte // actual WS frame bytes to write: sub-slice of data
+	refs  int32  // atomic countdown; when 0 → return to pool
+}
+
+func (f *tickFrame) release() {
+	if atomic.AddInt32(&f.refs, -1) == 0 {
+		f.data = f.data[:0]
+		f.frame = nil
+		broadcastFramePool.Put(f)
+	}
+}
+
+// broadcastFramePool holds pre-allocated 64 KB tickFrame buffers.
+// After the first few ticks, no allocations occur on the hot broadcast path.
+var broadcastFramePool = sync.Pool{
+	New: func() any {
+		return &tickFrame{data: make([]byte, 0, 65536)}
+	},
+}
+
+// Write timeouts.
+const (
+	// broadcastWriteTimeout — per-connection deadline during mass-write.
+	// 100ms = 3× tick budget (33ms). A goroutine parks via Go netpoller waiting
+	// for TCP window; if the client can't accept data within 100ms it is dead.
+	broadcastWriteTimeout = 100 * time.Millisecond
+
+	// directWriteTimeout — deadline for ACK, pong, initial-state writes.
+	directWriteTimeout = 30 * time.Millisecond
+
+	// maxWriteFailures — consecutive write failures before declaring a connection dead.
+	// At 30 Hz ticks with broadcastWriteTimeout=100ms: 150 × 100ms = 15s of sustained
+	// inability to write before disconnect.
+	maxWriteFailures = 150
+
+	// writeChanSize — per-connection channel buffer depth.
+	// 32 slots × 33ms/tick ≈ 1s of broadcast frames before dropping.
+	// With broadcastWriteTimeout=100ms the write goroutine is busy ≤3 ticks = 3 slots,
+	// so the channel will not fill under normal load.
+	writeChanSize = 32
+)
+
+// writeJob is the value type sent over Connection.writeCh.
+// Using a value type (not a closure) eliminates one heap allocation per broadcast per connection.
 //
-// Запись в websocket.Conn потокобезопасна сама по себе только для одного
-// writer'а — здесь воркер единственный writer для всех своих conn.
-func (sh *shard) run(ctx context.Context) {
-	ping := time.NewTicker(30 * time.Second)
-	defer ping.Stop()
+//   - Broadcast tick:  frame != nil, direct == nil. Write loop writes frame.frame,
+//     then calls frame.release() to decrement the ref-count.
+//   - Direct write:    frame == nil, direct != nil. Write loop writes direct bytes.
+type writeJob struct {
+	frame   *tickFrame // non-nil for broadcast (shared, ref-counted)
+	direct  []byte     // non-nil for ACK / pong / initial-state
+	timeout time.Duration
+}
 
-	writeDeadline := 10 * time.Second
-
-	for {
-		// Priority pass: drain directChan and eventChan before blocking on tick.
+// startWriteLoop starts the persistent write goroutine for conn.
+//
+// Design rationale (vs gws lazy-goroutine / connWriteQueue pattern):
+//
+// The lazy-goroutine pattern spawns a new goroutine each time push() is called on an empty
+// queue and exits when the queue drains. At 30 Hz broadcast with N connections that means
+// N goroutines spawned and destroyed every tick: 36 000 goroutine lifecycle events/s at
+// 1 200 clients. Each spawn allocates a stack; together they cause constant GC mark-assist
+// ("soft pauses") even with GOGC=400, producing 80–112 ms observed GC pauses and 80 ms
+// p99 tick duration.
+//
+// One persistent goroutine per connection eliminates all per-tick goroutine creation and
+// all closure allocations on the broadcast hot path. Channel sends are O(1), ~50 ns, and
+// carry no heap allocation (writeJob is a 40-byte struct passed by copy via the channel).
+//
+// Goroutine count: 1 per connection (same instantaneous peak as the lazy pattern), but
+// long-lived. GC only scans these stacks during STW — it does not create/destroy them.
+func (s *Server) startWriteLoop(c *Connection) {
+	go func() {
 		for {
 			select {
-			case dm := <-sh.directChan:
-				sh.mu.RLock()
-				conn, ok := sh.conns[dm.connID]
-				sh.mu.RUnlock()
-				if ok {
-					conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-					if err := conn.conn.WriteMessage(websocket.BinaryMessage, dm.data); err != nil {
-						metrics.WSWriteErrors.Inc()
-						conn.cancel()
-					} else {
-						metrics.BytesSent.Add(float64(len(dm.data)))
-					}
-				}
-			case pm := <-sh.eventChan:
-				sh.mu.RLock()
-				for _, conn := range sh.conns {
-					conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-					if err := conn.conn.WritePreparedMessage(pm); err != nil {
-						metrics.WSWriteErrors.Inc()
-						conn.cancel()
-					}
-				}
-				sh.mu.RUnlock()
-			default:
-				goto block
-			}
-		}
-
-	block:
-		select {
-		case <-ctx.Done():
-			return
-
-		case pm := <-sh.broadcastChan:
-			// Write PreparedMessage to all connections in this shard under RLock.
-			sh.mu.RLock()
-			for _, conn := range sh.conns {
-				conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-				if err := conn.conn.WritePreparedMessage(pm); err != nil {
-					metrics.WSWriteErrors.Inc()
-					conn.cancel()
-				}
-			}
-			sh.mu.RUnlock()
-
-		case pm := <-sh.eventChan:
-			sh.mu.RLock()
-			for _, conn := range sh.conns {
-				conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-				if err := conn.conn.WritePreparedMessage(pm); err != nil {
-					metrics.WSWriteErrors.Inc()
-					conn.cancel()
-				}
-			}
-			sh.mu.RUnlock()
-
-		case dm := <-sh.directChan:
-			sh.mu.RLock()
-			conn, ok := sh.conns[dm.connID]
-			sh.mu.RUnlock()
-			if ok {
-				conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-				if err := conn.conn.WriteMessage(websocket.BinaryMessage, dm.data); err != nil {
-					metrics.WSWriteErrors.Inc()
-					conn.cancel()
+			case job := <-c.writeCh:
+				var frameBytes []byte
+				if job.frame != nil {
+					frameBytes = job.frame.frame
 				} else {
-					metrics.BytesSent.Add(float64(len(dm.data)))
+					frameBytes = job.direct
 				}
-			}
+				c.rawConn.SetWriteDeadline(time.Now().Add(job.timeout))
+				_, err := c.rawConn.Write(frameBytes)
+				if job.frame != nil {
+					job.frame.release()
+				}
+				if err != nil {
+					metrics.WSWriteErrors.Inc()
+					if atomic.AddInt32(&c.writeFailures, 1) >= maxWriteFailures {
+						go s.cleanupConnection(c)
+						// Drain any tickFrame refs that are already buffered before
+						// exiting. cleanupConnection will drain whatever arrives after
+						// the map removal (see drainWriteCh in cleanupConnection).
+						drainWriteCh(c.writeCh)
+						return
+					}
+				} else {
+					atomic.StoreInt32(&c.writeFailures, 0)
+					metrics.BytesSent.Add(float64(len(frameBytes)))
+				}
 
-		case <-ping.C:
-			sh.mu.RLock()
-			for _, conn := range sh.conns {
-				conn.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-				if err := conn.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					conn.cancel()
-				}
+			case <-c.ctx.Done():
+				// Connection is shutting down. Release any tickFrame refs still buffered
+				// in the channel so they can return to broadcastFramePool.
+				drainWriteCh(c.writeCh)
+				return
 			}
-			sh.mu.RUnlock()
+		}
+	}()
+}
+
+// drainWriteCh releases all tickFrame refs currently buffered in ch and discards
+// direct-write jobs (their frameBytes are owned by the caller, not the pool).
+// Must be called after the write-loop goroutine has decided to exit so that
+// broadcastFramePool can reclaim all ref-counted 64 KB buffers.
+func drainWriteCh(ch chan writeJob) {
+	for {
+		select {
+		case job := <-ch:
+			if job.frame != nil {
+				job.frame.release()
+			}
+		default:
+			return
 		}
 	}
-}
-
-// initShards создаёт N шардов и запускает воркеры.
-// N = GOMAXPROCS (= числу OS-потоков Go runtime).
-func (s *Server) initShards(ctx context.Context) {
-	n := runtime.GOMAXPROCS(0)
-	s.shards = make([]*shard, n)
-	for i := range s.shards {
-		sh := newShard()
-		s.shards[i] = sh
-		go sh.run(ctx)
-	}
-	slog.Info("write shards initialized", "count", n)
-}
-
-// shardFor возвращает шард для данного playerID.
-func (s *Server) shardFor(playerID uint32) *shard {
-	return s.shards[playerID%uint32(len(s.shards))]
 }
 
 // ── Broadcast ─────────────────────────────────────────────────────────────────
 
-// broadcastTick кодирует состояние игроков и кидает PreparedMessage в каждый шард.
-// WS-фрейм строится 1 раз; N шардов (N=GOMAXPROCS) пишут своим ~300 клиентам.
-// Thundering herd: 2400 горутин → N пробуждений.
+// broadcastTick encodes the game state once and fans it out to every connection's
+// writeQueue. Zero-allocation hot path after warm-up (buffer from sync.Pool, ref-counted).
+// Each connection's drain goroutine calls f.release() after writing; when refs→0 the
+// buffer returns to the pool.
 func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.PlayerState, fullSync bool) {
 	if len(allPlayers) == 0 {
 		return
 	}
 
-	var data []byte
+	t0 := time.Now()
+	f := broadcastFramePool.Get().(*tickFrame)
+	f.data = f.data[:0]
+	// Reserve 10 bytes at front for the WS binary frame header (filled by wsFrameSlice below).
+	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 	if fullSync || len(changed) == 0 {
-		data = s.protocol.EncodeGameState(allPlayers)
+		f.data = s.protocol.AppendGameState(f.data, allPlayers)
 	} else {
-		data = s.protocol.EncodeDeltaGameState(changed)
+		f.data = s.protocol.AppendDeltaGameState(f.data, changed)
 	}
+	f.frame = wsFrameSlice(f.data)
+	metrics.TickPhaseDuration.WithLabelValues("encode").Observe(time.Since(t0).Seconds())
 
-	pm, err := websocket.NewPreparedMessage(websocket.BinaryMessage, data)
-	if err != nil {
-		slog.Error("failed to prepare broadcast message", "error", err)
+	t1 := time.Now()
+	// Snapshot connection count and set refs atomically before any send can call release().
+	// RLock prevents additions/removals during the fan-out loop.
+	s.connectionsMu.RLock()
+	n := len(s.connections)
+	if n == 0 {
+		s.connectionsMu.RUnlock()
+		f.data = f.data[:0]
+		f.frame = nil
+		broadcastFramePool.Put(f)
 		return
 	}
-
-	for _, sh := range s.shards {
+	atomic.StoreInt32(&f.refs, int32(n))
+	for _, conn := range s.connections {
+		// Non-blocking send into the connection's persistent write-loop goroutine.
+		// Zero allocation: writeJob is a 40-byte value — no closure, no heap alloc.
 		select {
-		case sh.broadcastChan <- pm:
+		case conn.writeCh <- writeJob{frame: f, timeout: broadcastWriteTimeout}:
 		default:
-			// Shard still busy with previous tick — skip, client will catch up.
-			metrics.SendChannelDropped.Inc()
+			// Channel full: write goroutine is busy with a previous frame (backpressure).
+			// This is NOT a connection error — do not increment writeFailures.
+			// Dead connections are caught by: write timeout (broadcastWriteTimeout ×
+			// maxWriteFailures) and the ping loop (90s inactivity).
+			f.release()
+			metrics.BroadcastsDropped.Inc()
 		}
 	}
+	s.connectionsMu.RUnlock()
+	metrics.TickPhaseDuration.WithLabelValues("shard_send").Observe(time.Since(t1).Seconds())
+}
+
+// broadcastEvent sends a pre-compiled WS frame to every connected client.
+// Used for join/left notifications. push() returns immediately (non-blocking).
+func (s *Server) broadcastEvent(frameBytes []byte) {
+	s.connectionsMu.RLock()
+	for _, conn := range s.connections {
+		select {
+		case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
+		default:
+			metrics.BroadcastsDropped.Inc()
+		}
+	}
+	s.connectionsMu.RUnlock()
 }
 
 // ── Per-connection sends ──────────────────────────────────────────────────────
 
-// sendInitialState отправляет начальное состояние новому клиенту через directChan.
-func (s *Server) sendInitialState(connection *Connection) {
+// sendInitialState sends the full game state to a newly connected client.
+// Uses the broadcast frame pool + wsFrameSlice to avoid intermediate allocations:
+// eliminates the AppendGameState nil-dst alloc and the ws.CompileFrame alloc.
+// Remaining allocs: GetAllPlayers ([]PlayerState) + the final frame copy.
+func (s *Server) sendInitialState(conn *Connection) {
 	allPlayers := s.gameWorld.GetAllPlayers()
-	data := s.protocol.EncodeGameState(allPlayers)
-	s.shardFor(connection.player.ID).sendDirect(connection.player.ID, data)
-}
 
-// sendDirect отправляет raw-сообщение конкретному соединению через его шард.
-func (s *Server) sendDirect(conn *Connection, data []byte) {
-	s.shardFor(conn.player.ID).sendDirect(conn.player.ID, data)
-}
+	// Borrow a pooled 64 KB buffer — same pool used by broadcastTick.
+	f := broadcastFramePool.Get().(*tickFrame)
+	f.data = f.data[:0]
+	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)   // reserve 10-byte WS header
+	f.data = s.protocol.AppendGameState(f.data, allPlayers) // zero-alloc into pool buf
+	frame := wsFrameSlice(f.data)                           // zero-alloc sub-slice
 
-// broadcastEvent отправляет PreparedMessage во все шарды через eventChan.
-// O(N_shards) вместо O(N_connections) — ключевая оптимизация для join/left.
-func (s *Server) broadcastEvent(pm *websocket.PreparedMessage) {
-	for _, sh := range s.shards {
-		select {
-		case sh.eventChan <- pm:
-		default:
-			// eventChan переполнен — крайне маловероятно при cap=256 и 20 join/sec.
-			metrics.SendChannelDropped.Inc()
-		}
+	// Copy frame bytes before returning pool buffer: write loop reads them later.
+	frameBytes := make([]byte, len(frame))
+	copy(frameBytes, frame)
+
+	f.data = f.data[:0]
+	f.frame = nil
+	broadcastFramePool.Put(f)
+
+	select {
+	case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
+	default:
+		metrics.BroadcastsDropped.Inc()
 	}
 }
 
-// notifyPlayerJoined уведомляет всех игроков о новом игроке.
-// Клиент фильтрует собственный join по player ID.
+// sendDirect wraps data in a WS binary frame and enqueues it on conn's writeQueue.
+func (s *Server) sendDirect(conn *Connection, data []byte) {
+	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
+	if err != nil {
+		return
+	}
+	select {
+	case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
+	default:
+		metrics.BroadcastsDropped.Inc()
+	}
+}
+
+// notifyPlayerJoined notifies all clients that a new player has joined.
+// The client filters its own join by player ID.
 func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
 	playerState := types.PlayerState{
 		ID:          newPlayer.ID,
@@ -261,21 +303,53 @@ func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
 		FacingRight: true,
 	}
 	data := s.protocol.EncodePlayerJoined(playerState)
-	pm, err := websocket.NewPreparedMessage(websocket.BinaryMessage, data)
+	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
 	if err != nil {
-		slog.Error("failed to prepare player joined message", "error", err)
+		slog.Error("failed to compile player joined frame", "error", err)
 		return
 	}
-	s.broadcastEvent(pm)
+	s.broadcastEvent(frameBytes)
 }
 
-// notifyPlayerLeft уведомляет всех игроков об отключении.
+// notifyPlayerLeft notifies all clients that a player has disconnected.
 func (s *Server) notifyPlayerLeft(leftPlayerID uint32) {
 	data := s.protocol.EncodePlayerLeft(leftPlayerID)
-	pm, err := websocket.NewPreparedMessage(websocket.BinaryMessage, data)
+	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
 	if err != nil {
-		slog.Error("failed to prepare player left message", "error", err)
+		slog.Error("failed to compile player left frame", "error", err)
 		return
 	}
-	s.broadcastEvent(pm)
+	s.broadcastEvent(frameBytes)
+}
+
+// runPingLoop periodically checks for stale connections and sends WS pings.
+// Replaces the per-shard ping ticker. Runs for the lifetime of the server context.
+func (s *Server) runPingLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	pingFrame, _ := ws.CompileFrame(ws.NewPingFrame(nil))
+
+	for {
+		select {
+		case <-ticker.C:
+			cutoff := time.Now().Add(-90 * time.Second).UnixNano()
+			s.connectionsMu.RLock()
+			for _, conn := range s.connections {
+				if atomic.LoadInt64(&conn.lastActivity) < cutoff {
+					// No pong within two ping intervals — treat as dead.
+					go s.cleanupConnection(conn)
+					continue
+				}
+				select {
+				case conn.writeCh <- writeJob{direct: pingFrame, timeout: directWriteTimeout}:
+				default:
+				}
+			}
+			s.connectionsMu.RUnlock()
+
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
