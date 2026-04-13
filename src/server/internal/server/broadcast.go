@@ -3,6 +3,7 @@ package server
 import (
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,6 +80,18 @@ var connectionSlicePool = sync.Pool{
 	},
 }
 
+type scoredConnection struct {
+	conn  *Connection
+	score int64
+}
+
+var scoredConnectionPool = sync.Pool{
+	New: func() any {
+		s := make([]scoredConnection, 0, 4096)
+		return &s
+	},
+}
+
 // Write timeouts.
 const (
 	// broadcastWriteTimeout — per-connection deadline during mass-write.
@@ -117,10 +130,11 @@ type writeJob struct {
 }
 
 type fanoutJob struct {
-	conns   []*Connection
-	frame   *tickFrame
-	dropped *int64
-	wg      *sync.WaitGroup
+	conns    []*Connection
+	frame    *tickFrame
+	sentAtNs int64
+	dropped  *int64
+	wg       *sync.WaitGroup
 }
 
 func (s *Server) initFanoutWorkers() {
@@ -148,7 +162,7 @@ func (s *Server) runFanoutWorker() {
 		case job := <-s.fanoutJobs:
 			localDropped := 0
 			for _, conn := range job.conns {
-				if !s.enqueueBroadcastJob(conn, job.frame) {
+				if !s.enqueueBroadcastJob(conn, job.frame, job.sentAtNs) {
 					localDropped++
 				}
 			}
@@ -160,9 +174,10 @@ func (s *Server) runFanoutWorker() {
 	}
 }
 
-func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame) bool {
+func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtNs int64) bool {
 	select {
 	case conn.writeCh <- writeJob{frame: frame, timeout: broadcastWriteTimeout}:
+		atomic.StoreInt64(&conn.lastWorldStateSentNs, sentAtNs)
 		if atomic.LoadInt32(&conn.fanoutDrops) != 0 {
 			atomic.StoreInt32(&conn.fanoutDrops, 0)
 		}
@@ -291,6 +306,154 @@ func drainWriteCh(ch chan writeJob) {
 	}
 }
 
+func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connection, int) {
+	n := len(conns)
+	if n == 0 {
+		return conns[:0], 0
+	}
+
+	limit := n
+	if s.fanoutMaxRecipients > 0 {
+		curr := int(atomic.LoadInt64(&s.fanoutRecipientLimit))
+		if curr < s.fanoutMinRecipients {
+			curr = s.fanoutMinRecipients
+		}
+		if curr > s.fanoutMaxRecipients {
+			curr = s.fanoutMaxRecipients
+		}
+		if curr < limit {
+			limit = curr
+		}
+	}
+
+	selected := conns[:0]
+	activeWindowNs := s.activeWindowNs
+	activeStalenessNs := s.activeStalenessNs
+	idleStalenessNs := s.idleStalenessNs
+	if idleStalenessNs < activeStalenessNs {
+		idleStalenessNs = activeStalenessNs
+	}
+
+	candBuf := scoredConnectionPool.Get().(*[]scoredConnection)
+	candidates := (*candBuf)[:0]
+
+	overdue := 0
+	for _, conn := range conns {
+		stalenessNs := nowNs - atomic.LoadInt64(&conn.lastWorldStateSentNs)
+		if stalenessNs < 0 {
+			stalenessNs = 0
+		}
+
+		idleForNs := nowNs - atomic.LoadInt64(&conn.lastActivity)
+		deadlineNs := idleStalenessNs
+		active := idleForNs <= activeWindowNs
+		if active {
+			deadlineNs = activeStalenessNs
+		}
+
+		if stalenessNs >= deadlineNs {
+			selected = append(selected, conn)
+			overdue++
+			continue
+		}
+
+		score := stalenessNs
+		if active {
+			score += deadlineNs / 2
+		}
+		drops := int64(atomic.LoadInt32(&conn.fanoutDrops))
+		if drops > 0 {
+			penalty := drops * (deadlineNs / 8)
+			if penalty > score/2 {
+				penalty = score / 2
+			}
+			score -= penalty
+		}
+
+		candidates = append(candidates, scoredConnection{conn: conn, score: score})
+	}
+
+	if len(selected) < limit && len(candidates) > 0 {
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].score > candidates[j].score
+		})
+		need := limit - len(selected)
+		if need > len(candidates) {
+			need = len(candidates)
+		}
+		for i := 0; i < need; i++ {
+			selected = append(selected, candidates[i].conn)
+		}
+	}
+
+	for i := range candidates {
+		candidates[i] = scoredConnection{}
+	}
+	*candBuf = candidates[:0]
+	scoredConnectionPool.Put(candBuf)
+
+	return selected, overdue
+}
+
+func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanoutDur time.Duration) {
+	if s.fanoutMaxRecipients <= 0 {
+		return
+	}
+
+	curr := int(atomic.LoadInt64(&s.fanoutRecipientLimit))
+	if curr < s.fanoutMinRecipients {
+		curr = s.fanoutMinRecipients
+	}
+	next := curr
+
+	if overdue > next {
+		next = overdue
+	}
+
+	if dropped > 0 || fanoutDur > s.fanoutTarget*3/2 {
+		next = int(float64(next) * 0.9)
+	} else if fanoutDur > s.fanoutTarget {
+		next = int(float64(next) * 0.95)
+	} else if fanoutDur < s.fanoutTarget/2 && selected >= curr*9/10 {
+		next = int(float64(next) * 1.05)
+		if next == curr {
+			next++
+		}
+	}
+
+	if next < s.fanoutMinRecipients {
+		next = s.fanoutMinRecipients
+	}
+	if next > s.fanoutMaxRecipients {
+		next = s.fanoutMaxRecipients
+	}
+	if next > total {
+		next = total
+	}
+	if next < s.fanoutMinRecipients && total >= s.fanoutMinRecipients {
+		next = s.fanoutMinRecipients
+	}
+
+	if next != curr {
+		atomic.StoreInt64(&s.fanoutRecipientLimit, int64(next))
+		metrics.FanoutRecipientLimit.Set(float64(next))
+
+		nowNano := time.Now().UnixNano()
+		prev := atomic.LoadInt64(&s.lastFanoutTuneLog)
+		if nowNano-prev >= int64(5*time.Second) &&
+			atomic.CompareAndSwapInt64(&s.lastFanoutTuneLog, prev, nowNano) {
+			slog.Info("fanout recipient limit updated",
+				"from", curr,
+				"to", next,
+				"selected", selected,
+				"overdue", overdue,
+				"fanout_ms", fanoutDur.Milliseconds(),
+				"target_ms", s.fanoutTarget.Milliseconds(),
+				"dropped_jobs", dropped)
+		}
+	}
+}
+
 // ── Broadcast ─────────────────────────────────────────────────────────────────
 
 // broadcastTick encodes the game state once and fans it out to every connection's
@@ -334,6 +497,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.TickPhaseDuration.WithLabelValues("encode").Observe(time.Since(t0).Seconds())
 
 	t1 := time.Now()
+	sentAtNs := t1.UnixNano()
 	// Snapshot connections under RLock, then release the lock before fanout.
 	// This avoids holding the map lock while enqueueing O(N) jobs.
 	s.connectionsMu.RLock()
@@ -354,32 +518,55 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		conns = append(conns, conn)
 	}
 	metrics.BroadcastTargets.Observe(float64(n))
-	atomic.StoreInt32(&f.refs, int32(n))
 	s.connectionsMu.RUnlock()
 
+	recipients, overdue := s.selectRecipients(conns, sentAtNs)
+	m := len(recipients)
+	if m == 0 {
+		for i := range conns {
+			conns[i] = nil
+		}
+		*buf = conns[:0]
+		connectionSlicePool.Put(buf)
+
+		f.data = f.data[:0]
+		f.frame = nil
+		broadcastFramePool.Put(f)
+		return
+	}
+
+	metrics.BroadcastRecipients.Observe(float64(m))
+	metrics.BroadcastOverdueRecipients.Observe(float64(overdue))
+	if deferred := n - m; deferred > 0 {
+		metrics.BroadcastDeferred.Add(float64(deferred))
+	}
+
+	atomic.StoreInt32(&f.refs, int32(m))
+
 	dropped := 0
-	if s.fanoutWorkers <= 1 || n < s.fanoutWorkers*64 {
-		for _, conn := range conns {
-			if !s.enqueueBroadcastJob(conn, f) {
+	if s.fanoutWorkers <= 1 || m < s.fanoutWorkers*64 {
+		for _, conn := range recipients {
+			if !s.enqueueBroadcastJob(conn, f, sentAtNs) {
 				dropped++
 			}
 		}
 	} else {
-		chunkSize := (n + s.fanoutWorkers - 1) / s.fanoutWorkers
+		chunkSize := (m + s.fanoutWorkers - 1) / s.fanoutWorkers
 		var wg sync.WaitGroup
 		var droppedAtomic int64
 
-		for start := 0; start < n; start += chunkSize {
+		for start := 0; start < m; start += chunkSize {
 			end := start + chunkSize
-			if end > n {
-				end = n
+			if end > m {
+				end = m
 			}
 			wg.Add(1)
 			s.fanoutJobs <- fanoutJob{
-				conns:   conns[start:end],
-				frame:   f,
-				dropped: &droppedAtomic,
-				wg:      &wg,
+				conns:    recipients[start:end],
+				frame:    f,
+				sentAtNs: sentAtNs,
+				dropped:  &droppedAtomic,
+				wg:       &wg,
 			}
 		}
 		wg.Wait()
@@ -395,6 +582,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	fanoutDur := time.Since(t1)
 	metrics.TickPhaseDuration.WithLabelValues("fanout_send").Observe(fanoutDur.Seconds())
 	metrics.TickFanoutDuration.Observe(fanoutDur.Seconds())
+	s.tuneRecipientLimit(n, m, overdue, dropped, fanoutDur)
 
 	if base := s.cfg.Game.BatchInterval; base > 0 {
 		curr := time.Duration(atomic.LoadInt64(&s.adaptiveBatchNs))
@@ -498,6 +686,7 @@ func (s *Server) sendInitialState(conn *Connection) {
 
 	select {
 	case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
+		atomic.StoreInt64(&conn.lastWorldStateSentNs, time.Now().UnixNano())
 	default:
 		metrics.BroadcastsDropped.Inc()
 	}

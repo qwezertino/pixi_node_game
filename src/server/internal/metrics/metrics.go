@@ -100,6 +100,28 @@ var (
 		Buckets: []float64{1, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000},
 	})
 
+	BroadcastRecipients = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_broadcast_recipients",
+		Help:    "Number of recipients selected for world-state broadcast in each tick",
+		Buckets: []float64{1, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000},
+	})
+
+	BroadcastOverdueRecipients = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_broadcast_overdue_recipients",
+		Help:    "Number of recipients selected due to staleness deadline in each tick",
+		Buckets: []float64{0, 1, 10, 50, 100, 250, 500, 1000, 2000, 5000},
+	})
+
+	BroadcastDeferred = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_broadcast_deferred_total",
+		Help: "Total number of connections deferred to future ticks by recipient scheduler",
+	})
+
+	FanoutRecipientLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "game_fanout_recipient_limit",
+		Help: "Current adaptive recipient limit for world-state fanout per tick (0 means unlimited)",
+	})
+
 	// ── WebSocket errors ──────────────────────────────────────────────────────
 	WSUpgradeErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_ws_upgrade_errors_total",

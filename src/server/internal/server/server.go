@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gobwas/ws"
@@ -55,6 +56,16 @@ type Server struct {
 	fanoutDropLimit int32
 	writeBatchSize  int
 
+	// Adaptive recipient fanout scheduling
+	fanoutMinRecipients  int
+	fanoutMaxRecipients  int
+	fanoutTarget         time.Duration
+	fanoutRecipientLimit int64 // atomic
+	activeStalenessNs    int64
+	idleStalenessNs      int64
+	activeWindowNs       int64
+	lastFanoutTuneLog    int64 // atomic UnixNano timestamp
+
 	// Performance monitoring
 	startTime time.Time
 }
@@ -68,17 +79,18 @@ type Server struct {
 //
 // Lifecycle: cleanupConnection is guaranteed to run exactly once via closeOnce.
 type Connection struct {
-	player        *types.Player
-	rawConn       net.Conn
-	fd            int // OS file descriptor (used by epoll remove)
-	rateLimiter   *rate.Limiter
-	writeCh       chan writeJob // buffered channel drained by startWriteLoop goroutine
-	closeOnce     sync.Once     // ensures cleanupConnection body runs once
-	lastActivity  int64         // UnixNano, updated on each received frame (atomic)
-	writeFailures int32         // consecutive write timeouts/errors (atomic); reset on success
-	fanoutDrops   int32         // consecutive dropped broadcast enqueues (atomic)
-	ctx           context.Context
-	cancel        context.CancelFunc
+	player               *types.Player
+	rawConn              net.Conn
+	fd                   int // OS file descriptor (used by epoll remove)
+	rateLimiter          *rate.Limiter
+	writeCh              chan writeJob // buffered channel drained by startWriteLoop goroutine
+	closeOnce            sync.Once     // ensures cleanupConnection body runs once
+	lastActivity         int64         // UnixNano, updated on each received frame (atomic)
+	writeFailures        int32         // consecutive write timeouts/errors (atomic); reset on success
+	fanoutDrops          int32         // consecutive dropped broadcast enqueues (atomic)
+	lastWorldStateSentNs int64         // UnixNano timestamp of last successfully enqueued world-state frame
+	ctx                  context.Context
+	cancel               context.CancelFunc
 }
 
 // New создает новый сервер
@@ -112,6 +124,37 @@ func New(cfg *config.Config) *Server {
 	server.writeBatchSize = cfg.Net.WriteBatchSize
 	if server.writeBatchSize < 1 {
 		server.writeBatchSize = 1
+	}
+
+	server.fanoutMinRecipients = cfg.Net.FanoutMinRecipientsPerTick
+	if server.fanoutMinRecipients < 1 {
+		server.fanoutMinRecipients = 1
+	}
+	server.fanoutMaxRecipients = cfg.Net.FanoutMaxRecipientsPerTick
+	if server.fanoutMaxRecipients > 0 && server.fanoutMinRecipients > server.fanoutMaxRecipients {
+		server.fanoutMinRecipients = server.fanoutMaxRecipients
+	}
+	server.fanoutTarget = time.Duration(cfg.Net.FanoutTargetMs) * time.Millisecond
+	if server.fanoutTarget <= 0 {
+		server.fanoutTarget = 12 * time.Millisecond
+	}
+	server.activeStalenessNs = cfg.Net.WorldStateActiveStaleness.Nanoseconds()
+	if server.activeStalenessNs <= 0 {
+		server.activeStalenessNs = (150 * time.Millisecond).Nanoseconds()
+	}
+	server.idleStalenessNs = cfg.Net.WorldStateIdleStaleness.Nanoseconds()
+	if server.idleStalenessNs < server.activeStalenessNs {
+		server.idleStalenessNs = server.activeStalenessNs
+	}
+	server.activeWindowNs = cfg.Net.WorldStateActiveWindow.Nanoseconds()
+	if server.activeWindowNs <= 0 {
+		server.activeWindowNs = (1 * time.Second).Nanoseconds()
+	}
+	if server.fanoutMaxRecipients > 0 {
+		atomic.StoreInt64(&server.fanoutRecipientLimit, int64(server.fanoutMaxRecipients))
+		metrics.FanoutRecipientLimit.Set(float64(server.fanoutMaxRecipients))
+	} else {
+		metrics.FanoutRecipientLimit.Set(0)
 	}
 
 	server.initFanoutWorkers()
@@ -260,9 +303,10 @@ func (s *Server) createConnection(player *types.Player, rawConn net.Conn) *Conne
 			rate.Limit(s.cfg.Net.MessageRateLimit),
 			s.cfg.Net.BurstLimit,
 		),
-		lastActivity: time.Now().UnixNano(),
-		ctx:          ctx,
-		cancel:       cancel,
+		lastActivity:         time.Now().UnixNano(),
+		lastWorldStateSentNs: time.Now().UnixNano(),
+		ctx:                  ctx,
+		cancel:               cancel,
 	}
 	s.startWriteLoop(conn)
 	return conn
