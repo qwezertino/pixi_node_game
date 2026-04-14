@@ -49,6 +49,7 @@ type NetworkConfig struct {
 	IPConnRate                 float64 // connections/sec per IP; 0 = disabled
 	IPConnBurst                int
 	FanoutWorkers              int
+	FanoutQueueShedDepth       int
 	FanoutDropStreak           int
 	WriteBatchSize             int
 	FanoutMinRecipientsPerTick int
@@ -152,6 +153,7 @@ func Load() *Config {
 			IPConnRate:                 getEnvFloat("IP_CONN_RATE", 10.0),
 			IPConnBurst:                getEnvInt("IP_CONN_BURST", 20),
 			FanoutWorkers:              getEnvInt("FANOUT_WORKERS", 0),
+			FanoutQueueShedDepth:       getEnvInt("FANOUT_QUEUE_SHED_DEPTH", 6),
 			FanoutDropStreak:           getEnvInt("FANOUT_DROP_STREAK", 120),
 			WriteBatchSize:             getEnvInt("WRITE_BATCH_SIZE", 8),
 			FanoutMinRecipientsPerTick: getEnvInt("FANOUT_MIN_RECIPIENTS_PER_TICK", 256),

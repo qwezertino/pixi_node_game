@@ -51,10 +51,11 @@ type Server struct {
 	lastBroadcastNs int64 // atomic
 
 	// Parallel fanout enqueue workers
-	fanoutWorkers   int
-	fanoutJobs      chan fanoutJob
-	fanoutDropLimit int32
-	writeBatchSize  int
+	fanoutWorkers        int
+	fanoutJobs           chan fanoutJob
+	fanoutDropLimit      int32
+	writeBatchSize       int
+	fanoutQueueShedDepth int
 
 	// Adaptive recipient fanout scheduling
 	fanoutMinRecipients  int
@@ -125,6 +126,10 @@ func New(cfg *config.Config) *Server {
 	server.writeBatchSize = cfg.Net.WriteBatchSize
 	if server.writeBatchSize < 1 {
 		server.writeBatchSize = 1
+	}
+	server.fanoutQueueShedDepth = cfg.Net.FanoutQueueShedDepth
+	if server.fanoutQueueShedDepth < 1 {
+		server.fanoutQueueShedDepth = 0
 	}
 
 	server.fanoutMinRecipients = cfg.Net.FanoutMinRecipientsPerTick

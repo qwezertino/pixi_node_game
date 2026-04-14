@@ -187,10 +187,22 @@ func (s *Server) runFanoutWorker() {
 }
 
 func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtNs int64) bool {
+	if s.fanoutQueueShedDepth > 0 {
+		depth := len(conn.writeCh)
+		metrics.WSWriteQueueDepth.Observe(float64(depth))
+		if depth >= s.fanoutQueueShedDepth {
+			// Queue-aware shedding: skip stale world-state for overloaded clients.
+			frame.release()
+			metrics.BroadcastsShed.Inc()
+			return false
+		}
+	}
+
 	if !atomic.CompareAndSwapInt32(&conn.pendingBroadcast, 0, 1) {
 		// Keep latest-state semantics: if one world-state frame is already queued/in-flight,
 		// skip enqueuing older snapshots for this connection.
 		frame.release()
+		metrics.BroadcastsShed.Inc()
 		return true
 	}
 

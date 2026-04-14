@@ -83,6 +83,11 @@ var (
 		Help: "Total broadcast messages dropped (send channel full)",
 	})
 
+	BroadcastsShed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_broadcasts_shed_total",
+		Help: "Total world-state broadcasts skipped by queue-aware fanout shedding",
+	})
+
 	BytesSent = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_bytes_sent_total",
 		Help: "Total bytes sent to clients",
@@ -189,6 +194,12 @@ var (
 		Name:    "game_ws_write_batch_jobs",
 		Help:    "Number of queued write jobs coalesced into one socket write call",
 		Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+	})
+
+	WSWriteQueueDepth = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_ws_write_queue_depth",
+		Help:    "Observed per-connection write queue depth during world-state enqueue",
+		Buckets: []float64{0, 1, 2, 4, 6, 8, 12, 16, 24, 32},
 	})
 
 	AdaptiveBatchIntervalMs = promauto.NewGauge(prometheus.GaugeOpts{
