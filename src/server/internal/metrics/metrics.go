@@ -122,6 +122,22 @@ var (
 		Help: "Total number of connections deferred to future ticks by recipient scheduler",
 	})
 
+	BroadcastBudgetTrimmed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_broadcast_budget_trimmed_total",
+		Help: "Total number of recipients deferred due to fanout byte budget limits",
+	})
+
+	BroadcastBudgetHits = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_broadcast_budget_hits_total",
+		Help: "Total number of ticks where fanout byte budget limited recipient count",
+	})
+
+	BroadcastBudgetRecipients = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_broadcast_budget_recipients",
+		Help:    "Effective recipient cap imposed by fanout byte budget in each tick",
+		Buckets: []float64{1, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000},
+	})
+
 	FanoutRecipientLimit = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_fanout_recipient_limit",
 		Help: "Current adaptive recipient limit for world-state fanout per tick (0 means unlimited)",

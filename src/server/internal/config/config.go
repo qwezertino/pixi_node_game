@@ -43,21 +43,29 @@ type WorldConfig struct {
 }
 
 type NetworkConfig struct {
-	MaxConnections             int
-	MessageRateLimit           int
-	BurstLimit                 int
-	IPConnRate                 float64 // connections/sec per IP; 0 = disabled
-	IPConnBurst                int
-	FanoutWorkers              int
-	FanoutQueueShedDepth       int
-	FanoutDropStreak           int
-	WriteBatchSize             int
-	FanoutMinRecipientsPerTick int
-	FanoutMaxRecipientsPerTick int // 0 = unlimited (all connections)
-	FanoutTargetMs             int
-	WorldStateActiveStaleness  time.Duration
-	WorldStateIdleStaleness    time.Duration
-	WorldStateActiveWindow     time.Duration
+	MaxConnections                 int
+	MessageRateLimit               int
+	BurstLimit                     int
+	IPConnRate                     float64 // connections/sec per IP; 0 = disabled
+	IPConnBurst                    int
+	FanoutWorkers                  int
+	FanoutMaxBroadcastBytesPerTick int // 0 = unlimited
+	FanoutQueueShedDepth           int
+	FanoutDropStreak               int
+	WriteBatchSize                 int
+	FanoutFairDebtMax              int
+	FanoutFairDebtInc              int
+	FanoutFairDebtDec              int
+	FanoutFairDebtWeightNs         int64
+	FanoutRoundRobinWeightNs       int64
+	FanoutCriticalWindow           time.Duration
+	FanoutCriticalBoostNs          int64
+	FanoutMinRecipientsPerTick     int
+	FanoutMaxRecipientsPerTick     int // 0 = unlimited (all connections)
+	FanoutTargetMs                 int
+	WorldStateActiveStaleness      time.Duration
+	WorldStateIdleStaleness        time.Duration
+	WorldStateActiveWindow         time.Duration
 }
 
 // JSONConfig mirrors the structure of gameConfig.json (shared with the TypeScript client).
@@ -147,21 +155,29 @@ func Load() *Config {
 		// ── Network infrastructure ────────────────────────────────────────────
 		// All configurable via .env; hardcoded values are production-tested defaults.
 		Net: NetworkConfig{
-			MaxConnections:             getEnvInt("MAX_CONNECTIONS", 12000),
-			MessageRateLimit:           getEnvInt("RATE_LIMIT_MSG_SEC", 120),
-			BurstLimit:                 getEnvInt("RATE_LIMIT_BURST", 20),
-			IPConnRate:                 getEnvFloat("IP_CONN_RATE", 10.0),
-			IPConnBurst:                getEnvInt("IP_CONN_BURST", 20),
-			FanoutWorkers:              getEnvInt("FANOUT_WORKERS", 0),
-			FanoutQueueShedDepth:       getEnvInt("FANOUT_QUEUE_SHED_DEPTH", 6),
-			FanoutDropStreak:           getEnvInt("FANOUT_DROP_STREAK", 120),
-			WriteBatchSize:             getEnvInt("WRITE_BATCH_SIZE", 8),
-			FanoutMinRecipientsPerTick: getEnvInt("FANOUT_MIN_RECIPIENTS_PER_TICK", 256),
-			FanoutMaxRecipientsPerTick: getEnvInt("FANOUT_MAX_RECIPIENTS_PER_TICK", 0),
-			FanoutTargetMs:             getEnvInt("FANOUT_TARGET_MS", 12),
-			WorldStateActiveStaleness:  time.Duration(getEnvInt("WORLD_STATE_ACTIVE_STALENESS_MS", 150)) * time.Millisecond,
-			WorldStateIdleStaleness:    time.Duration(getEnvInt("WORLD_STATE_IDLE_STALENESS_MS", 350)) * time.Millisecond,
-			WorldStateActiveWindow:     time.Duration(getEnvInt("WORLD_STATE_ACTIVE_WINDOW_MS", 1000)) * time.Millisecond,
+			MaxConnections:                 getEnvInt("MAX_CONNECTIONS", 12000),
+			MessageRateLimit:               getEnvInt("RATE_LIMIT_MSG_SEC", 120),
+			BurstLimit:                     getEnvInt("RATE_LIMIT_BURST", 20),
+			IPConnRate:                     getEnvFloat("IP_CONN_RATE", 10.0),
+			IPConnBurst:                    getEnvInt("IP_CONN_BURST", 20),
+			FanoutWorkers:                  getEnvInt("FANOUT_WORKERS", 0),
+			FanoutMaxBroadcastBytesPerTick: getEnvInt("FANOUT_MAX_BROADCAST_BYTES_PER_TICK", 0),
+			FanoutQueueShedDepth:           getEnvInt("FANOUT_QUEUE_SHED_DEPTH", 6),
+			FanoutDropStreak:               getEnvInt("FANOUT_DROP_STREAK", 120),
+			WriteBatchSize:                 getEnvInt("WRITE_BATCH_SIZE", 8),
+			FanoutFairDebtMax:              getEnvInt("FANOUT_FAIR_DEBT_MAX", 12),
+			FanoutFairDebtInc:              getEnvInt("FANOUT_FAIR_DEBT_INC", 1),
+			FanoutFairDebtDec:              getEnvInt("FANOUT_FAIR_DEBT_DEC", 2),
+			FanoutFairDebtWeightNs:         int64(getEnvInt("FANOUT_FAIR_DEBT_WEIGHT_NS", 250000)),
+			FanoutRoundRobinWeightNs:       int64(getEnvInt("FANOUT_ROUND_ROBIN_WEIGHT_NS", 150000)),
+			FanoutCriticalWindow:           time.Duration(getEnvInt("FANOUT_CRITICAL_WINDOW_MS", 400)) * time.Millisecond,
+			FanoutCriticalBoostNs:          int64(getEnvInt("FANOUT_CRITICAL_BOOST_NS", 3000000)),
+			FanoutMinRecipientsPerTick:     getEnvInt("FANOUT_MIN_RECIPIENTS_PER_TICK", 256),
+			FanoutMaxRecipientsPerTick:     getEnvInt("FANOUT_MAX_RECIPIENTS_PER_TICK", 0),
+			FanoutTargetMs:                 getEnvInt("FANOUT_TARGET_MS", 12),
+			WorldStateActiveStaleness:      time.Duration(getEnvInt("WORLD_STATE_ACTIVE_STALENESS_MS", 150)) * time.Millisecond,
+			WorldStateIdleStaleness:        time.Duration(getEnvInt("WORLD_STATE_IDLE_STALENESS_MS", 350)) * time.Millisecond,
+			WorldStateActiveWindow:         time.Duration(getEnvInt("WORLD_STATE_ACTIVE_WINDOW_MS", 1000)) * time.Millisecond,
 		},
 	}
 }

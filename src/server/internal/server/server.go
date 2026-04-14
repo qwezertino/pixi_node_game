@@ -51,11 +51,21 @@ type Server struct {
 	lastBroadcastNs int64 // atomic
 
 	// Parallel fanout enqueue workers
-	fanoutWorkers        int
-	fanoutJobs           chan fanoutJob
-	fanoutDropLimit      int32
-	writeBatchSize       int
-	fanoutQueueShedDepth int
+	fanoutWorkers                  int
+	fanoutJobs                     chan fanoutJob
+	fanoutDropLimit                int32
+	writeBatchSize                 int
+	fanoutMaxBroadcastBytesPerTick int
+	fanoutQueueShedDepth           int
+	fanoutFairDebtMax              int32
+	fanoutFairDebtInc              int32
+	fanoutFairDebtDec              int32
+	fanoutFairDebtWeightNs         int64
+	fanoutRoundRobinWeightNs       int64
+	fanoutCriticalWindowNs         int64
+	fanoutCriticalBoostNs          int64
+	fanoutRoundRobinEpoch          int64 // atomic cursor for tie-breaking fairness
+	fanoutDebtEpoch                uint32
 
 	// Adaptive recipient fanout scheduling
 	fanoutMinRecipients  int
@@ -89,8 +99,11 @@ type Connection struct {
 	lastActivity         int64         // UnixNano, updated on each received frame (atomic)
 	writeFailures        int32         // consecutive write timeouts/errors (atomic); reset on success
 	fanoutDrops          int32         // consecutive dropped broadcast enqueues (atomic)
+	fanoutFairDebt       int32         // anti-starvation debt for recipient selection fairness (atomic)
+	fanoutDebtEpoch      uint32        // marks whether conn was selected in the current fairness epoch
 	pendingBroadcast     int32         // 0/1: whether a world-state broadcast job is already queued/in-flight
 	lastWorldStateSentNs int64         // UnixNano timestamp of last successfully enqueued world-state frame
+	criticalUntilNs      int64         // UnixNano until which this client receives criticality boost
 	ctx                  context.Context
 	cancel               context.CancelFunc
 }
@@ -127,9 +140,41 @@ func New(cfg *config.Config) *Server {
 	if server.writeBatchSize < 1 {
 		server.writeBatchSize = 1
 	}
+	server.fanoutMaxBroadcastBytesPerTick = cfg.Net.FanoutMaxBroadcastBytesPerTick
+	if server.fanoutMaxBroadcastBytesPerTick < 0 {
+		server.fanoutMaxBroadcastBytesPerTick = 0
+	}
 	server.fanoutQueueShedDepth = cfg.Net.FanoutQueueShedDepth
 	if server.fanoutQueueShedDepth < 1 {
 		server.fanoutQueueShedDepth = 0
+	}
+	server.fanoutFairDebtMax = int32(cfg.Net.FanoutFairDebtMax)
+	if server.fanoutFairDebtMax < 0 {
+		server.fanoutFairDebtMax = 0
+	}
+	server.fanoutFairDebtInc = int32(cfg.Net.FanoutFairDebtInc)
+	if server.fanoutFairDebtInc < 0 {
+		server.fanoutFairDebtInc = 0
+	}
+	server.fanoutFairDebtDec = int32(cfg.Net.FanoutFairDebtDec)
+	if server.fanoutFairDebtDec < 0 {
+		server.fanoutFairDebtDec = 0
+	}
+	server.fanoutFairDebtWeightNs = cfg.Net.FanoutFairDebtWeightNs
+	if server.fanoutFairDebtWeightNs < 0 {
+		server.fanoutFairDebtWeightNs = 0
+	}
+	server.fanoutRoundRobinWeightNs = cfg.Net.FanoutRoundRobinWeightNs
+	if server.fanoutRoundRobinWeightNs < 0 {
+		server.fanoutRoundRobinWeightNs = 0
+	}
+	server.fanoutCriticalWindowNs = cfg.Net.FanoutCriticalWindow.Nanoseconds()
+	if server.fanoutCriticalWindowNs < 0 {
+		server.fanoutCriticalWindowNs = 0
+	}
+	server.fanoutCriticalBoostNs = cfg.Net.FanoutCriticalBoostNs
+	if server.fanoutCriticalBoostNs < 0 {
+		server.fanoutCriticalBoostNs = 0
 	}
 
 	server.fanoutMinRecipients = cfg.Net.FanoutMinRecipientsPerTick
@@ -331,6 +376,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 	switch clientMsg.Type {
 	case protocol.MessageMove:
 		metrics.MessagesReceived.WithLabelValues("move").Inc()
+		s.markConnectionCritical(connection)
 
 		// Server-authoritative: process movement vector, server computes position
 		event := types.GameEvent{
@@ -376,6 +422,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 
 	case protocol.MessageDirection:
 		metrics.MessagesReceived.WithLabelValues("direction").Inc()
+		s.markConnectionCritical(connection)
 		s.gameWorld.ProcessEvent(types.GameEvent{
 			PlayerID:    connection.player.ID,
 			Type:        types.EventFace,
@@ -385,6 +432,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 
 	case protocol.MessageAttack:
 		metrics.MessagesReceived.WithLabelValues("attack").Inc()
+		s.markConnectionCritical(connection)
 		s.gameWorld.TryAttack(connection.player.ID)
 		// State=1 будет разослан всем через tick broadcast.
 
@@ -393,6 +441,23 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 
 	case protocol.MessageViewportUpdate:
 		// Silently accepted — viewport-based culling not yet implemented.
+	}
+}
+
+func (s *Server) markConnectionCritical(conn *Connection) {
+	if s.fanoutCriticalWindowNs <= 0 {
+		return
+	}
+	nowNs := time.Now().UnixNano()
+	untilNs := nowNs + s.fanoutCriticalWindowNs
+	for {
+		curr := atomic.LoadInt64(&conn.criticalUntilNs)
+		if curr >= untilNs {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&conn.criticalUntilNs, curr, untilNs) {
+			return
+		}
 	}
 }
 

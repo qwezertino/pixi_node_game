@@ -83,14 +83,20 @@ var connectionSlicePool = sync.Pool{
 type scoredConnection struct {
 	conn    *Connection
 	score   int64
+	rrBias  int64
 	overdue bool
 }
 
 type topKMinHeap []scoredConnection
 
-func (h topKMinHeap) Len() int           { return len(h) }
-func (h topKMinHeap) Less(i, j int) bool { return h[i].score < h[j].score }
-func (h topKMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h topKMinHeap) Len() int { return len(h) }
+func (h topKMinHeap) Less(i, j int) bool {
+	if h[i].score == h[j].score {
+		return h[i].rrBias < h[j].rrBias
+	}
+	return h[i].score < h[j].score
+}
+func (h topKMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
 func (h *topKMinHeap) Push(x any) {
 	*h = append(*h, x.(scoredConnection))
@@ -366,6 +372,14 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 	activeWindowNs := s.activeWindowNs
 	activeStalenessNs := s.activeStalenessNs
 	idleStalenessNs := s.idleStalenessNs
+	debtWeightNs := s.fanoutFairDebtWeightNs
+	roundRobinWeightNs := s.fanoutRoundRobinWeightNs
+	criticalBoostNs := s.fanoutCriticalBoostNs
+	rrEpoch := atomic.AddInt64(&s.fanoutRoundRobinEpoch, 1)
+	modBase := int64(n)
+	if modBase <= 0 {
+		modBase = 1
+	}
 	if idleStalenessNs < activeStalenessNs {
 		idleStalenessNs = activeStalenessNs
 	}
@@ -396,6 +410,21 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 			// Keep overdue clients prioritized while still respecting the global per-tick cap.
 			score += deadlineNs
 		}
+		if criticalBoostNs > 0 && nowNs <= atomic.LoadInt64(&conn.criticalUntilNs) {
+			score += criticalBoostNs
+		}
+		if debtWeightNs > 0 {
+			debt := int64(atomic.LoadInt32(&conn.fanoutFairDebt))
+			if debt > 0 {
+				score += debt * debtWeightNs
+			}
+		}
+		rrBias := int64(0)
+		if roundRobinWeightNs > 0 {
+			rrRank := (int64(conn.player.ID) + rrEpoch) % modBase
+			rrBias = (modBase - rrRank) * roundRobinWeightNs / modBase
+			score += rrBias
+		}
 		drops := int64(atomic.LoadInt32(&conn.fanoutDrops))
 		if drops > 0 {
 			penalty := drops * (deadlineNs / 8)
@@ -405,12 +434,12 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 			score -= penalty
 		}
 
-		item := scoredConnection{conn: conn, score: score, overdue: isOverdue}
+		item := scoredConnection{conn: conn, score: score, rrBias: rrBias, overdue: isOverdue}
 		if top.Len() < limit {
 			heap.Push(&top, item)
 			continue
 		}
-		if item.score > top[0].score {
+		if item.score > top[0].score || (item.score == top[0].score && item.rrBias > top[0].rrBias) {
 			top[0] = item
 			heap.Fix(&top, 0)
 		}
@@ -425,6 +454,59 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 	}
 
 	return selected, overdueSelected
+}
+
+func (s *Server) updateFairDebt(conns []*Connection, recipients []*Connection) {
+	if s.fanoutFairDebtMax <= 0 || len(conns) == 0 {
+		return
+	}
+	epoch := atomic.AddUint32(&s.fanoutDebtEpoch, 1)
+	if epoch == 0 {
+		epoch = atomic.AddUint32(&s.fanoutDebtEpoch, 1)
+	}
+	for _, conn := range recipients {
+		atomic.StoreUint32(&conn.fanoutDebtEpoch, epoch)
+	}
+
+	for _, conn := range conns {
+		if atomic.LoadUint32(&conn.fanoutDebtEpoch) == epoch {
+			if s.fanoutFairDebtDec <= 0 {
+				atomic.StoreInt32(&conn.fanoutFairDebt, 0)
+				continue
+			}
+			for {
+				current := atomic.LoadInt32(&conn.fanoutFairDebt)
+				if current <= 0 {
+					break
+				}
+				next := current - s.fanoutFairDebtDec
+				if next < 0 {
+					next = 0
+				}
+				if atomic.CompareAndSwapInt32(&conn.fanoutFairDebt, current, next) {
+					break
+				}
+			}
+			continue
+		}
+
+		if s.fanoutFairDebtInc <= 0 {
+			continue
+		}
+		for {
+			current := atomic.LoadInt32(&conn.fanoutFairDebt)
+			if current >= s.fanoutFairDebtMax {
+				break
+			}
+			next := current + s.fanoutFairDebtInc
+			if next > s.fanoutFairDebtMax {
+				next = s.fanoutFairDebtMax
+			}
+			if atomic.CompareAndSwapInt32(&conn.fanoutFairDebt, current, next) {
+				break
+			}
+		}
+	}
 }
 
 func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanoutDur time.Duration) {
@@ -567,6 +649,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.TickFanoutSelectDuration.Observe(selectDur.Seconds())
 	metrics.TickPhaseDuration.WithLabelValues("fanout_select").Observe(selectDur.Seconds())
 	m := len(recipients)
+	s.updateFairDebt(conns, recipients)
 	if m == 0 {
 		for i := range conns {
 			conns[i] = nil
@@ -578,6 +661,27 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		f.frame = nil
 		broadcastFramePool.Put(f)
 		return
+	}
+
+	if budgetBytes := s.fanoutMaxBroadcastBytesPerTick; budgetBytes > 0 {
+		frameBytes := len(f.frame)
+		if frameBytes > 0 {
+			budgetRecipients := budgetBytes / frameBytes
+			if budgetRecipients < 1 {
+				budgetRecipients = 1
+			}
+			metrics.BroadcastBudgetRecipients.Observe(float64(budgetRecipients))
+			if budgetRecipients < m {
+				trimmed := m - budgetRecipients
+				recipients = recipients[:budgetRecipients]
+				m = budgetRecipients
+				if overdue > m {
+					overdue = m
+				}
+				metrics.BroadcastBudgetHits.Inc()
+				metrics.BroadcastBudgetTrimmed.Add(float64(trimmed))
+			}
+		}
 	}
 
 	metrics.BroadcastRecipients.Observe(float64(m))
