@@ -5,6 +5,9 @@ import { AnimationController, PlayerState } from "./animationController";
 import { CoordinateConverter } from "../utils/coordinateConverter";
 import { MOVEMENT } from "../../shared/gameConfig";
 
+const RECONCILE_SOFT_ALPHA = 0.45;
+const RECONCILE_MAX_STEP = 18;
+const RECONCILE_HARD_SNAP_DIST_SQ = 120 * 120;
 
 export class MovementController {
     private _isMoving = false;
@@ -88,9 +91,10 @@ export class MovementController {
      * Пересчет позиции на основе server acknowledgment (server reconciliation)
      */
     private reconcilePosition(serverPosition: {x: number, y: number}, lastAckedSequence: number): void {
-        // Set position to server authoritative position
-        this._virtualPosition.x = serverPosition.x;
-        this._virtualPosition.y = serverPosition.y;
+        const reconciledTarget = {
+            x: serverPosition.x,
+            y: serverPosition.y,
+        };
 
         // Re-apply pending inputs that happened after the acknowledged sequence
         const futureInputs = this._pendingInputs.filter(input => input.sequence > lastAckedSequence);
@@ -98,17 +102,47 @@ export class MovementController {
         if (futureInputs.length > 0) {
             for (const input of futureInputs) {
                 const moveDistance = MOVEMENT.playerSpeedPerTick;
-                this._virtualPosition.x += input.dx * moveDistance;
-                this._virtualPosition.y += input.dy * moveDistance;
+                reconciledTarget.x += input.dx * moveDistance;
+                reconciledTarget.y += input.dy * moveDistance;
 
                 if (this._coordinateConverter) {
                     const clampedPos = this._coordinateConverter.clampToVirtualBounds(
-                        this._virtualPosition.x, this._virtualPosition.y
+                        reconciledTarget.x, reconciledTarget.y
                     );
-                    this._virtualPosition.x = clampedPos.x;
-                    this._virtualPosition.y = clampedPos.y;
+                    reconciledTarget.x = clampedPos.x;
+                    reconciledTarget.y = clampedPos.y;
                 }
             }
+        }
+
+        const dx = reconciledTarget.x - this._virtualPosition.x;
+        const dy = reconciledTarget.y - this._virtualPosition.y;
+        const distSq = dx * dx + dy * dy;
+
+        if (distSq >= RECONCILE_HARD_SNAP_DIST_SQ) {
+            this._virtualPosition.x = reconciledTarget.x;
+            this._virtualPosition.y = reconciledTarget.y;
+        } else {
+            let stepX = dx * RECONCILE_SOFT_ALPHA;
+            let stepY = dy * RECONCILE_SOFT_ALPHA;
+            const stepLen = Math.hypot(stepX, stepY);
+            if (stepLen > RECONCILE_MAX_STEP && stepLen > 0) {
+                const scale = RECONCILE_MAX_STEP / stepLen;
+                stepX *= scale;
+                stepY *= scale;
+            }
+
+            this._virtualPosition.x += stepX;
+            this._virtualPosition.y += stepY;
+        }
+
+        if (this._coordinateConverter) {
+            const clampedPos = this._coordinateConverter.clampToVirtualBounds(
+                this._virtualPosition.x,
+                this._virtualPosition.y
+            );
+            this._virtualPosition.x = clampedPos.x;
+            this._virtualPosition.y = clampedPos.y;
         }
 
         // Update screen position after reconciliation

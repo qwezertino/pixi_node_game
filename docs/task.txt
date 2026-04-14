@@ -130,3 +130,24 @@ Graceful degradation - LOD система при перегрузке
 
 - [ ] Рассмотреть миграцию write-path на event-driven модель (reactor/netpoll-гибрид)
 	для снижения tail-latency при 4k+ соединениях и уменьшения давления на scheduler.
+
+12. TODO: дальнейшие улучшения (best practices)
+
+- [ ] Улучшить сетевой таймлайн клиента:
+	добавить clock sync клиент-сервер и рендерить по серверному времени,
+	а не только по локальному времени прихода пакетов.
+- [ ] Сделать интерполяцию умнее:
+	перейти на velocity-aware интерполяцию (Hermite/smooth damp)
+	и добавить ограничение ускорения для уменьшения микрорывков.
+- [ ] Ввести политику keyframe + delta:
+	регулярный keyframe каждые N дельт для всех клиентов,
+	между keyframe оставлять легкие дельты.
+- [ ] Добавить runtime-адаптацию по качеству канала:
+	per-client EMA по inter-arrival/jitter и автоподстройка
+	interpolation delay и soft-correction коэффициентов.
+- [ ] Усилить эволюцию протокола:
+	добавить protocol version + capability flags при подключении,
+	подготовить опциональную схему fields bitmap в state-пакете.
+- [ ] Развить приоритизацию fanout без AOI:
+	class-based очереди (critical movement/attack выше, cosmetic ниже)
+	для лучшей отзывчивости под нагрузкой.

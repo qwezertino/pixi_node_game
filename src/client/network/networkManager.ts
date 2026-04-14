@@ -17,7 +17,8 @@ export type OnPlayerDirectionCallback = (
     direction: -1 | 1
 ) => void;
 export type OnGameStateCallback = (
-    players: Record<string, PlayerState>
+    players: Record<string, PlayerState>,
+    stateSequence?: number
 ) => void;
 export type OnCorrectionCallback = (position: PlayerPosition) => void;
 export type OnMovementAckCallback = (position: PlayerPosition, inputSequence: number) => void;
@@ -33,6 +34,7 @@ export class NetworkManager {
     private playerId: string = "";
     private initialPosition: PlayerPosition = { x: 0, y: 0 };
     private players: Record<string, PlayerState> = {};
+    private lastStateSequence: number = 0;
 
     // Callback handlers
     private onPlayerJoinedCallbacks: OnPlayerJoinedCallback[] = [];
@@ -110,6 +112,15 @@ export class NetworkManager {
     private onSocketError() {
         // Handle connection error
         console.error('WebSocket error');
+    }
+
+    private isNewerStateSequence(next: number, current: number): boolean {
+        if (current === 0) return true;
+        if (next === current) return false;
+
+        // Unsigned wrap-aware comparison for uint32 sequence numbers.
+        const delta = (next - current) >>> 0;
+        return delta < 0x80000000;
     }
 
     private setupSocketEvents() {
@@ -218,6 +229,13 @@ export class NetworkManager {
 
                     case "gameState":
                     case "deltaGameState":
+                        if (typeof message.stateSequence === "number") {
+                            const sequence = message.stateSequence >>> 0;
+                            if (!this.isNewerStateSequence(sequence, this.lastStateSequence)) {
+                                break;
+                            }
+                            this.lastStateSequence = sequence;
+                        }
 
                         // If we don't have a player ID yet, determine it from the game state
                         if (!this.playerId && message.players) {
@@ -264,7 +282,7 @@ export class NetworkManager {
                         });
 
                         this.onGameStateCallbacks.forEach((callback) =>
-                            callback(this.players)
+                            callback(this.players, message.stateSequence)
                         );
                         break;
 

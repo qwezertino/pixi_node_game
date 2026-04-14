@@ -604,14 +604,15 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	}
 
 	t0 := time.Now()
+	stateSequence := atomic.AddUint32(&s.worldStateSeq, 1)
 	f := broadcastFramePool.Get().(*tickFrame)
 	f.data = f.data[:0]
 	// Reserve 10 bytes at front for the WS binary frame header (filled by wsFrameSlice below).
 	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 	if fullSync {
-		f.data = s.protocol.AppendGameState(f.data, allPlayers)
+		f.data = s.protocol.AppendGameState(f.data, allPlayers, stateSequence)
 	} else {
-		f.data = s.protocol.AppendDeltaGameState(f.data, changed)
+		f.data = s.protocol.AppendDeltaGameState(f.data, changed, stateSequence)
 	}
 	f.frame = wsFrameSlice(f.data)
 	if payloadSize := len(f.data) - 10; payloadSize > 0 {
@@ -825,9 +826,10 @@ func (s *Server) sendInitialState(conn *Connection) {
 	// Borrow a pooled 64 KB buffer — same pool used by broadcastTick.
 	f := broadcastFramePool.Get().(*tickFrame)
 	f.data = f.data[:0]
-	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)   // reserve 10-byte WS header
-	f.data = s.protocol.AppendGameState(f.data, allPlayers) // zero-alloc into pool buf
-	frame := wsFrameSlice(f.data)                           // zero-alloc sub-slice
+	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // reserve 10-byte WS header
+	seq := atomic.LoadUint32(&s.worldStateSeq)
+	f.data = s.protocol.AppendGameState(f.data, allPlayers, seq) // zero-alloc into pool buf
+	frame := wsFrameSlice(f.data)                                // zero-alloc sub-slice
 
 	// Copy frame bytes before returning pool buffer: write loop reads them later.
 	frameBytes := make([]byte, len(frame))

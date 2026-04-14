@@ -165,26 +165,31 @@ export class BinaryProtocol {
     }
 
     private static decodeGameState(data: Uint8Array, view: DataView): GameStateMessage {
+        const { players, stateSequence } = this.decodePlayerBlock(data, view);
         return {
             type: 'gameState',
-            players: this.decodePlayerBlock(data, view),
-            timestamp: Date.now()
+            players,
+            timestamp: Date.now(),
+            stateSequence,
         };
     }
 
     private static decodeDeltaGameState(data: Uint8Array, view: DataView) {
+        const { players, stateSequence } = this.decodePlayerBlock(data, view);
         return {
             type: 'deltaGameState',
-            players: this.decodePlayerBlock(data, view),
-            timestamp: Date.now()
+            players,
+            timestamp: Date.now(),
+            stateSequence,
         };
     }
 
-    private static decodePlayerBlock(data: Uint8Array, view: DataView): Record<string, PlayerState> {
-        const playerCount = view.getUint32(1, true);
+    private static decodePlayerBlock(data: Uint8Array, view: DataView): { players: Record<string, PlayerState>; stateSequence?: number } {
+        const header = this.decodeWorldStateHeader(data, view);
+        const playerCount = header.playerCount;
         const players: Record<string, PlayerState> = {};
 
-        let offset = 5;
+        let offset = header.offset;
         for (let i = 0; i < playerCount; i++) {
             if (offset + 11 > data.length) break;
 
@@ -220,7 +225,25 @@ export class BinaryProtocol {
             };
         }
 
-        return players;
+        return { players, stateSequence: header.stateSequence };
+    }
+
+    private static decodeWorldStateHeader(data: Uint8Array, view: DataView): { stateSequence?: number; playerCount: number; offset: number } {
+        // New format: [type:1][stateSequence:4][playerCount:4][players...]
+        if (data.length >= 9) {
+            const stateSequence = view.getUint32(1, true);
+            const playerCount = view.getUint32(5, true);
+            const expectedLength = 9 + playerCount * 11;
+            if (expectedLength <= data.length) {
+                return { stateSequence, playerCount, offset: 9 };
+            }
+        }
+
+        // Backward-compatible fallback: [type:1][playerCount:4][players...]
+        return {
+            playerCount: view.getUint32(1, true),
+            offset: 5,
+        };
     }
 
     private static decodePlayerJoined(_data: Uint8Array, view: DataView): PlayerJoinedMessage {

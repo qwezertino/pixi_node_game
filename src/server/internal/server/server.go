@@ -49,6 +49,7 @@ type Server struct {
 	// Adaptive broadcast pacing
 	adaptiveBatchNs int64 // atomic
 	lastBroadcastNs int64 // atomic
+	worldStateSeq   uint32
 
 	// Parallel fanout enqueue workers
 	fanoutWorkers                  int

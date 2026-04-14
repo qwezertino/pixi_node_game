@@ -1,6 +1,6 @@
 import { Container, Point, AnimatedSprite, Texture } from "pixi.js";
 import { NetworkManager } from "../network/networkManager";
-import { PlayerState } from "../network/protocol/messages";
+import { PlayerState, TICK_RATE } from "../network/protocol/messages";
 import { SpriteLoader } from "../utils/spriteLoader";
 import {
     AnimationController,
@@ -24,14 +24,12 @@ interface PositionSnapshot {
     y: number;
 }
 
-// Задержка рендера: 3 тика при 30Hz = ~100ms + safety margin.
-// Gaffer on Games: для 30pps с 2-5% потерей пакетов нужно 3× interval = 150ms.
-// Клиент всегда рендерит других игроков "в прошлом",
-// интерполируя между двумя известными позициями — никаких телепортов.
-const INTERPOLATION_DELAY_MS = 150;
+const MIN_INTERPOLATION_DELAY_MS = 90;
+const MAX_INTERPOLATION_DELAY_MS = 220;
+const SNAPSHOT_EWMA_ALPHA = 0.15;
 // Максимальное время экстраполяции когда буфер пуст (высокий пинг / потеря пакетов).
 // После этого порога позиция замораживается до следующего снимка.
-const MAX_EXTRAPOLATE_MS = 250;
+const MAX_EXTRAPOLATE_CAP_MS = 320;
 const MAX_SNAPSHOTS = 32;
 
 class RemotePlayer {
@@ -43,6 +41,11 @@ class RemotePlayer {
 
     // Буфер серверных позиций для интерполяции
     private snapshots: PositionSnapshot[] = [];
+    private interpolationDelayMs = 130;
+    private interArrivalEwmaMs = 1000 / Math.max(TICK_RATE, 1);
+    private jitterEwmaMs = 0;
+    private lastSnapshotTimeMs = 0;
+    private lastSnapshotSequence = 0;
 
     // Текущая рендер-позиция (интерполированная)
     public virtualPosition = { x: 0, y: 0 };
@@ -97,8 +100,41 @@ class RemotePlayer {
     }
 
     // Добавить серверный снимок позиции в буфер
-    pushSnapshot(x: number, y: number) {
+    pushSnapshot(x: number, y: number, stateSequence?: number) {
+        if (typeof stateSequence === "number") {
+            const seq = stateSequence >>> 0;
+            if (this.lastSnapshotSequence !== 0) {
+                const delta = (seq - this.lastSnapshotSequence) >>> 0;
+                if (delta === 0 || delta >= 0x80000000) {
+                    return;
+                }
+            }
+            this.lastSnapshotSequence = seq;
+        }
+
         const now = performance.now();
+        if (this.lastSnapshotTimeMs > 0) {
+            const dt = now - this.lastSnapshotTimeMs;
+            if (dt > 0) {
+                this.interArrivalEwmaMs =
+                    this.interArrivalEwmaMs * (1 - SNAPSHOT_EWMA_ALPHA) + dt * SNAPSHOT_EWMA_ALPHA;
+                const deviation = Math.abs(dt - this.interArrivalEwmaMs);
+                this.jitterEwmaMs =
+                    this.jitterEwmaMs * (1 - SNAPSHOT_EWMA_ALPHA) + deviation * SNAPSHOT_EWMA_ALPHA;
+
+                const targetDelay = Math.min(
+                    MAX_INTERPOLATION_DELAY_MS,
+                    Math.max(
+                        MIN_INTERPOLATION_DELAY_MS,
+                        this.interArrivalEwmaMs * 2.2 + this.jitterEwmaMs * 1.8
+                    )
+                );
+                this.interpolationDelayMs =
+                    this.interpolationDelayMs * (1 - SNAPSHOT_EWMA_ALPHA) + targetDelay * SNAPSHOT_EWMA_ALPHA;
+            }
+        }
+        this.lastSnapshotTimeMs = now;
+
         this.snapshots.push({ time: now, x, y });
         // Удаляем старые снимки — держим только MAX_SNAPSHOTS
         if (this.snapshots.length > MAX_SNAPSHOTS) {
@@ -111,10 +147,10 @@ class RemotePlayer {
             this.animationController.playerState ===
             AnimationPlayerState.ATTACKING;
 
-        // Entity interpolation: рендерим позицию на INTERPOLATION_DELAY_MS в прошлом.
+        // Entity interpolation: рендерим позицию на adaptive delay в прошлом.
         // Это означает что мы всегда имеем два снимка вокруг целевого времени —
         // никаких экстраполяций и телепортов.
-        const renderTime = performance.now() - INTERPOLATION_DELAY_MS;
+        const renderTime = performance.now() - this.interpolationDelayMs;
         const snaps = this.snapshots;
 
         if (snaps.length >= 2) {
@@ -141,7 +177,11 @@ class RemotePlayer {
                 // renderTime опережает новейший снимок — высокий пинг / потеря пакетов.
                 // Экстраполируем скоростью последних двух снимков вместо заморозки.
                 const extrapolateMs = renderTime - newest.time;
-                if (extrapolateMs <= MAX_EXTRAPOLATE_MS) {
+                const maxExtrapolateMs = Math.min(
+                    MAX_EXTRAPOLATE_CAP_MS,
+                    Math.max(140, this.interpolationDelayMs * 1.75)
+                );
+                if (extrapolateMs <= maxExtrapolateMs) {
                     const prev = snaps[snaps.length - 2];
                     const dt = newest.time - prev.time;
                     if (dt > 0) {
@@ -230,9 +270,11 @@ class RemotePlayer {
         // сразу имела данные и игрок был виден
         const now = performance.now();
         this.snapshots = [
-            { time: now - INTERPOLATION_DELAY_MS - 50, x: virtualX, y: virtualY },
-            { time: now - INTERPOLATION_DELAY_MS,       x: virtualX, y: virtualY },
+            { time: now - this.interpolationDelayMs - 50, x: virtualX, y: virtualY },
+            { time: now - this.interpolationDelayMs,      x: virtualX, y: virtualY },
         ];
+
+        this.lastSnapshotTimeMs = now;
     }
 }
 
@@ -298,7 +340,7 @@ export class PlayerManager {
             }
         });
 
-        this.networkManager.onGameState(async (players) => {
+        this.networkManager.onGameState(async (players, stateSequence) => {
             const currentPlayerId = this.networkManager.getPlayerId();
 
             for (const [playerId, playerState] of Object.entries(players)) {
@@ -315,7 +357,7 @@ export class PlayerManager {
                 if (existingPlayer) {
                     // Entity interpolation: добавляем снимок в буфер,
                     // позиция будет плавно интерполирована в update()
-                    existingPlayer.pushSnapshot(playerState.position.x, playerState.position.y);
+                    existingPlayer.pushSnapshot(playerState.position.x, playerState.position.y, stateSequence);
 
                     existingPlayer.direction = playerState.direction;
                     existingPlayer.isMoving = playerState.moving;

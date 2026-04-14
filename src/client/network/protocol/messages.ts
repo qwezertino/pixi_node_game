@@ -99,6 +99,7 @@ export interface GameStateMessage extends ServerMessage {
     type: 'gameState';
     players: Record<string, PlayerState>;
     timestamp: number;
+    stateSequence?: number;
 }
 
 export interface MovementAcknowledgmentMessage extends ServerMessage {

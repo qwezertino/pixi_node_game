@@ -96,19 +96,19 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (*ClientMessage, erro
 }
 
 // EncodeGameState кодирует состояние игры для отправки клиенту
-func (bp *BinaryProtocol) EncodeGameState(players []types.PlayerState) []byte {
-	return bp.AppendGameState(nil, players)
+func (bp *BinaryProtocol) EncodeGameState(players []types.PlayerState, stateSequence uint32) []byte {
+	return bp.AppendGameState(nil, players, stateSequence)
 }
 
 // AppendGameState encodes full game state and appends it to dst (preserves existing content).
 // When dst has a header prefix (e.g. 10 reserved WS frame bytes), the payload is written
 // after those bytes — dst[len(dst):len(dst)+payloadSize] — with no allocation if
 // cap(dst) is sufficient (ring slot pre-allocated to 64 KB).
-func (bp *BinaryProtocol) AppendGameState(dst []byte, players []types.PlayerState) []byte {
-	// Header: message type (1) + player count (4) = 5 bytes
+func (bp *BinaryProtocol) AppendGameState(dst []byte, players []types.PlayerState, stateSequence uint32) []byte {
+	// Header: message type (1) + state sequence (4) + player count (4) = 9 bytes
 	playerSize := 11 // ID(4) + X(2) + Y(2) + VX(1) + VY(1) + Flags(1) = 11 bytes
 	startOffset := len(dst)
-	payloadSize := 5 + len(players)*playerSize
+	payloadSize := 9 + len(players)*playerSize
 	totalSize := startOffset + payloadSize
 
 	if cap(dst) < totalSize {
@@ -124,6 +124,10 @@ func (bp *BinaryProtocol) AppendGameState(dst []byte, players []types.PlayerStat
 	// Message type
 	dst[offset] = MessageGameState
 	offset++
+
+	// Monotonic world-state sequence (for stale/out-of-order filtering on client)
+	binary.LittleEndian.PutUint32(dst[offset:], stateSequence)
+	offset += 4
 
 	// Player count
 	binary.LittleEndian.PutUint32(dst[offset:], uint32(len(players)))
@@ -155,17 +159,17 @@ func (bp *BinaryProtocol) AppendGameState(dst []byte, players []types.PlayerStat
 // EncodeDeltaGameState кодирует дельту — только изменившихся игроков.
 // Формат идентичен EncodeGameState (11 байт/игрок), но тип сообщения = MessageDeltaGameState.
 // Клиент мёржит дельту в своё состояние вместо полной замены.
-func (bp *BinaryProtocol) EncodeDeltaGameState(players []types.PlayerState) []byte {
-	return bp.AppendDeltaGameState(nil, players)
+func (bp *BinaryProtocol) EncodeDeltaGameState(players []types.PlayerState, stateSequence uint32) []byte {
+	return bp.AppendDeltaGameState(nil, players, stateSequence)
 }
 
 // AppendDeltaGameState encodes a delta game state and appends it to dst (preserves existing content).
 // Формат идентичен AppendGameState (11 байт/игрок), но тип сообщения = MessageDeltaGameState.
 // Клиент мёржит дельту в своё состояние вместо полной замены.
-func (bp *BinaryProtocol) AppendDeltaGameState(dst []byte, players []types.PlayerState) []byte {
+func (bp *BinaryProtocol) AppendDeltaGameState(dst []byte, players []types.PlayerState, stateSequence uint32) []byte {
 	playerSize := 11
 	startOffset := len(dst)
-	payloadSize := 5 + len(players)*playerSize
+	payloadSize := 9 + len(players)*playerSize
 	totalSize := startOffset + payloadSize
 
 	if cap(dst) < totalSize {
@@ -180,6 +184,9 @@ func (bp *BinaryProtocol) AppendDeltaGameState(dst []byte, players []types.Playe
 
 	dst[offset] = MessageDeltaGameState
 	offset++
+
+	binary.LittleEndian.PutUint32(dst[offset:], stateSequence)
+	offset += 4
 
 	binary.LittleEndian.PutUint32(dst[offset:], uint32(len(players)))
 	offset += 4
