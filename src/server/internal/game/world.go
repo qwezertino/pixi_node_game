@@ -84,17 +84,28 @@ type GameWorld struct {
 
 // NewGameWorld создает новый игровой мир
 func NewGameWorld(cfg *config.Config) *GameWorld {
+	initialCap := cfg.Net.MaxConnections
+	if initialCap < 256 {
+		initialCap = 256
+	} else if initialCap > 16384 {
+		initialCap = 16384
+	}
+	changedCap := initialCap / 8
+	if changedCap < 64 {
+		changedCap = 64
+	}
+
 	gw := &GameWorld{
 		cfg:            cfg,
 		playersMap:     make(map[uint32]*types.Player, 256),
 		stopChan:       make(chan struct{}),
 		nextPlayerID:   1000, // Start from 1000 for easy debugging
 		lastFullSync:   time.Now(),
-		prevStates:     make(map[uint32]types.PlayerState, 256),
-		scratchStates:  make([]types.PlayerState, 0, 256),
-		scratchChanged: make([]types.PlayerState, 0, 64),
-		scratchSeenIDs: make(map[uint32]struct{}, 256),
-		scratchPtrs:    make([]*types.Player, 0, 256),
+		prevStates:     make(map[uint32]types.PlayerState, initialCap),
+		scratchStates:  make([]types.PlayerState, 0, initialCap),
+		scratchChanged: make([]types.PlayerState, 0, changedCap),
+		scratchSeenIDs: make(map[uint32]struct{}, initialCap),
+		scratchPtrs:    make([]*types.Player, 0, initialCap),
 	}
 
 	// Spawn persistent tick workers — one per logical CPU.

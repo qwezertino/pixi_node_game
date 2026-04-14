@@ -88,6 +88,7 @@ type Connection struct {
 	lastActivity         int64         // UnixNano, updated on each received frame (atomic)
 	writeFailures        int32         // consecutive write timeouts/errors (atomic); reset on success
 	fanoutDrops          int32         // consecutive dropped broadcast enqueues (atomic)
+	pendingBroadcast     int32         // 0/1: whether a world-state broadcast job is already queued/in-flight
 	lastWorldStateSentNs int64         // UnixNano timestamp of last successfully enqueued world-state frame
 	ctx                  context.Context
 	cancel               context.CancelFunc

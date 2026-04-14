@@ -167,6 +167,30 @@ var (
 		Buckets: prometheus.ExponentialBucketsRange(0.00005, 0.25, 14),
 	})
 
+	TickFanoutSelectDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_tick_fanout_select_seconds",
+		Help:    "Time spent selecting broadcast recipients for the current tick",
+		Buckets: prometheus.ExponentialBucketsRange(0.00001, 0.1, 14),
+	})
+
+	TickFanoutEnqueueDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_tick_fanout_enqueue_seconds",
+		Help:    "Time spent enqueueing selected recipients in fanout workers/write queues",
+		Buckets: prometheus.ExponentialBucketsRange(0.00001, 0.1, 14),
+	})
+
+	WSWriteBatchDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_ws_write_batch_seconds",
+		Help:    "Duration of one batched socket write in the per-connection write loop",
+		Buckets: prometheus.ExponentialBucketsRange(0.00001, 0.25, 14),
+	})
+
+	WSWriteBatchJobs = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_ws_write_batch_jobs",
+		Help:    "Number of queued write jobs coalesced into one socket write call",
+		Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+	})
+
 	AdaptiveBatchIntervalMs = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_adaptive_batch_interval_ms",
 		Help: "Current adaptive batch interval in milliseconds for broadcast pacing",

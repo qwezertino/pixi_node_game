@@ -1,9 +1,9 @@
 package server
 
 import (
+	"container/heap"
 	"log/slog"
 	"net"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,15 +81,27 @@ var connectionSlicePool = sync.Pool{
 }
 
 type scoredConnection struct {
-	conn  *Connection
-	score int64
+	conn    *Connection
+	score   int64
+	overdue bool
 }
 
-var scoredConnectionPool = sync.Pool{
-	New: func() any {
-		s := make([]scoredConnection, 0, 4096)
-		return &s
-	},
+type topKMinHeap []scoredConnection
+
+func (h topKMinHeap) Len() int           { return len(h) }
+func (h topKMinHeap) Less(i, j int) bool { return h[i].score < h[j].score }
+func (h topKMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *topKMinHeap) Push(x any) {
+	*h = append(*h, x.(scoredConnection))
+}
+
+func (h *topKMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
 }
 
 // Write timeouts.
@@ -175,6 +187,13 @@ func (s *Server) runFanoutWorker() {
 }
 
 func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtNs int64) bool {
+	if !atomic.CompareAndSwapInt32(&conn.pendingBroadcast, 0, 1) {
+		// Keep latest-state semantics: if one world-state frame is already queued/in-flight,
+		// skip enqueuing older snapshots for this connection.
+		frame.release()
+		return true
+	}
+
 	select {
 	case conn.writeCh <- writeJob{frame: frame, timeout: broadcastWriteTimeout}:
 		atomic.StoreInt64(&conn.lastWorldStateSentNs, sentAtNs)
@@ -183,6 +202,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtN
 		}
 		return true
 	default:
+		atomic.StoreInt32(&conn.pendingBroadcast, 0)
 		frame.release()
 		metrics.BroadcastsDropped.Inc()
 		if atomic.AddInt32(&conn.fanoutDrops, 1) == s.fanoutDropLimit {
@@ -252,12 +272,16 @@ func (s *Server) startWriteLoop(c *Connection) {
 				}
 
 			writeBatch:
+				writeStart := time.Now()
 				c.rawConn.SetWriteDeadline(time.Now().Add(maxTimeout))
 				buffers := net.Buffers(frames[:count])
 				n, err := buffers.WriteTo(c.rawConn)
+				metrics.WSWriteBatchDuration.Observe(time.Since(writeStart).Seconds())
+				metrics.WSWriteBatchJobs.Observe(float64(count))
 
 				for i := 0; i < count; i++ {
 					if jobs[i].frame != nil {
+						atomic.StoreInt32(&c.pendingBroadcast, 0)
 						jobs[i].frame.release()
 					}
 					frames[i] = nil
@@ -334,10 +358,9 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 		idleStalenessNs = activeStalenessNs
 	}
 
-	candBuf := scoredConnectionPool.Get().(*[]scoredConnection)
-	candidates := (*candBuf)[:0]
+	top := make(topKMinHeap, 0, limit)
+	heap.Init(&top)
 
-	overdue := 0
 	for _, conn := range conns {
 		stalenessNs := nowNs - atomic.LoadInt64(&conn.lastWorldStateSentNs)
 		if stalenessNs < 0 {
@@ -351,15 +374,15 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 			deadlineNs = activeStalenessNs
 		}
 
-		if stalenessNs >= deadlineNs {
-			selected = append(selected, conn)
-			overdue++
-			continue
-		}
+		isOverdue := stalenessNs >= deadlineNs
 
 		score := stalenessNs
 		if active {
 			score += deadlineNs / 2
+		}
+		if isOverdue {
+			// Keep overdue clients prioritized while still respecting the global per-tick cap.
+			score += deadlineNs
 		}
 		drops := int64(atomic.LoadInt32(&conn.fanoutDrops))
 		if drops > 0 {
@@ -370,29 +393,26 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 			score -= penalty
 		}
 
-		candidates = append(candidates, scoredConnection{conn: conn, score: score})
-	}
-
-	if len(selected) < limit && len(candidates) > 0 {
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].score > candidates[j].score
-		})
-		need := limit - len(selected)
-		if need > len(candidates) {
-			need = len(candidates)
+		item := scoredConnection{conn: conn, score: score, overdue: isOverdue}
+		if top.Len() < limit {
+			heap.Push(&top, item)
+			continue
 		}
-		for i := 0; i < need; i++ {
-			selected = append(selected, candidates[i].conn)
+		if item.score > top[0].score {
+			top[0] = item
+			heap.Fix(&top, 0)
 		}
 	}
 
-	for i := range candidates {
-		candidates[i] = scoredConnection{}
+	overdueSelected := 0
+	for i := range top {
+		selected = append(selected, top[i].conn)
+		if top[i].overdue {
+			overdueSelected++
+		}
 	}
-	*candBuf = candidates[:0]
-	scoredConnectionPool.Put(candBuf)
 
-	return selected, overdue
+	return selected, overdueSelected
 }
 
 func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanoutDur time.Duration) {
@@ -400,11 +420,20 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 		return
 	}
 
-	curr := int(atomic.LoadInt64(&s.fanoutRecipientLimit))
-	if curr < s.fanoutMinRecipients {
-		curr = s.fanoutMinRecipients
+	rawCurr := int(atomic.LoadInt64(&s.fanoutRecipientLimit))
+	if rawCurr < 1 {
+		rawCurr = min(total, s.fanoutMinRecipients)
+		if rawCurr < 1 {
+			rawCurr = 1
+		}
 	}
+	curr := rawCurr
 	next := curr
+
+	if total >= s.fanoutMinRecipients && curr < s.fanoutMinRecipients {
+		// Restore to floor quickly when load returns after an idle window.
+		next = s.fanoutMinRecipients
+	}
 
 	if overdue > next {
 		next = overdue
@@ -434,7 +463,7 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 		next = s.fanoutMinRecipients
 	}
 
-	if next != curr {
+	if next != rawCurr {
 		atomic.StoreInt64(&s.fanoutRecipientLimit, int64(next))
 		metrics.FanoutRecipientLimit.Set(float64(next))
 
@@ -443,7 +472,7 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 		if nowNano-prev >= int64(5*time.Second) &&
 			atomic.CompareAndSwapInt64(&s.lastFanoutTuneLog, prev, nowNano) {
 			slog.Info("fanout recipient limit updated",
-				"from", curr,
+				"from", rawCurr,
 				"to", next,
 				"selected", selected,
 				"overdue", overdue,
@@ -520,7 +549,11 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.BroadcastTargets.Observe(float64(n))
 	s.connectionsMu.RUnlock()
 
+	selectStart := time.Now()
 	recipients, overdue := s.selectRecipients(conns, sentAtNs)
+	selectDur := time.Since(selectStart)
+	metrics.TickFanoutSelectDuration.Observe(selectDur.Seconds())
+	metrics.TickPhaseDuration.WithLabelValues("fanout_select").Observe(selectDur.Seconds())
 	m := len(recipients)
 	if m == 0 {
 		for i := range conns {
@@ -543,6 +576,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 
 	atomic.StoreInt32(&f.refs, int32(m))
 
+	enqueueStart := time.Now()
 	dropped := 0
 	if s.fanoutWorkers <= 1 || m < s.fanoutWorkers*64 {
 		for _, conn := range recipients {
@@ -572,6 +606,9 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		wg.Wait()
 		dropped = int(atomic.LoadInt64(&droppedAtomic))
 	}
+	enqueueDur := time.Since(enqueueStart)
+	metrics.TickFanoutEnqueueDuration.Observe(enqueueDur.Seconds())
+	metrics.TickPhaseDuration.WithLabelValues("fanout_enqueue").Observe(enqueueDur.Seconds())
 
 	for i := range conns {
 		conns[i] = nil
