@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -411,13 +412,17 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		}
 
 		// Send movement acknowledgment via shard directChan (priority over broadcast).
-		ackData := s.protocol.EncodeMovementAck(
-			connection.player.ID,
-			uint16(ackX32),
-			uint16(ackY32),
-			clientMsg.InputSequence,
-		)
-		s.sendDirect(connection, ackData)
+		// Encode directly into a stack array to avoid a heap allocation:
+		// EncodeMovementAck returns []byte which normally escapes; with a fixed-size
+		// stack array we pass a slice that doesn't outlive this scope (CompileFrame
+		// copies the payload into its own buffer before sendDirect returns).
+		var ackBuf [13]byte
+		ackBuf[0] = protocol.MessageMovementAck
+		binary.LittleEndian.PutUint32(ackBuf[1:], connection.player.ID)
+		binary.LittleEndian.PutUint16(ackBuf[5:], uint16(ackX32))
+		binary.LittleEndian.PutUint16(ackBuf[7:], uint16(ackY32))
+		binary.LittleEndian.PutUint32(ackBuf[9:], clientMsg.InputSequence)
+		s.sendDirect(connection, ackBuf[:])
 
 		// Обновление позиции разошлётся через tick broadcast, не здесь.
 

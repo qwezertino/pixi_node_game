@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/server"
@@ -43,10 +44,17 @@ func optimizeRuntime() {
 		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
 
-	// Optimize GC for high throughput
-	if os.Getenv("GOGC") == "" {
-		os.Setenv("GOGC", "400")
+	// Optimize GC for high throughput.
+	// GOGC=400: allow heap to grow to 4× live heap before triggering GC.
+	// NOTE: os.Setenv("GOGC", ...) has no effect — the Go runtime reads GOGC before
+	// main() runs. debug.SetGCPercent is the only way to change it at runtime.
+	gcPct := 400
+	if v := os.Getenv("GOGC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			gcPct = n
+		}
 	}
+	debug.SetGCPercent(gcPct)
 
 	// GOMEMLIMIT is read automatically by the Go runtime from the env var.
 	// Log the current value so it's visible in structured logs.
@@ -57,6 +65,6 @@ func optimizeRuntime() {
 
 	slog.Info("runtime optimized",
 		"gomaxprocs", runtime.GOMAXPROCS(0),
-		"gogc", os.Getenv("GOGC"),
+		"gogc", gcPct,
 	)
 }

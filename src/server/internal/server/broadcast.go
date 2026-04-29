@@ -80,6 +80,17 @@ var connectionSlicePool = sync.Pool{
 	},
 }
 
+// scoredConnPool pools topKMinHeap slices for selectRecipients.
+// selectRecipients is called every tick; pooling eliminates the per-tick
+// make(topKMinHeap, 0, N) allocation and the heap.Push interface-boxing allocations
+// (32-byte scoredConnection > 16-byte inline threshold → each Push allocates).
+var scoredConnPool = sync.Pool{
+	New: func() any {
+		s := make(topKMinHeap, 0, 4096)
+		return &s
+	},
+}
+
 type scoredConnection struct {
 	conn    *Connection
 	score   int64
@@ -195,8 +206,8 @@ func (s *Server) runFanoutWorker() {
 func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtNs int64) bool {
 	if s.fanoutQueueShedDepth > 0 {
 		depth := len(conn.writeCh)
-		metrics.WSWriteQueueDepth.Observe(float64(depth))
 		if depth >= s.fanoutQueueShedDepth {
+			metrics.WSWriteQueueDepth.Observe(float64(depth))
 			// Queue-aware shedding: skip stale world-state for overloaded clients.
 			frame.release()
 			metrics.BroadcastsShed.Inc()
@@ -292,8 +303,23 @@ func (s *Server) startWriteLoop(c *Connection) {
 			writeBatch:
 				writeStart := time.Now()
 				c.rawConn.SetWriteDeadline(time.Now().Add(maxTimeout))
-				buffers := net.Buffers(frames[:count])
-				n, err := buffers.WriteTo(c.rawConn)
+
+				// net.Buffers.WriteTo escapes the slice header to the heap on every
+				// call (Go escape analysis sees &buffers flow into writeBuffers →
+				// pfd.Writev and conservatively heap-allocates the 24-byte header).
+				// With pendingBroadcast CAS, count==1 is the common case (one world-
+				// state frame per tick). Use rawConn.Write for single frames to avoid
+				// the allocation entirely; fall back to net.Buffers only for batches.
+				var n int64
+				var err error
+				if count == 1 {
+					var nn int
+					nn, err = c.rawConn.Write(frames[0])
+					n = int64(nn)
+				} else {
+					buffers := net.Buffers(frames[:count])
+					n, err = buffers.WriteTo(c.rawConn)
+				}
 				metrics.WSWriteBatchDuration.Observe(time.Since(writeStart).Seconds())
 				metrics.WSWriteBatchJobs.Observe(float64(count))
 
@@ -384,8 +410,16 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 		idleStalenessNs = activeStalenessNs
 	}
 
-	top := make(topKMinHeap, 0, limit)
-	heap.Init(&top)
+	// Pool topKMinHeap to avoid per-tick make([]scoredConnection, 0, limit).
+	// Two-phase fill avoids heap.Push interface-boxing (scoredConnection is 32 bytes,
+	// above the 16-byte inline threshold → each Push would heap-allocate).
+	// Phase 1: direct append until heap is full, then heap.Init once (O(limit), no boxing).
+	// Phase 2: for remaining conns, direct comparison + heap.Fix (no boxing).
+	topPtr := scoredConnPool.Get().(*topKMinHeap)
+	top := (*topPtr)[:0]
+	if cap(top) < limit {
+		top = make(topKMinHeap, 0, limit)
+	}
 
 	for _, conn := range conns {
 		stalenessNs := nowNs - atomic.LoadInt64(&conn.lastWorldStateSentNs)
@@ -407,7 +441,6 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 			score += deadlineNs / 2
 		}
 		if isOverdue {
-			// Keep overdue clients prioritized while still respecting the global per-tick cap.
 			score += deadlineNs
 		}
 		if criticalBoostNs > 0 && nowNs <= atomic.LoadInt64(&conn.criticalUntilNs) {
@@ -435,14 +468,24 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 		}
 
 		item := scoredConnection{conn: conn, score: score, rrBias: rrBias, overdue: isOverdue}
-		if top.Len() < limit {
-			heap.Push(&top, item)
+		if len(top) < limit {
+			// Phase 1: fill — direct append, no interface boxing.
+			top = append(top, item)
+			if len(top) == limit {
+				// Heap is full for the first time: establish heap property in O(limit).
+				heap.Init(&top)
+			}
 			continue
 		}
+		// Phase 2: replace minimum if current item scores higher.
 		if item.score > top[0].score || (item.score == top[0].score && item.rrBias > top[0].rrBias) {
 			top[0] = item
 			heap.Fix(&top, 0)
 		}
+	}
+	// If we never filled the heap (n < limit), establish heap property now.
+	if len(top) > 0 && len(top) < limit {
+		heap.Init(&top)
 	}
 
 	overdueSelected := 0
@@ -451,7 +494,10 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 		if top[i].overdue {
 			overdueSelected++
 		}
+		top[i] = scoredConnection{} // clear pointer refs before returning to pool
 	}
+	*topPtr = top[:0]
+	scoredConnPool.Put(topPtr)
 
 	return selected, overdueSelected
 }
@@ -695,33 +741,10 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 
 	enqueueStart := time.Now()
 	dropped := 0
-	if s.fanoutWorkers <= 1 || m < s.fanoutWorkers*64 {
-		for _, conn := range recipients {
-			if !s.enqueueBroadcastJob(conn, f, sentAtNs) {
-				dropped++
-			}
+	for _, conn := range recipients {
+		if !s.enqueueBroadcastJob(conn, f, sentAtNs) {
+			dropped++
 		}
-	} else {
-		chunkSize := (m + s.fanoutWorkers - 1) / s.fanoutWorkers
-		var wg sync.WaitGroup
-		var droppedAtomic int64
-
-		for start := 0; start < m; start += chunkSize {
-			end := start + chunkSize
-			if end > m {
-				end = m
-			}
-			wg.Add(1)
-			s.fanoutJobs <- fanoutJob{
-				conns:    recipients[start:end],
-				frame:    f,
-				sentAtNs: sentAtNs,
-				dropped:  &droppedAtomic,
-				wg:       &wg,
-			}
-		}
-		wg.Wait()
-		dropped = int(atomic.LoadInt64(&droppedAtomic))
 	}
 	enqueueDur := time.Since(enqueueStart)
 	metrics.TickFanoutEnqueueDuration.Observe(enqueueDur.Seconds())

@@ -19,6 +19,23 @@ import (
 	"pixi_game_server/internal/metrics"
 )
 
+// readBufPoolSize is the fixed size of pooled read buffers.
+// All client message types fit within 64 bytes:
+//   - Move:        1 (type) + 1 (vector) + 4 (input_seq) = 6 bytes
+//   - Direction:   1 + 1 = 2 bytes
+//   - Attack:      1 byte
+//   - ViewportUpdate: up to ~16 bytes
+const readBufPoolSize = 64
+
+// readBufPool pools fixed-size receive buffers for incoming WebSocket frames.
+// Eliminates ~48k/sec make([]byte, N) allocations at 2400 clients × 20Hz input.
+var readBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, readBufPoolSize)
+		return &b
+	},
+}
+
 // epollPoller is the Linux readHandler implementation.
 // It registers each accepted WebSocket connection's file descriptor with
 // epoll(7) using EPOLLONESHOT, so exactly one worker goroutine handles each
@@ -199,10 +216,23 @@ func (ep *epollPoller) processRead(c *Connection) {
 	}
 
 	// Read the payload.
+	// readBufPool provides 64-byte buffers covering all client message types.
+	// For payloads > 64 bytes (not expected in normal protocol use) fall back to make.
+	// processMessage is synchronous and never stores the payload slice, so returning
+	// the buffer to the pool after the switch is safe.
 	var payload []byte
+	var poolBuf *[]byte
 	if hdr.Length > 0 {
-		payload = make([]byte, hdr.Length)
+		if int(hdr.Length) <= readBufPoolSize {
+			poolBuf = readBufPool.Get().(*[]byte)
+			payload = (*poolBuf)[:hdr.Length]
+		} else {
+			payload = make([]byte, hdr.Length)
+		}
 		if _, err := io.ReadFull(c.rawConn, payload); err != nil {
+			if poolBuf != nil {
+				readBufPool.Put(poolBuf)
+			}
 			metrics.WSReadErrors.Inc()
 			go ep.svr.cleanupConnection(c)
 			return
@@ -219,12 +249,20 @@ func (ep *epollPoller) processRead(c *Connection) {
 
 	switch hdr.OpCode {
 	case ws.OpClose:
+		if poolBuf != nil {
+			readBufPool.Put(poolBuf)
+		}
 		go ep.svr.cleanupConnection(c)
 		return
 
 	case ws.OpPing:
-		// Route pong through the connection's write channel to avoid concurrent Write calls.
+		// ws.NewPongFrame copies payload into the Frame struct before CompileFrame.
+		// Safe to return poolBuf after the pong is compiled.
 		pongFrame, compErr := ws.CompileFrame(ws.NewPongFrame(payload))
+		if poolBuf != nil {
+			readBufPool.Put(poolBuf)
+			poolBuf = nil
+		}
 		if compErr == nil {
 			select {
 			case c.writeCh <- writeJob{direct: pongFrame, timeout: directWriteTimeout}:
@@ -242,6 +280,7 @@ func (ep *epollPoller) processRead(c *Connection) {
 			slog.Warn("rate limit exceeded", "player_id", c.player.ID)
 			metrics.MessagesRateLimited.Inc()
 		} else {
+			// processMessage is synchronous and does not retain the payload slice.
 			ep.svr.processMessage(c, payload)
 		}
 
@@ -249,6 +288,9 @@ func (ep *epollPoller) processRead(c *Connection) {
 		// Continuation frames and unknown opcodes — ignore for now.
 	}
 
+	if poolBuf != nil {
+		readBufPool.Put(poolBuf)
+	}
 	// Re-arm so epoll will notify us on the next incoming frame.
 	ep.rearm(c)
 }

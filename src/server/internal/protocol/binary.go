@@ -58,19 +58,21 @@ func UnpackMovement(packed uint8) MovementVector {
 }
 
 // DecodeClientMessage декодирует сообщение от клиента
-func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (*ClientMessage, error) {
+// DecodeClientMessage parses a raw WebSocket payload into a ClientMessage.
+// Returns a value type (not a pointer) to avoid a heap allocation on the hot path.
+func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (ClientMessage, error) {
 	if len(data) < 1 {
-		return nil, fmt.Errorf("message too short")
+		return ClientMessage{}, fmt.Errorf("message too short")
 	}
 
-	msg := &ClientMessage{
+	msg := ClientMessage{
 		Type: data[0],
 	}
 
 	switch msg.Type {
 	case MessageMove:
 		if len(data) < 6 {
-			return nil, fmt.Errorf("move message too short")
+			return ClientMessage{}, fmt.Errorf("move message too short")
 		}
 		movement := UnpackMovement(data[1])
 		msg.MovementVector = movement
@@ -78,7 +80,7 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (*ClientMessage, erro
 
 	case MessageDirection:
 		if len(data) < 2 {
-			return nil, fmt.Errorf("direction message too short")
+			return ClientMessage{}, fmt.Errorf("direction message too short")
 		}
 		msg.Direction = data[1] == 1
 
@@ -89,7 +91,7 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (*ClientMessage, erro
 		// Accepted but not processed — viewport-based culling not yet implemented.
 
 	default:
-		return nil, fmt.Errorf("unknown message type: %d", msg.Type)
+		return ClientMessage{}, fmt.Errorf("unknown message type: %d", msg.Type)
 	}
 
 	return msg, nil

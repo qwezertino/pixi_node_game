@@ -24,12 +24,11 @@ interface PositionSnapshot {
     y: number;
 }
 
-const MIN_INTERPOLATION_DELAY_MS = 90;
-const MAX_INTERPOLATION_DELAY_MS = 220;
+// При 20Hz тик = 50ms. Держим буфер 2 тика (100ms) чтобы
+// всегда было 2 снапшота для интерполяции даже при лёгком джиттере.
+const MIN_INTERPOLATION_DELAY_MS = 100;
+const MAX_INTERPOLATION_DELAY_MS = 300;
 const SNAPSHOT_EWMA_ALPHA = 0.15;
-// Максимальное время экстраполяции когда буфер пуст (высокий пинг / потеря пакетов).
-// После этого порога позиция замораживается до следующего снимка.
-const MAX_EXTRAPOLATE_CAP_MS = 320;
 const MAX_SNAPSHOTS = 32;
 
 class RemotePlayer {
@@ -174,30 +173,11 @@ class RemotePlayer {
                 this.virtualPosition.x = older.x + (newer.x - older.x) * t;
                 this.virtualPosition.y = older.y + (newer.y - older.y) * t;
             } else {
-                // renderTime опережает новейший снимок — высокий пинг / потеря пакетов.
-                // Экстраполируем скоростью последних двух снимков вместо заморозки.
-                const extrapolateMs = renderTime - newest.time;
-                const maxExtrapolateMs = Math.min(
-                    MAX_EXTRAPOLATE_CAP_MS,
-                    Math.max(140, this.interpolationDelayMs * 1.75)
-                );
-                if (extrapolateMs <= maxExtrapolateMs) {
-                    const prev = snaps[snaps.length - 2];
-                    const dt = newest.time - prev.time;
-                    if (dt > 0) {
-                        const vx = (newest.x - prev.x) / dt;
-                        const vy = (newest.y - prev.y) / dt;
-                        this.virtualPosition.x = newest.x + vx * extrapolateMs;
-                        this.virtualPosition.y = newest.y + vy * extrapolateMs;
-                    } else {
-                        this.virtualPosition.x = newest.x;
-                        this.virtualPosition.y = newest.y;
-                    }
-                } else {
-                    // Слишком долго без данных — замораживаем на последней известной позиции
-                    this.virtualPosition.x = newest.x;
-                    this.virtualPosition.y = newest.y;
-                }
+                // renderTime опережает новейший снимок — буфер 100ms (2 тика × 50ms)
+                // делает этот случай редким. Держим последнюю известную позицию:
+                // никакой экстраполяции → никакого телепорта-назад при получении снимка.
+                this.virtualPosition.x = newest.x;
+                this.virtualPosition.y = newest.y;
             }
 
             if (this.coordinateConverter) {
