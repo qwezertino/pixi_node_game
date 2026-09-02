@@ -72,6 +72,11 @@ var (
 		Help: "Total messages dropped due to per-connection rate limiting",
 	})
 
+	MovementInputsRejected = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_movement_inputs_rejected_total",
+		Help: "Movement inputs rejected due to duplicate/out-of-order sequence or a full input ring",
+	})
+
 	BytesReceived = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_bytes_received_total",
 		Help: "Total bytes received from clients",
@@ -218,6 +223,24 @@ var (
 		Buckets: []float64{0, 1, 2, 4, 6, 8, 12, 16, 24, 32},
 	})
 
+	WorldStateQueueDelay = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_world_state_queue_delay_seconds",
+		Help:    "Time a world-state frame waits in a per-connection queue before writing",
+		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 16),
+	})
+
+	WorldStateAgeAtWriteStart = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_world_state_age_at_write_start_seconds",
+		Help:    "World-state age when the socket write starts",
+		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 16),
+	})
+
+	WorldStateAgeAtWriteEnd = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_world_state_age_at_write_end_seconds",
+		Help:    "World-state age when the socket write completes",
+		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 16),
+	})
+
 	AdaptiveBatchIntervalMs = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_adaptive_batch_interval_ms",
 		Help: "Current adaptive batch interval in milliseconds for broadcast pacing",
@@ -237,5 +260,46 @@ var (
 	DeltaRatio = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_delta_ratio",
 		Help: "Fraction of players with changed state in the last tick (0.0–1.0)",
+	})
+
+	// The three metrics below size the payoff of velocity replication before it is
+	// built. Position is a deterministic function of velocity on both sides, so a
+	// client could dead-reckon every record counted by DeltaPositionOnly instead of
+	// receiving it. DeltaVectorChanges plus DeltaClampedPlayers is the traffic that
+	// would remain: input the client cannot predict, and boundary clamps that break
+	// the prediction.
+	DeltaVectorChanges = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_delta_vector_changes",
+		Help:    "Broadcast records a dead-reckoning client could not predict (velocity/state/facing changed)",
+		Buckets: []float64{0, 10, 50, 100, 250, 500, 1000, 2000, 5000},
+	})
+
+	DeltaPositionOnly = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_delta_position_only",
+		Help:    "Broadcast records present only because position advanced predictably — removable by velocity replication",
+		Buckets: []float64{0, 10, 50, 100, 250, 500, 1000, 2000, 5000},
+	})
+
+	DeltaClampedPlayers = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_delta_clamped_players",
+		Help:    "Broadcast records where a moving player did not advance (world-boundary clamp), which dead reckoning would mispredict",
+		Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256},
+	})
+
+	BroadcastRecords = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_broadcast_records",
+		Help:    "Player records actually placed on the wire per broadcast frame",
+		Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 5000},
+	})
+
+	DeltaKeyframes = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_delta_keyframes",
+		Help:    "Records added purely by keyframe rotation so clients converge after a missed record",
+		Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256},
+	})
+
+	DeltaPredictableRatio = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "game_delta_predictable_ratio",
+		Help: "Fraction of the last broadcast delta a dead-reckoning client could have predicted (0.0–1.0)",
 	})
 )

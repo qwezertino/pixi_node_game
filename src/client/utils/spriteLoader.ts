@@ -12,8 +12,25 @@ const ANIMATIONS_CONFIG = [
     { name: "block", row: 7, frames: 2 }
 ];
 
+export interface CharacterVisual {
+    animations: Map<string, Texture[]>;
+    getAnimation: (name: string) => AnimatedSprite | undefined;
+}
+
 export class SpriteLoader {
-    static async loadCharacterVisual(spritesheetPath: string) {
+    private static readonly characterVisuals = new Map<string, Promise<CharacterVisual>>();
+
+    static loadCharacterVisual(spritesheetPath: string): Promise<CharacterVisual> {
+        let visual = this.characterVisuals.get(spritesheetPath);
+        if (!visual) {
+            visual = this.createCharacterVisual(spritesheetPath);
+            this.characterVisuals.set(spritesheetPath, visual);
+            visual.catch(() => this.characterVisuals.delete(spritesheetPath));
+        }
+        return visual;
+    }
+
+    private static async createCharacterVisual(spritesheetPath: string): Promise<CharacterVisual> {
         const sheetTexture = await Assets.load(spritesheetPath);
         const animations = new Map<string, Texture[]>();
 

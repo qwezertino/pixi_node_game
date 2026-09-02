@@ -100,6 +100,9 @@ export interface GameStateMessage extends ServerMessage {
     players: Record<string, PlayerState>;
     timestamp: number;
     stateSequence?: number;
+    // Simulation tick the records describe. Players absent from a delta are
+    // dead-reckoned forward by the tick difference since the previous frame.
+    worldTick: number;
 }
 
 export interface MovementAcknowledgmentMessage extends ServerMessage {
@@ -116,6 +119,18 @@ export interface ServerCorrectionMessage extends ServerMessage {
     position: PlayerPosition;
 }
 
+export interface WelcomeMessage extends ServerMessage {
+    type: 'welcome';
+    protocolVersion: number;
+    tickRate: number;
+    playerId: string;
+}
+
+// Must match protocol.ProtocolVersion on the server. The wire format carries no
+// per-record framing, so a mismatched decoder does not fail — it silently yields
+// wrong player IDs. Checking the version turns that into a visible error.
+export const PROTOCOL_VERSION = 3;
+
 export enum MessageType {
     JOIN = 1,
     LEAVE = 2,
@@ -130,4 +145,6 @@ export enum MessageType {
     PLAYER_JOINED = 11,
     PLAYER_LEFT = 12,
     DELTA_GAME_STATE = 14,
+    WELCOME = 15,
+    SYNC_REQUEST = 16,
 }

@@ -214,6 +214,12 @@ func (ep *epollPoller) processRead(c *Connection) {
 		go ep.svr.cleanupConnection(c)
 		return
 	}
+	if !validClientHeader(hdr) {
+		metrics.WSReadErrors.Inc()
+		ep.svr.logRejectedFrame(c, hdr)
+		go ep.svr.cleanupConnection(c)
+		return
+	}
 
 	// Read the payload.
 	// readBufPool provides 64-byte buffers covering all client message types.
@@ -239,10 +245,7 @@ func (ep *epollPoller) processRead(c *Connection) {
 		}
 	}
 
-	// Client frames must be masked (RFC 6455 §5.3).
-	if hdr.Masked {
-		ws.Cipher(payload, hdr.Mask, 0)
-	}
+	ws.Cipher(payload, hdr.Mask, 0)
 
 	// Update liveness timestamp.
 	atomic.StoreInt64(&c.lastActivity, time.Now().UnixNano())
@@ -273,19 +276,30 @@ func (ep *epollPoller) processRead(c *Connection) {
 	case ws.OpPong:
 		// Already updated lastActivity above; nothing else needed.
 
-	case ws.OpBinary, ws.OpText:
+	case ws.OpBinary:
 		metrics.BytesReceived.Add(float64(len(payload)))
 
 		if !c.rateLimiter.Allow() {
-			slog.Warn("rate limit exceeded", "player_id", c.player.ID)
+			// Drop the message but keep the session: a burst can come from a
+			// middlebox flushing a stalled queue, not only from an abusive client.
+			// Only a sustained overage costs the connection.
 			metrics.MessagesRateLimited.Inc()
+			if atomic.AddInt32(&c.rateLimitStreak, 1) >= maxRateLimitStreak {
+				if poolBuf != nil {
+					readBufPool.Put(poolBuf)
+					poolBuf = nil
+				}
+				go ep.svr.cleanupConnection(c)
+				return
+			}
 		} else {
+			atomic.StoreInt32(&c.rateLimitStreak, 0)
 			// processMessage is synchronous and does not retain the payload slice.
 			ep.svr.processMessage(c, payload)
 		}
 
 	default:
-		// Continuation frames and unknown opcodes — ignore for now.
+		// Header validation limits opcodes to the cases above.
 	}
 
 	if poolBuf != nil {

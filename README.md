@@ -109,7 +109,7 @@ ulimit -n 65536
 | `make install` | `bun install` + `go mod tidy && go mod download` |
 | `make build` | Build client and server |
 | `make build-client` | Vite build → `dist/` |
-| `make build-server` | Go build → `dist/server` (copies gameConfig.json for embed, cleans up after) |
+| `make build-server` | Go build → `dist/server` (copies gameConfig.json for embed) |
 | `make build-server-linux` | Same + `CGO_ENABLED=0 GOOS=linux` |
 | `make build-release` | `build-client` + `build-server-linux` |
 | `make dev-client` | Vite dev server on `:8109` with HMR |
@@ -136,7 +136,7 @@ ulimit -n 65536
 | `/health` | JSON health check |
 | `/metrics` | Prometheus metrics |
 | `/metrics/json` | Legacy JSON metrics |
-| `/debug/pprof/` | Go pprof profiling (block + mutex profilers enabled) |
+| `/debug/pprof/` | Go pprof profiling (block + mutex profiling requires `PPROF_BLOCK_RATE=1`) |
 
 ---
 
@@ -145,9 +145,9 @@ ulimit -n 65536
 The Go server is built for minimal goroutine count at scale:
 
 - **Read path**: Linux epoll (`EPOLLONESHOT`) — 1 wait loop + `2×GOMAXPROCS` read workers. No goroutine-per-connection. At 10 000 clients: ~25 read goroutines total.
-- **Write path**: per-connection `writeCh chan writeJob` (buffered 4) with one persistent goroutine per connection (`startWriteLoop`). `writeJob` is a 40-byte value struct — no heap allocation on sends. Goroutines are long-lived, never created per tick.
-- **Game loop**: single `gameLoop` goroutine running at 30 Hz. Position updates are parallelised across `GOMAXPROCS` persistent worker goroutines. Delta tracking sends only changed state each tick; full sync every 1 s.
-- **GC tuning**: `GOGC=400` + `GOMEMLIMIT=2GiB` eliminates mark-assist latency spikes.
+- **Write path**: per-connection `writeCh chan writeJob` (buffered 32) with one persistent goroutine per connection (`startWriteLoop`). Broadcast frames are shared/ref-counted; movement ACKs are encoded into reusable writer buffers. Goroutines are long-lived, never created per tick.
+- **Game loop**: single simulation loop at 20 Hz. Position updates are parallelised across `GOMAXPROCS` persistent worker goroutines. Replication is paced separately at a 100 ms base interval (adaptive up to 120 ms); full sync every 30 s.
+- **GC tuning**: concurrent GC remains enabled; the default application setting is `GOGC=400`, while `GOMEMLIMIT` should be set for the deployment memory budget.
 - **Goroutine count at 10 000 clients**: `2×GOMAXPROCS` (epoll readers) + `GOMAXPROCS` (tick workers) + 10 000 (persistent write loops) + a few system goroutines. Write goroutines are long-lived and blocked on channel receive — GC scans stacks but never creates/destroys them during gameplay.
 
 ---

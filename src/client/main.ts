@@ -79,6 +79,8 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
     // Create player container for organizing all player sprites
     const playerContainer = new Container();
+    playerContainer.eventMode = "none";
+    playerContainer.interactiveChildren = false;
     app.stage.addChild(playerContainer);
 
     // Initialize modules
@@ -187,8 +189,15 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     });
     console.log("Network connection established, starting game...");
 
+    // A dropped connection reconnects as a new server-side player at a new spawn.
+    // Without re-seeding the predicted position here, the first movement ACK of the
+    // new session would arrive as a large correction and snap the local player.
+    networkManager.onSessionStart((position) => {
+        movementController.setInitialPosition(position.x, position.y);
+    });
+
     // Local player attack animation — triggered by server confirmation via gameState
-    networkManager.onPlayerAttack((playerId, _position) => {
+    networkManager.onPlayerAttack((playerId) => {
         if (playerId === networkManager.getPlayerId()) {
             animationController.handleAttack();
         }
@@ -219,8 +228,10 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
         // Update FPS display
         fpsDisplay.update();
 
-        // Accumulate time
-        accumulator += deltaTime;
+        // Do not replay seconds of stale input after a suspended/background tab.
+        // Client and server both advance through explicit input steps, so dropping
+        // excess wall-clock catch-up here preserves their deterministic sequence.
+        accumulator = Math.min(accumulator + deltaTime, fixedTimeStep * 4);
 
         // Process physics at fixed time steps
         while (accumulator >= fixedTimeStep) {
@@ -234,12 +245,13 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
             }
             // During attack, keep ATTACKING state and don't change it
 
-            // Update remote players
-            playerManager.update(fixedTimeStep);
-
             // Decrease accumulated time
             accumulator -= fixedTimeStep;
         }
+
+        // Interpolation is a rendering concern and must run on every rendered frame,
+        // independently from the fixed-rate local simulation loop.
+        playerManager.update(deltaTime);
 
         // Update animation and visual state (can run at variable frame rate)
         animationController.playerRef.scale.copyFrom(movementController.scale);

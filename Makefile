@@ -1,7 +1,7 @@
 # Makefile for Pixi Node Game - 2D Multiplayer Game
 # Client: TypeScript + PixiJS, Server: Go
 
-.PHONY: all build build-client build-server run run-client run-server dev clean test docker-init docker-up docker-build docker-test docker-monitoring docker-down
+.PHONY: all build build-client build-server run run-client run-server dev clean test docker-init docker-up docker-build docker-test docker-monitoring docker-down protocol-test protocol-ab load-test lint
 
 # Variables
 SERVER_DIR=src/server
@@ -141,6 +141,17 @@ load-test:
 	@echo "⚡ Running server load tests..."
 	artillery run utils/testing/artillery/artillery-config.yml
 
+# End-to-end protocol probes: builds the server, bundles the real client decoder,
+# runs every probe against a fresh server. Pass PROBE=<name> to run just one.
+protocol-test:
+	@echo "🔌 Running protocol probes..."
+	utils/testing/protocol/run.sh $(PROBE)
+
+# A/B the velocity-replication switch under identical load.
+protocol-ab:
+	@echo "📊 Comparing replication modes..."
+	utils/testing/protocol/ab-velocity.sh $(CLIENTS) $(TURNS) $(SECONDS)
+
 # Help
 help:
 	@echo "Available commands:"
@@ -155,4 +166,6 @@ help:
 	@echo "  run             - Run production build"
 	@echo "  clean           - Clean build artifacts"
 	@echo "  load-test       - Run server load tests with Artillery"
+	@echo "  protocol-test   - Run end-to-end protocol probes (PROBE=<name> for one)"
+	@echo "  protocol-ab     - A/B velocity replication (CLIENTS=, TURNS=, SECONDS=)"
 	@echo "  deps            - Install dependencies"

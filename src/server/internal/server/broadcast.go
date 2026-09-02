@@ -2,6 +2,7 @@ package server
 
 import (
 	"container/heap"
+	"encoding/binary"
 	"log/slog"
 	"net"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"github.com/gobwas/ws"
 
 	"pixi_game_server/internal/metrics"
+	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/types"
 )
 
@@ -80,6 +82,13 @@ var connectionSlicePool = sync.Pool{
 	},
 }
 
+var recipientSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]*Connection, 0, 4096)
+		return &s
+	},
+}
+
 // scoredConnPool pools topKMinHeap slices for selectRecipients.
 // selectRecipients is called every tick; pooling eliminates the per-tick
 // make(topKMinHeap, 0, N) allocation and the heap.Push interface-boxing allocations
@@ -131,8 +140,13 @@ const (
 	// directWriteTimeout — deadline for ACK, pong, initial-state writes.
 	directWriteTimeout = 30 * time.Millisecond
 
+	// maxAdaptiveBatchInterval — fallback ceiling for replication backoff when the tick
+	// rate is unknown. With a known tick rate the ceiling is derived from it instead,
+	// so that the backoff survives quantisation to whole ticks.
+	maxAdaptiveBatchInterval = 120 * time.Millisecond
+
 	// maxWriteFailures — consecutive write failures before declaring a connection dead.
-	// At 30 Hz ticks with broadcastWriteTimeout=100ms: 150 × 100ms = 15s of sustained
+	// With broadcastWriteTimeout=100ms: 150 failures = 15s of sustained
 	// inability to write before disconnect.
 	maxWriteFailures = 150
 
@@ -153,57 +167,40 @@ const (
 //     then calls frame.release() to decrement the ref-count.
 //   - Direct write:    frame == nil, direct != nil. Write loop writes direct bytes.
 type writeJob struct {
-	frame   *tickFrame // non-nil for broadcast (shared, ref-counted)
-	direct  []byte     // non-nil for ACK / pong / initial-state
-	timeout time.Duration
+	frame          *tickFrame // non-nil for broadcast (shared, ref-counted)
+	direct         []byte     // non-nil for pong / initial-state / lifecycle events
+	ack            bool       // movement ACK encoded by the writer into a reusable batch buffer
+	ackID          uint32
+	ackX           uint16
+	ackY           uint16
+	ackSeq         uint32
+	stateCreatedNs int64 // non-zero for world-state jobs
+	enqueuedNs     int64
+	timeout        time.Duration
 }
 
-type fanoutJob struct {
-	conns    []*Connection
-	frame    *tickFrame
-	sentAtNs int64
-	dropped  *int64
-	wg       *sync.WaitGroup
+func writeJobFrame(job *writeJob, ackBuffer *[15]byte) []byte {
+	if job.frame != nil {
+		return job.frame.frame
+	}
+	if !job.ack {
+		return job.direct
+	}
+
+	// Server frames are unmasked. MOVEMENT_ACK payload is 13 bytes, so the WS
+	// header is the compact two-byte form. The buffer belongs to the persistent
+	// writer batch and is reused after Write/WriteTo returns.
+	ackBuffer[0] = 0x82
+	ackBuffer[1] = 13
+	ackBuffer[2] = protocol.MessageMovementAck
+	binary.LittleEndian.PutUint32(ackBuffer[3:], job.ackID)
+	binary.LittleEndian.PutUint16(ackBuffer[7:], job.ackX)
+	binary.LittleEndian.PutUint16(ackBuffer[9:], job.ackY)
+	binary.LittleEndian.PutUint32(ackBuffer[11:], job.ackSeq)
+	return ackBuffer[:]
 }
 
-func (s *Server) initFanoutWorkers() {
-	workers := s.cfg.Net.FanoutWorkers
-	if workers <= 0 {
-		workers = s.cfg.Server.Workers * 2
-	}
-	if workers < 1 {
-		workers = 1
-	}
-
-	s.fanoutWorkers = workers
-	s.fanoutJobs = make(chan fanoutJob, workers*2)
-
-	for i := 0; i < workers; i++ {
-		go s.runFanoutWorker()
-	}
-}
-
-func (s *Server) runFanoutWorker() {
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case job := <-s.fanoutJobs:
-			localDropped := 0
-			for _, conn := range job.conns {
-				if !s.enqueueBroadcastJob(conn, job.frame, job.sentAtNs) {
-					localDropped++
-				}
-			}
-			if localDropped > 0 {
-				atomic.AddInt64(job.dropped, int64(localDropped))
-			}
-			job.wg.Done()
-		}
-	}
-}
-
-func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtNs int64) bool {
+func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCreatedNs int64) bool {
 	if s.fanoutQueueShedDepth > 0 {
 		depth := len(conn.writeCh)
 		if depth >= s.fanoutQueueShedDepth {
@@ -224,8 +221,12 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtN
 	}
 
 	select {
-	case conn.writeCh <- writeJob{frame: frame, timeout: broadcastWriteTimeout}:
-		atomic.StoreInt64(&conn.lastWorldStateSentNs, sentAtNs)
+	case conn.writeCh <- writeJob{
+		frame:          frame,
+		stateCreatedNs: stateCreatedNs,
+		enqueuedNs:     time.Now().UnixNano(),
+		timeout:        broadcastWriteTimeout,
+	}:
 		if atomic.LoadInt32(&conn.fanoutDrops) != 0 {
 			atomic.StoreInt32(&conn.fanoutDrops, 0)
 		}
@@ -246,7 +247,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, sentAtN
 // Design rationale (vs gws lazy-goroutine / connWriteQueue pattern):
 //
 // The lazy-goroutine pattern spawns a new goroutine each time push() is called on an empty
-// queue and exits when the queue drains. At 30 Hz broadcast with N connections that means
+// queue and exits when the queue drains. With N connections that means
 // N goroutines spawned and destroyed every tick: 36 000 goroutine lifecycle events/s at
 // 1 200 clients. Each spawn allocates a stack; together they cause constant GC mark-assist
 // ("soft pauses") even with GOGC=400, producing 80–112 ms observed GC pauses and 80 ms
@@ -269,16 +270,13 @@ func (s *Server) startWriteLoop(c *Connection) {
 
 		jobs := make([]writeJob, batchSize)
 		frames := make([][]byte, batchSize)
+		ackBuffers := make([][15]byte, batchSize)
 
 		for {
 			select {
 			case first := <-c.writeCh:
 				jobs[0] = first
-				if first.frame != nil {
-					frames[0] = first.frame.frame
-				} else {
-					frames[0] = first.direct
-				}
+				frames[0] = writeJobFrame(&jobs[0], &ackBuffers[0])
 
 				count := 1
 				maxTimeout := first.timeout
@@ -286,11 +284,7 @@ func (s *Server) startWriteLoop(c *Connection) {
 					select {
 					case job := <-c.writeCh:
 						jobs[count] = job
-						if job.frame != nil {
-							frames[count] = job.frame.frame
-						} else {
-							frames[count] = job.direct
-						}
+						frames[count] = writeJobFrame(&jobs[count], &ackBuffers[count])
 						if job.timeout > maxTimeout {
 							maxTimeout = job.timeout
 						}
@@ -302,6 +296,16 @@ func (s *Server) startWriteLoop(c *Connection) {
 
 			writeBatch:
 				writeStart := time.Now()
+				writeStartNs := writeStart.UnixNano()
+				for i := 0; i < count; i++ {
+					if jobs[i].stateCreatedNs == 0 {
+						continue
+					}
+					queueDelay := time.Duration(writeStartNs - jobs[i].enqueuedNs)
+					stateAge := time.Duration(writeStartNs - jobs[i].stateCreatedNs)
+					metrics.WorldStateQueueDelay.Observe(queueDelay.Seconds())
+					metrics.WorldStateAgeAtWriteStart.Observe(stateAge.Seconds())
+				}
 				c.rawConn.SetWriteDeadline(time.Now().Add(maxTimeout))
 
 				// net.Buffers.WriteTo escapes the slice header to the heap on every
@@ -323,6 +327,32 @@ func (s *Server) startWriteLoop(c *Connection) {
 				metrics.WSWriteBatchDuration.Observe(time.Since(writeStart).Seconds())
 				metrics.WSWriteBatchJobs.Observe(float64(count))
 
+				writeEndNs := time.Now().UnixNano()
+				for i := 0; i < count; i++ {
+					if jobs[i].stateCreatedNs == 0 {
+						continue
+					}
+					ageNs := writeEndNs - jobs[i].stateCreatedNs
+					metrics.WorldStateAgeAtWriteEnd.Observe(time.Duration(ageNs).Seconds())
+					updateAtomicMax(&s.writePressurePeakNs, ageNs)
+				}
+				fatalWriteFailure := false
+				if err != nil {
+					metrics.WSWriteErrors.Inc()
+					if atomic.AddInt32(&c.writeFailures, 1) >= maxWriteFailures {
+						fatalWriteFailure = true
+					}
+				} else {
+					atomic.StoreInt32(&c.writeFailures, 0)
+					metrics.BytesSent.Add(float64(n))
+					for i := 0; i < count; i++ {
+						if jobs[i].stateCreatedNs == 0 {
+							continue
+						}
+						atomic.StoreInt64(&c.lastWorldStateSentNs, writeEndNs)
+					}
+				}
+
 				for i := 0; i < count; i++ {
 					if jobs[i].frame != nil {
 						atomic.StoreInt32(&c.pendingBroadcast, 0)
@@ -332,19 +362,12 @@ func (s *Server) startWriteLoop(c *Connection) {
 					jobs[i] = writeJob{}
 				}
 
-				if err != nil {
-					metrics.WSWriteErrors.Inc()
-					if atomic.AddInt32(&c.writeFailures, 1) >= maxWriteFailures {
-						go s.cleanupConnection(c)
-						// Drain any tickFrame refs that are already buffered before
-						// exiting. cleanupConnection will drain whatever arrives after
-						// the map removal (see drainWriteCh in cleanupConnection).
-						drainWriteCh(c.writeCh)
-						return
-					}
-				} else {
-					atomic.StoreInt32(&c.writeFailures, 0)
-					metrics.BytesSent.Add(float64(n))
+				if fatalWriteFailure {
+					go s.cleanupConnection(c)
+					// Drain refs buffered before exit. cleanupConnection handles the
+					// narrow race after map removal as well.
+					drainWriteCh(c.writeCh)
+					return
 				}
 
 			case <-c.ctx.Done():
@@ -355,6 +378,15 @@ func (s *Server) startWriteLoop(c *Connection) {
 			}
 		}
 	}()
+}
+
+func updateAtomicMax(target *int64, value int64) {
+	for {
+		current := atomic.LoadInt64(target)
+		if value <= current || atomic.CompareAndSwapInt64(target, current, value) {
+			return
+		}
+	}
 }
 
 // drainWriteCh releases all tickFrame refs currently buffered in ch and discards
@@ -374,10 +406,10 @@ func drainWriteCh(ch chan writeJob) {
 	}
 }
 
-func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connection, int) {
+func (s *Server) selectRecipients(conns []*Connection, nowNs int64, hardLimit int) ([]*Connection, int, *[]*Connection) {
 	n := len(conns)
 	if n == 0 {
-		return conns[:0], 0
+		return conns[:0], 0, nil
 	}
 
 	limit := n
@@ -393,8 +425,33 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 			limit = curr
 		}
 	}
+	if hardLimit > 0 && hardLimit < limit {
+		limit = hardLimit
+	}
 
-	selected := conns[:0]
+	// Common/default path: everybody receives the frame. Avoid scoring, heap work,
+	// and a second slice when neither recipient cap nor byte budget trims the set.
+	if limit >= n {
+		overdue := 0
+		for _, conn := range conns {
+			stalenessNs := nowNs - atomic.LoadInt64(&conn.lastWorldStateSentNs)
+			idleForNs := nowNs - atomic.LoadInt64(&conn.lastActivity)
+			deadlineNs := s.idleStalenessNs
+			if idleForNs <= s.activeWindowNs {
+				deadlineNs = s.activeStalenessNs
+			}
+			if stalenessNs >= deadlineNs {
+				overdue++
+			}
+		}
+		return conns, overdue, nil
+	}
+
+	selectedPtr := recipientSlicePool.Get().(*[]*Connection)
+	selected := (*selectedPtr)[:0]
+	if cap(selected) < limit {
+		selected = make([]*Connection, 0, limit)
+	}
 	activeWindowNs := s.activeWindowNs
 	activeStalenessNs := s.activeStalenessNs
 	idleStalenessNs := s.idleStalenessNs
@@ -499,7 +556,26 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64) ([]*Connecti
 	*topPtr = top[:0]
 	scoredConnPool.Put(topPtr)
 
-	return selected, overdueSelected
+	*selectedPtr = selected
+	return selected, overdueSelected, selectedPtr
+}
+
+// releaseConnSlice clears the element pointers before returning the backing array to
+// the pool: a pooled slice keeps them alive and would pin closed connections.
+func releaseConnSlice(conns []*Connection, buf *[]*Connection) {
+	for i := range conns {
+		conns[i] = nil
+	}
+	*buf = conns[:0]
+	connectionSlicePool.Put(buf)
+}
+
+func releaseRecipientSlice(recipients []*Connection, recipientPtr *[]*Connection) {
+	for i := range recipients {
+		recipients[i] = nil
+	}
+	*recipientPtr = recipients[:0]
+	recipientSlicePool.Put(recipientPtr)
 }
 
 func (s *Server) updateFairDebt(conns []*Connection, recipients []*Connection) {
@@ -623,48 +699,96 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 	}
 }
 
+// replicationIntervalNs rounds the requested batch interval to a whole number of
+// simulation ticks. Replication is evaluated on tick boundaries, so an interval that
+// is not a tick multiple cannot be honoured — it beats against the tick instead. With
+// a 50 ms tick and a 100 ms request, roughly half the ticks landed a fraction under
+// the threshold and deferred a full tick, producing a 100/150 ms alternation: an
+// effective 8 Hz instead of 10 Hz, and enough arrival jitter to pin the client's
+// adaptive interpolation delay at its 300 ms ceiling.
+//
+// This also bounds the adaptive controller honestly: its ±3..10 ms steps are below
+// tick granularity and can only take effect once they accumulate past half a tick.
+func replicationIntervalNs(batchNs, tickNs int64) int64 {
+	if batchNs <= 0 || tickNs <= 0 {
+		return batchNs
+	}
+	ticks := (batchNs + tickNs/2) / tickNs
+	if ticks < 1 {
+		ticks = 1
+	}
+	return ticks * tickNs
+}
+
+// shouldEmitFrame decides whether a paced tick puts a frame on the wire.
+//
+// Under velocity replication an empty delta still has to go out. The client
+// dead-reckons omitted players when a frame arrives, using the worldTick in its header
+// as the step count — so suppressing empty frames would freeze every remote player
+// until somebody happened to change direction. The heartbeat is a bare 13-byte header,
+// roughly 2 Mbit/s across 2000 clients at 10 Hz, against the hundreds of Mbit/s the
+// omitted records would otherwise have cost.
+//
+// In legacy mode nothing dead-reckons, so an empty delta carries no information and is
+// suppressed as before.
+func shouldEmitFrame(fullSync bool, changedCount int, velocityReplication bool) bool {
+	return fullSync || changedCount > 0 || velocityReplication
+}
+
+// adaptiveBatchCeiling bounds how far replication may back off under write pressure.
+// The ceiling has to be reachable in tick units, not just in milliseconds:
+// replicationIntervalNs rounds to the nearest tick, so a ceiling below base + 1.5
+// ticks quantises straight back to base and the backoff silently becomes a no-op.
+// Two ticks of headroom guarantee the controller can reach at least one longer
+// interval, which is what shedding actually costs.
+func adaptiveBatchCeiling(base time.Duration, tickIntervalNs int64) time.Duration {
+	if tickIntervalNs <= 0 {
+		return maxAdaptiveBatchInterval
+	}
+	return base + time.Duration(2*tickIntervalNs)
+}
+
+// replicationDue allows a half-tick of slack so that ordinary ticker jitter cannot
+// push an on-schedule tick just under the threshold and cost it a whole tick. A tick
+// can only arrive on the tick grid, so the slack never admits an extra emission.
+func replicationDue(nowNs, lastNs, intervalNs, tickNs int64) bool {
+	if intervalNs <= 0 {
+		return true
+	}
+	return nowNs-lastNs >= intervalNs-tickNs/2
+}
+
 // ── Broadcast ─────────────────────────────────────────────────────────────────
 
 // broadcastTick encodes the game state once and fans it out to every connection's
 // writeQueue. Zero-allocation hot path after warm-up (buffer from sync.Pool, ref-counted).
 // Each connection's drain goroutine calls f.release() after writing; when refs→0 the
 // buffer returns to the pool.
-func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.PlayerState, fullSync bool) {
+func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32) bool {
 	if len(allPlayers) == 0 {
-		return
-	}
-	if !fullSync && len(changed) == 0 {
-		return
+		return false
 	}
 
+	// Two independent pacing clocks. The ACK pass is throttled by lastAckPassNs so it
+	// runs at the replication rate rather than the simulation rate; the state frame is
+	// throttled by lastBroadcastNs, which advances only when a frame is actually sent.
+	// Sharing one clock would let a tick that emits only ACKs consume the state slot
+	// and delay the next real delta by up to a full interval.
+	nowNs := time.Now().UnixNano()
+	intervalNs := int64(0)
 	if !fullSync {
-		batchNs := atomic.LoadInt64(&s.adaptiveBatchNs)
-		if batchNs > 0 {
-			now := time.Now().UnixNano()
-			last := atomic.LoadInt64(&s.lastBroadcastNs)
-			if now-last < batchNs {
-				return
-			}
-			atomic.StoreInt64(&s.lastBroadcastNs, now)
-		}
+		intervalNs = replicationIntervalNs(atomic.LoadInt64(&s.adaptiveBatchNs), s.tickIntervalNs)
 	}
 
-	t0 := time.Now()
-	stateSequence := atomic.AddUint32(&s.worldStateSeq, 1)
-	f := broadcastFramePool.Get().(*tickFrame)
-	f.data = f.data[:0]
-	// Reserve 10 bytes at front for the WS binary frame header (filled by wsFrameSlice below).
-	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-	if fullSync {
-		f.data = s.protocol.AppendGameState(f.data, allPlayers, stateSequence)
-	} else {
-		f.data = s.protocol.AppendDeltaGameState(f.data, changed, stateSequence)
+	if !replicationDue(nowNs, atomic.LoadInt64(&s.lastAckPassNs), intervalNs, s.tickIntervalNs) {
+		return false
 	}
-	f.frame = wsFrameSlice(f.data)
-	if payloadSize := len(f.data) - 10; payloadSize > 0 {
-		metrics.BroadcastPayloadBytes.Observe(float64(payloadSize))
+	atomic.StoreInt64(&s.lastAckPassNs, nowNs)
+
+	hasState := shouldEmitFrame(fullSync, len(changed), s.cfg.Net.VelocityReplication)
+	if hasState && !replicationDue(nowNs, atomic.LoadInt64(&s.lastBroadcastNs), intervalNs, s.tickIntervalNs) {
+		hasState = false
 	}
-	metrics.TickPhaseDuration.WithLabelValues("encode").Observe(time.Since(t0).Seconds())
 
 	t1 := time.Now()
 	sentAtNs := t1.UnixNano()
@@ -674,10 +798,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	n := len(s.connections)
 	if n == 0 {
 		s.connectionsMu.RUnlock()
-		f.data = f.data[:0]
-		f.frame = nil
-		broadcastFramePool.Put(f)
-		return
+		return true
 	}
 	buf := connectionSlicePool.Get().(*[]*Connection)
 	conns := (*buf)[:0]
@@ -690,26 +811,58 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.BroadcastTargets.Observe(float64(n))
 	s.connectionsMu.RUnlock()
 
-	selectStart := time.Now()
-	recipients, overdue := s.selectRecipients(conns, sentAtNs)
-	selectDur := time.Since(selectStart)
-	metrics.TickFanoutSelectDuration.Observe(selectDur.Seconds())
-	metrics.TickPhaseDuration.WithLabelValues("fanout_select").Observe(selectDur.Seconds())
-	m := len(recipients)
-	s.updateFairDebt(conns, recipients)
-	if m == 0 {
-		for i := range conns {
-			conns[i] = nil
-		}
-		*buf = conns[:0]
-		connectionSlicePool.Put(buf)
+	// ACKs must not depend on the delta payload being non-empty. A player held
+	// against a world boundary keeps consuming inputs without changing any
+	// replicated field; if the ACK rode on the delta, that client would never prune
+	// its pending-input ring and would overflow it after PlayerInputQueueCapacity steps.
+	s.enqueueAuthoritativeMovementAcks(conns)
 
-		f.data = f.data[:0]
-		f.frame = nil
-		broadcastFramePool.Put(f)
-		return
+	if !hasState {
+		releaseConnSlice(conns, buf)
+		return false
+	}
+	atomic.StoreInt64(&s.lastBroadcastNs, nowNs)
+
+	t0 := time.Now()
+	// Increment only once a state frame is actually produced: the client treats a
+	// sequence distance != 1 as a gap and asks for a full resync.
+	stateSequence := atomic.AddUint32(&s.worldStateSeq, 1)
+	f := broadcastFramePool.Get().(*tickFrame)
+	f.data = f.data[:0]
+	// Reserve 10 bytes at front for the WS binary frame header (filled by wsFrameSlice below).
+	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	if fullSync {
+		f.data = s.protocol.AppendGameState(f.data, allPlayers, stateSequence, worldTick)
+	} else {
+		f.data = s.protocol.AppendDeltaGameState(f.data, changed, stateSequence, worldTick)
+	}
+	f.frame = wsFrameSlice(f.data)
+	payloadSize := len(f.data) - 10
+	if payloadSize > 0 {
+		metrics.BroadcastPayloadBytes.Observe(float64(payloadSize))
+	}
+	if fullSync {
+		metrics.BroadcastRecords.Observe(float64(len(allPlayers)))
+	} else {
+		metrics.BroadcastRecords.Observe(float64(len(changed)))
+	}
+	metrics.TickPhaseDuration.WithLabelValues("encode").Observe(time.Since(t0).Seconds())
+
+	selectionLimit := n
+	if s.fanoutMaxRecipients > 0 {
+		selectionLimit = int(atomic.LoadInt64(&s.fanoutRecipientLimit))
+		if selectionLimit < s.fanoutMinRecipients {
+			selectionLimit = s.fanoutMinRecipients
+		}
+		if selectionLimit > s.fanoutMaxRecipients {
+			selectionLimit = s.fanoutMaxRecipients
+		}
+		if selectionLimit > n {
+			selectionLimit = n
+		}
 	}
 
+	budgetLimit := 0
 	if budgetBytes := s.fanoutMaxBroadcastBytesPerTick; budgetBytes > 0 {
 		frameBytes := len(f.frame)
 		if frameBytes > 0 {
@@ -718,17 +871,31 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 				budgetRecipients = 1
 			}
 			metrics.BroadcastBudgetRecipients.Observe(float64(budgetRecipients))
-			if budgetRecipients < m {
-				trimmed := m - budgetRecipients
-				recipients = recipients[:budgetRecipients]
-				m = budgetRecipients
-				if overdue > m {
-					overdue = m
-				}
+			if budgetRecipients < selectionLimit {
+				budgetLimit = budgetRecipients
 				metrics.BroadcastBudgetHits.Inc()
-				metrics.BroadcastBudgetTrimmed.Add(float64(trimmed))
+				metrics.BroadcastBudgetTrimmed.Add(float64(selectionLimit - budgetRecipients))
 			}
 		}
+	}
+
+	selectStart := time.Now()
+	recipients, overdue, recipientPtr := s.selectRecipients(conns, sentAtNs, budgetLimit)
+	selectDur := time.Since(selectStart)
+	metrics.TickFanoutSelectDuration.Observe(selectDur.Seconds())
+	metrics.TickPhaseDuration.WithLabelValues("fanout_select").Observe(selectDur.Seconds())
+	m := len(recipients)
+	s.updateFairDebt(conns, recipients)
+	if m == 0 {
+		if recipientPtr != nil {
+			releaseRecipientSlice(recipients, recipientPtr)
+		}
+		releaseConnSlice(conns, buf)
+
+		f.data = f.data[:0]
+		f.frame = nil
+		broadcastFramePool.Put(f)
+		return false
 	}
 
 	metrics.BroadcastRecipients.Observe(float64(m))
@@ -750,11 +917,10 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.TickFanoutEnqueueDuration.Observe(enqueueDur.Seconds())
 	metrics.TickPhaseDuration.WithLabelValues("fanout_enqueue").Observe(enqueueDur.Seconds())
 
-	for i := range conns {
-		conns[i] = nil
+	if recipientPtr != nil {
+		releaseRecipientSlice(recipients, recipientPtr)
 	}
-	*buf = conns[:0]
-	connectionSlicePool.Put(buf)
+	releaseConnSlice(conns, buf)
 
 	fanoutDur := time.Since(t1)
 	metrics.TickPhaseDuration.WithLabelValues("fanout_send").Observe(fanoutDur.Seconds())
@@ -767,12 +933,15 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 			curr = base
 		}
 
+		ceiling := adaptiveBatchCeiling(base, s.tickIntervalNs)
+
+		pressure := time.Duration(atomic.SwapInt64(&s.writePressurePeakNs, 0))
 		next := curr
-		if fanoutDur > 30*time.Millisecond {
-			next = minDuration(curr+10*time.Millisecond, 120*time.Millisecond)
-		} else if fanoutDur > 15*time.Millisecond {
-			next = minDuration(curr+5*time.Millisecond, 120*time.Millisecond)
-		} else if fanoutDur < 6*time.Millisecond && curr > base {
+		if pressure > 75*time.Millisecond || fanoutDur > 30*time.Millisecond {
+			next = minDuration(curr+10*time.Millisecond, ceiling)
+		} else if pressure > 30*time.Millisecond || fanoutDur > 15*time.Millisecond {
+			next = minDuration(curr+5*time.Millisecond, ceiling)
+		} else if pressure < 10*time.Millisecond && fanoutDur < 6*time.Millisecond && curr > base {
 			next = maxDuration(curr-3*time.Millisecond, base)
 		}
 
@@ -787,7 +956,8 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 				slog.Info("adaptive batch interval updated",
 					"from_ms", curr.Milliseconds(),
 					"to_ms", next.Milliseconds(),
-					"fanout_ms", fanoutDur.Milliseconds())
+					"fanout_ms", fanoutDur.Milliseconds(),
+					"write_pressure_ms", pressure.Milliseconds())
 			}
 		}
 	}
@@ -801,12 +971,13 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 				"duration_ms", fanoutDur.Milliseconds(),
 				"connections", n,
 				"dropped_jobs", dropped,
-				"payload_bytes", len(f.data)-10,
+				"payload_bytes", payloadSize,
 				"full_sync", fullSync,
 				"changed_players", len(changed),
 				"all_players", len(allPlayers))
 		}
 	}
+	return true
 }
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -851,8 +1022,12 @@ func (s *Server) sendInitialState(conn *Connection) {
 	f.data = f.data[:0]
 	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // reserve 10-byte WS header
 	seq := atomic.LoadUint32(&s.worldStateSeq)
-	f.data = s.protocol.AppendGameState(f.data, allPlayers, seq) // zero-alloc into pool buf
-	frame := wsFrameSlice(f.data)                                // zero-alloc sub-slice
+	// The tick is read next to the snapshot, so it may be one tick stale if a
+	// simulation step lands between the two. A one-step dead-reckoning offset is
+	// corrected by the next record or keyframe for that player.
+	worldTick := s.gameWorld.GetTickCount()
+	f.data = s.protocol.AppendGameState(f.data, allPlayers, seq, worldTick) // zero-alloc into pool buf
+	frame := wsFrameSlice(f.data)                                           // zero-alloc sub-slice
 
 	// Copy frame bytes before returning pool buffer: write loop reads them later.
 	frameBytes := make([]byte, len(frame))
@@ -881,6 +1056,42 @@ func (s *Server) sendDirect(conn *Connection, data []byte) {
 	default:
 		metrics.BroadcastsDropped.Inc()
 	}
+}
+
+// sendMovementAck queues ACK fields as a value. Encoding happens in the persistent
+// writer, avoiding ws.CompileFrame and a heap-backed []byte for every MOVE.
+func (s *Server) sendMovementAck(conn *Connection, playerID uint32, x, y uint16, inputSequence uint32) bool {
+	select {
+	case conn.writeCh <- writeJob{
+		ack:     true,
+		ackID:   playerID,
+		ackX:    x,
+		ackY:    y,
+		ackSeq:  inputSequence,
+		timeout: directWriteTimeout,
+	}:
+		return true
+	default:
+		metrics.BroadcastsDropped.Inc()
+		return false
+	}
+}
+
+func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) {
+	for _, conn := range conns {
+		sequence := conn.player.GetAppliedClientTick()
+		if sequence == atomic.LoadUint32(&conn.lastMovementAckSeq) {
+			continue
+		}
+		if s.sendMovementAck(conn, conn.player.ID, conn.player.GetX(), conn.player.GetY(), sequence) {
+			atomic.StoreUint32(&conn.lastMovementAckSeq, sequence)
+		}
+	}
+}
+
+func (s *Server) sendWelcome(conn *Connection) {
+	data := s.protocol.EncodeWelcome(conn.player.ID, uint16(s.cfg.Game.TickRate))
+	s.sendDirect(conn, data)
 }
 
 // notifyPlayerJoined notifies all clients that a new player has joined.

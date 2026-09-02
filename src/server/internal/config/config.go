@@ -48,8 +48,9 @@ type NetworkConfig struct {
 	BurstLimit                     int
 	IPConnRate                     float64 // connections/sec per IP; 0 = disabled
 	IPConnBurst                    int
-	FanoutWorkers                  int
-	FanoutMaxBroadcastBytesPerTick int // 0 = unlimited
+	FanoutMaxBroadcastBytesPerTick int  // 0 = unlimited
+	VelocityReplication            bool // omit records a client can dead-reckon
+	KeyframeDivisor                int  // 1/N of players refreshed per broadcast; 0 = off
 	FanoutQueueShedDepth           int
 	FanoutDropStreak               int
 	WriteBatchSize                 int
@@ -160,8 +161,9 @@ func Load() *Config {
 			BurstLimit:                     getEnvInt("RATE_LIMIT_BURST", 20),
 			IPConnRate:                     getEnvFloat("IP_CONN_RATE", 10.0),
 			IPConnBurst:                    getEnvInt("IP_CONN_BURST", 20),
-			FanoutWorkers:                  getEnvInt("FANOUT_WORKERS", 0),
 			FanoutMaxBroadcastBytesPerTick: getEnvInt("FANOUT_MAX_BROADCAST_BYTES_PER_TICK", 0),
+			VelocityReplication:            getEnvBool("VELOCITY_REPLICATION", true),
+			KeyframeDivisor:                getEnvInt("KEYFRAME_DIVISOR", 50),
 			FanoutQueueShedDepth:           getEnvInt("FANOUT_QUEUE_SHED_DEPTH", 6),
 			FanoutDropStreak:               getEnvInt("FANOUT_DROP_STREAK", 120),
 			WriteBatchSize:                 getEnvInt("WRITE_BATCH_SIZE", 8),
@@ -187,6 +189,18 @@ func getEnvString(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func getEnvInt(key string, defaultValue int) int {

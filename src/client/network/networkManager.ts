@@ -1,8 +1,13 @@
 import { BinaryProtocol } from "./protocol/binaryProtocol";
 import {
     PlayerState,
-    PlayerPosition
+    PlayerPosition,
+    PROTOCOL_VERSION
 } from "./protocol/messages";
+
+// Beyond this the gap is a stall or a wrap, not a paced frame: extrapolating across it
+// would fling every remote player across the map. Hold position and wait for a record.
+const MAX_DEAD_RECKON_TICKS = 20;
 
 // Callback types
 export type OnPlayerJoinedCallback = (player: PlayerState) => void;
@@ -18,10 +23,15 @@ export type OnPlayerDirectionCallback = (
 ) => void;
 export type OnGameStateCallback = (
     players: Record<string, PlayerState>,
-    stateSequence?: number
+    stateSequence: number | undefined,
+    fullState: boolean,
+    // Simulation ticks elapsed since the previous frame this client received.
+    // Players missing from the frame advanced by exactly this many steps.
+    elapsedTicks: number
 ) => void;
 export type OnCorrectionCallback = (position: PlayerPosition) => void;
 export type OnMovementAckCallback = (position: PlayerPosition, inputSequence: number) => void;
+export type OnSessionStartCallback = (position: PlayerPosition) => void;
 export type OnPlayerAttackCallback = (
     playerId: string,
     position: PlayerPosition
@@ -31,12 +41,27 @@ export class NetworkManager {
     private socket: WebSocket | null = null;
     private worker: Worker | null = null;
     private useWorker: boolean = true; // Use Web Worker for WebSocket to avoid blocking main thread
+    private connected = false;
     private playerId: string = "";
     private initialPosition: PlayerPosition = { x: 0, y: 0 };
     private players: Record<string, PlayerState> = {};
     private lastStateSequence: number = 0;
+    private hasStateSequence = false;
+    private resyncRequested = false;
+    private resyncRetryTimer: number | null = null;
+    private receivedInitialPosition = false;
+    private lastWorldTick = 0;
+    private hasWorldTick = false;
+
+    // Reconnect state
+    private wsUrl = "";
+    private reconnectTimer: number | null = null;
+    private reconnectAttempts = 0;
+    private closedByClient = false;
+    private protocolMismatch = false;
 
     // Callback handlers
+    private onSessionStartCallbacks: OnSessionStartCallback[] = [];
     private onPlayerJoinedCallbacks: OnPlayerJoinedCallback[] = [];
     private onPlayerLeftCallbacks: OnPlayerLeftCallback[] = [];
     private onPlayerMovementCallbacks: OnPlayerMovementCallback[] = [];
@@ -86,10 +111,8 @@ export class NetworkManager {
                 this.initDirectSocket();
             };
 
-            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-            const wsUrl = `${protocol}//${window.location.host}/ws`;
-
-            this.worker.postMessage({ type: 'connect', url: wsUrl });
+            this.wsUrl = this.resolveWsUrl();
+            this.worker.postMessage({ type: 'connect', url: this.wsUrl });
         } catch (error) {
             console.warn('Failed to initialize Web Worker, falling back to direct WebSocket:', error);
             this.useWorker = false;
@@ -98,16 +121,65 @@ export class NetworkManager {
     }
 
     private initDirectSocket() {
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        this.wsUrl = this.resolveWsUrl();
 
-        this.socket = new WebSocket(wsUrl);
+        this.socket = new WebSocket(this.wsUrl);
+        this.socket.binaryType = "arraybuffer";
         this.setupSocketEvents();
     }
 
-    private onSocketOpen() {}
+    private resolveWsUrl(): string {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        return `${protocol}//${window.location.host}/ws`;
+    }
 
-    private onSocketClose() {}
+    private onSocketOpen() {
+        this.connected = true;
+        this.reconnectAttempts = 0;
+    }
+
+    private onSocketClose() {
+        this.connected = false;
+        if (this.resyncRetryTimer !== null) {
+            window.clearTimeout(this.resyncRetryTimer);
+            this.resyncRetryTimer = null;
+        }
+        this.resyncRequested = false;
+
+        // The server hands out a fresh player ID on every accept, so a reconnect is a
+        // new session rather than a resumption. Everything keyed to the old identity
+        // must go before the next WELCOME arrives.
+        this.playerId = "";
+        this.players = {};
+        this.lastStateSequence = 0;
+        this.hasStateSequence = false;
+        this.receivedInitialPosition = false;
+        this.lastWorldTick = 0;
+        this.hasWorldTick = false;
+
+        this.scheduleReconnect();
+    }
+
+    private scheduleReconnect() {
+        if (this.closedByClient || this.reconnectTimer !== null) return;
+
+        // Exponential backoff with jitter: a server restart would otherwise bring
+        // every client back simultaneously and reproduce the connect storm.
+        const base = Math.min(500 * 2 ** this.reconnectAttempts, 8000);
+        const delay = base * (0.5 + Math.random() * 0.5);
+        this.reconnectAttempts++;
+
+        this.reconnectTimer = window.setTimeout(() => {
+            this.reconnectTimer = null;
+            if (this.closedByClient) return;
+
+            if (this.worker) {
+                this.worker.postMessage({ type: 'connect', url: this.wsUrl });
+            } else {
+                this.initDirectSocket();
+            }
+        }, delay);
+    }
 
     private onSocketError() {
         // Handle connection error
@@ -127,7 +199,7 @@ export class NetworkManager {
         if (!this.socket) return;
 
         // Connection established
-        this.socket.addEventListener("open", () => {});
+        this.socket.addEventListener("open", () => this.onSocketOpen());
 
         // Receive messages from server
         this.socket.addEventListener("message", async (event) => {
@@ -146,7 +218,7 @@ export class NetworkManager {
         });
 
         // Connection closed
-        this.socket.addEventListener("close", () => {});
+        this.socket.addEventListener("close", () => this.onSocketClose());
 
         // Connection error
         this.socket.addEventListener("error", () => {
@@ -167,6 +239,21 @@ export class NetworkManager {
                 }
 
                 switch (message.type) {
+                    case "welcome":
+                        if (message.protocolVersion !== PROTOCOL_VERSION) {
+                            console.error(
+                                `Protocol mismatch: server speaks v${message.protocolVersion}, ` +
+                                `client speaks v${PROTOCOL_VERSION}. Refusing to decode world state.`
+                            );
+                            this.protocolMismatch = true;
+                            this.closedByClient = true;
+                            this.disconnect();
+                            break;
+                        }
+                        this.protocolMismatch = false;
+                        this.playerId = message.playerId;
+                        break;
+
                     case "playerMovement":
 
 
@@ -228,16 +315,31 @@ export class NetworkManager {
                         break;
 
                     case "gameState":
-                    case "deltaGameState":
+                    case "deltaGameState": {
+                        const fullState = message.type === "gameState";
                         if (typeof message.stateSequence === "number") {
                             const sequence = message.stateSequence >>> 0;
-                            if (!this.isNewerStateSequence(sequence, this.lastStateSequence)) {
+                            if (this.hasStateSequence && !this.isNewerStateSequence(sequence, this.lastStateSequence)) {
+                                break;
+                            }
+
+                            const distance = (sequence - this.lastStateSequence) >>> 0;
+                            if (!fullState && this.hasStateSequence && distance !== 1) {
+                                this.requestFullState();
                                 break;
                             }
                             this.lastStateSequence = sequence;
+                            this.hasStateSequence = true;
+                            if (fullState) {
+                                this.resyncRequested = false;
+                                if (this.resyncRetryTimer !== null) {
+                                    window.clearTimeout(this.resyncRetryTimer);
+                                    this.resyncRetryTimer = null;
+                                }
+                            }
                         }
 
-                        // If we don't have a player ID yet, determine it from the game state
+                        // Backward-compatible fallback for servers predating WELCOME.
                         if (!this.playerId && message.players) {
                             const playerIds = Object.keys(message.players);
                             if (playerIds.length > 0) {
@@ -249,21 +351,33 @@ export class NetworkManager {
                             }
                         }
 
+                        // Ticks elapsed since the previous frame *this client saw*, not
+                        // since the previous frame the server sent: a frame the fanout
+                        // shed must still leave dead reckoning on the right step.
+                        const worldTick = (message.worldTick ?? 0) >>> 0;
+                        let elapsedTicks = 0;
+                        if (this.hasWorldTick) {
+                            elapsedTicks = (worldTick - this.lastWorldTick) >>> 0;
+                            if (elapsedTicks > MAX_DEAD_RECKON_TICKS) elapsedTicks = 0;
+                        }
+                        this.lastWorldTick = worldTick;
+                        this.hasWorldTick = true;
+
+                        const incomingPlayers = message.players as Record<string, PlayerState>;
                         const prevPlayers = this.players;
 
-                        if (message.type === "deltaGameState") {
-                            // Delta: merge changed players into existing state
-                            this.players = { ...this.players };
-                            for (const [id, player] of Object.entries(message.players as Record<string, PlayerState>)) {
-                                this.players[id] = player;
-                            }
-                        } else {
-                            // Full state: replace entirely
-                            this.players = message.players;
+                        if (!this.receivedInitialPosition && this.playerId && incomingPlayers[this.playerId]) {
+                            this.initialPosition = incomingPlayers[this.playerId].position;
+                            this.receivedInitialPosition = true;
+                            // Fires on the first snapshot of every session, including
+                            // those that follow a reconnect with a new player ID.
+                            this.onSessionStartCallbacks.forEach((callback) =>
+                                callback(this.initialPosition)
+                            );
                         }
 
                         // Fire animation callbacks based on state changes
-                        Object.entries(message.players as Record<string, PlayerState>).forEach(([id, player]) => {
+                        Object.entries(incomingPlayers).forEach(([id, player]) => {
                             const isLocalPlayer = id === this.playerId;
                             const prev = prevPlayers[id];
 
@@ -281,10 +395,21 @@ export class NetworkManager {
                             }
                         });
 
+                        if (fullState) {
+                            this.players = incomingPlayers;
+                        } else {
+                            // Mutate only changed records. Copying the full 2000-player
+                            // object for every small delta defeats delta compression.
+                            for (const [id, player] of Object.entries(incomingPlayers)) {
+                                this.players[id] = player;
+                            }
+                        }
+
                         this.onGameStateCallbacks.forEach((callback) =>
-                            callback(this.players, message.stateSequence)
+                            callback(incomingPlayers, message.stateSequence, fullState, elapsedTicks)
                         );
                         break;
+                    }
 
                     case "movementAck":
 
@@ -310,7 +435,7 @@ export class NetworkManager {
                         break;
                 }
             }
-        } catch (error) {
+        } catch {
             // Handle any errors in message processing
         }
     }
@@ -409,6 +534,36 @@ export class NetworkManager {
         }
     }
 
+    private requestFullState(): void {
+        if (!this.connected || this.resyncRequested) return;
+        this.resyncRequested = true;
+        const binaryData = BinaryProtocol.encodeSyncRequest();
+        if (this.worker) {
+            this.worker.postMessage({ type: 'send', data: binaryData });
+        } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
+        }
+
+        // Retry once if no full snapshot arrives. The flag is cleared by the
+        // gameState branch, so a delivered snapshot cancels this path.
+        if (this.resyncRetryTimer !== null) {
+            window.clearTimeout(this.resyncRetryTimer);
+        }
+        this.resyncRetryTimer = window.setTimeout(() => {
+            this.resyncRetryTimer = null;
+            this.resyncRequested = false;
+            this.requestFullState();
+        }, 1000);
+    }
+
+    public onSessionStart(callback: OnSessionStartCallback): void {
+        this.onSessionStartCallbacks.push(callback);
+    }
+
+    public hasProtocolMismatch(): boolean {
+        return this.protocolMismatch;
+    }
+
     // Get player ID
     public getPlayerId(): string {
         return this.playerId;
@@ -443,6 +598,15 @@ export class NetworkManager {
 
     // Cleanup method
     public disconnect(): void {
+        this.closedByClient = true;
+        if (this.reconnectTimer !== null) {
+            window.clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        if (this.resyncRetryTimer !== null) {
+            window.clearTimeout(this.resyncRetryTimer);
+            this.resyncRetryTimer = null;
+        }
         if (this.worker) {
             this.worker.postMessage({ type: 'disconnect' });
             this.worker.terminate();

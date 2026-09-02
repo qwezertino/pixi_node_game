@@ -1,21 +1,44 @@
 package types
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
+const PlayerInputQueueCapacity = 256
+
+type MovementInput struct {
+	Sequence uint32
+	DX       int8
+	DY       int8
+}
+
+// InputResult explains why a movement step was not queued. The distinction matters:
+// a stale sequence is routinely produced by retransmits and reordering middleboxes and
+// must not cost the player their session, while a full ring means the client is more
+// than PlayerInputQueueCapacity steps behind and can no longer be reconciled.
+type InputResult uint8
+
+const (
+	InputAccepted InputResult = iota
+	InputStale
+	InputQueueFull
+	InputInvalid
+)
+
 // Player представляет игрока в системе
 type Player struct {
-	ID              uint32 // Atomic access
-	X               uint32 // Atomic access (stores uint16 value)
-	Y               uint32 // Atomic access (stores uint16 value)
-	VX              uint32 // Atomic access (stores int8: -1, 0, 1)
-	VY              uint32 // Atomic access (stores int8: -1, 0, 1)
-	FacingRight     uint32 // Atomic bool (0/1)
-	State           uint32 // Atomic player state
-	ClientTick      uint32 // Atomic client tick for reconciliation
-	AttackStartTime int64  // Atomic nanosecond timestamp of attack start (0 = not attacking)
+	ID                uint32 // Atomic access
+	X                 uint32 // Atomic access (stores uint16 value)
+	Y                 uint32 // Atomic access (stores uint16 value)
+	VX                uint32 // Atomic access (stores int8: -1, 0, 1)
+	VY                uint32 // Atomic access (stores int8: -1, 0, 1)
+	FacingRight       uint32 // Atomic bool (0/1)
+	State             uint32 // Atomic player state
+	ClientTick        uint32 // Atomic client tick for reconciliation
+	AppliedClientTick uint32 // Latest client tick captured and applied by world simulation
+	AttackStartTime   int64  // Atomic nanosecond timestamp of attack start (0 = not attacking)
 
 	// Timestamps для performance tracking
 	LastUpdate   int64 // Atomic timestamp
@@ -24,6 +47,14 @@ type Player struct {
 
 	// Metrics
 	MessageCount uint64 // Atomic counter
+
+	inputMu            sync.Mutex
+	inputQueue         [PlayerInputQueueCapacity]MovementInput
+	inputHead          uint16
+	inputTail          uint16
+	inputCount         uint16
+	lastQueuedInput    uint32
+	hasLastQueuedInput bool
 }
 
 // GameEvent представляет игровое событие
@@ -125,6 +156,52 @@ func (p *Player) SetClientTick(tick uint32) {
 	atomic.StoreUint32(&p.ClientTick, tick)
 }
 
+func (p *Player) GetAppliedClientTick() uint32 {
+	return atomic.LoadUint32(&p.AppliedClientTick)
+}
+
+func (p *Player) SetAppliedClientTick(tick uint32) {
+	atomic.StoreUint32(&p.AppliedClientTick, tick)
+}
+
+// EnqueueMovementInput preserves every predicted movement step in WebSocket order.
+// The fixed-size, pointer-free ring avoids hot-path allocations and bounds memory.
+func (p *Player) EnqueueMovementInput(input MovementInput) InputResult {
+	p.inputMu.Lock()
+	defer p.inputMu.Unlock()
+
+	if p.hasLastQueuedInput {
+		delta := input.Sequence - p.lastQueuedInput
+		if delta == 0 || delta >= 1<<31 {
+			return InputStale
+		}
+	}
+	if p.inputCount == PlayerInputQueueCapacity {
+		return InputQueueFull
+	}
+
+	p.inputQueue[p.inputTail] = input
+	p.inputTail = (p.inputTail + 1) % PlayerInputQueueCapacity
+	p.inputCount++
+	p.lastQueuedInput = input.Sequence
+	p.hasLastQueuedInput = true
+	return InputAccepted
+}
+
+func (p *Player) DequeueMovementInput() (MovementInput, bool) {
+	p.inputMu.Lock()
+	defer p.inputMu.Unlock()
+
+	if p.inputCount == 0 {
+		return MovementInput{}, false
+	}
+	input := p.inputQueue[p.inputHead]
+	p.inputQueue[p.inputHead] = MovementInput{}
+	p.inputHead = (p.inputHead + 1) % PlayerInputQueueCapacity
+	p.inputCount--
+	return input, true
+}
+
 func (p *Player) GetLastUpdate() int64 {
 	return atomic.LoadInt64(&p.LastUpdate)
 }
@@ -159,6 +236,6 @@ func (p *Player) ToState() PlayerState {
 		VY:          p.GetVY(),
 		FacingRight: p.GetFacingRight(),
 		State:       p.GetState(),
-		ClientTick:  p.GetClientTick(),
+		ClientTick:  p.GetAppliedClientTick(),
 	}
 }

@@ -5,9 +5,7 @@ import { AnimationController, PlayerState } from "./animationController";
 import { CoordinateConverter } from "../utils/coordinateConverter";
 import { MOVEMENT } from "../../shared/gameConfig";
 
-const RECONCILE_SOFT_ALPHA = 0.45;
-const RECONCILE_MAX_STEP = 18;
-const RECONCILE_HARD_SNAP_DIST_SQ = 120 * 120;
+const MAX_PENDING_INPUTS = 256;
 
 export class MovementController {
     private _isMoving = false;
@@ -74,17 +72,10 @@ export class MovementController {
      */
     handleMovementAcknowledgment(acknowledgedPosition: {x: number, y: number}, inputSequence: number): void {
         // Remove all inputs up to and including the acknowledged sequence
-        this._pendingInputs = this._pendingInputs.filter(input => input.sequence > inputSequence);
-
-        const deltaX = acknowledgedPosition.x - this._virtualPosition.x;
-        const deltaY = acknowledgedPosition.y - this._virtualPosition.y;
-        const distanceSquared = deltaX * deltaX + deltaY * deltaY;
-
-        // Reconcile if server position differs by more than 1 tick of movement (4px per axis)
-        if (distanceSquared > 32) { // ~5.6 pixels tolerance
-            this.reconcilePosition(acknowledgedPosition, inputSequence);
-        }
-        // If distanceSquared <= 16, client prediction is accurate enough
+        this._pendingInputs = this._pendingInputs.filter(input =>
+            this.isSequenceNewer(input.sequence, inputSequence)
+        );
+        this.reconcilePosition(acknowledgedPosition, inputSequence);
     }
 
     /**
@@ -97,7 +88,9 @@ export class MovementController {
         };
 
         // Re-apply pending inputs that happened after the acknowledged sequence
-        const futureInputs = this._pendingInputs.filter(input => input.sequence > lastAckedSequence);
+        const futureInputs = this._pendingInputs.filter(input =>
+            this.isSequenceNewer(input.sequence, lastAckedSequence)
+        );
 
         if (futureInputs.length > 0) {
             for (const input of futureInputs) {
@@ -115,26 +108,12 @@ export class MovementController {
             }
         }
 
-        const dx = reconciledTarget.x - this._virtualPosition.x;
-        const dy = reconciledTarget.y - this._virtualPosition.y;
-        const distSq = dx * dx + dy * dy;
 
-        if (distSq >= RECONCILE_HARD_SNAP_DIST_SQ) {
-            this._virtualPosition.x = reconciledTarget.x;
-            this._virtualPosition.y = reconciledTarget.y;
-        } else {
-            let stepX = dx * RECONCILE_SOFT_ALPHA;
-            let stepY = dy * RECONCILE_SOFT_ALPHA;
-            const stepLen = Math.hypot(stepX, stepY);
-            if (stepLen > RECONCILE_MAX_STEP && stepLen > 0) {
-                const scale = RECONCILE_MAX_STEP / stepLen;
-                stepX *= scale;
-                stepY *= scale;
-            }
-
-            this._virtualPosition.x += stepX;
-            this._virtualPosition.y += stepY;
-        }
+        // Logical prediction is corrected exactly. In the normal path this is a
+        // no-op because replaying unacknowledged inputs reproduces the current
+        // client position. Any non-zero correction indicates a real divergence.
+        this._virtualPosition.x = reconciledTarget.x;
+        this._virtualPosition.y = reconciledTarget.y;
 
         if (this._coordinateConverter) {
             const clampedPos = this._coordinateConverter.clampToVirtualBounds(
@@ -226,7 +205,7 @@ export class MovementController {
                         timestamp: Date.now()
                     });
 
-                    if (this._pendingInputs.length > 30) {
+                    if (this._pendingInputs.length > MAX_PENDING_INPUTS) {
                         this._pendingInputs.shift();
                     }
 
@@ -249,7 +228,7 @@ export class MovementController {
                     timestamp: now
                 });
 
-                if (this._pendingInputs.length > 30) {
+                if (this._pendingInputs.length > MAX_PENDING_INPUTS) {
                     this._pendingInputs.shift();
                 }
 
@@ -304,6 +283,11 @@ export class MovementController {
                newVector.dy !== this._currentMovementVector.dy;
     }
 
+    private isSequenceNewer(next: number, current: number): boolean {
+        const delta = (next - current) >>> 0;
+        return delta !== 0 && delta < 0x80000000;
+    }
+
     /**
      * Отправить движение на сервер
      */
@@ -319,6 +303,12 @@ export class MovementController {
     public setInitialPosition(x: number, y: number): void {
         this._virtualPosition.x = Math.round(x);
         this._virtualPosition.y = Math.round(y);
+
+        // A reconnect spawns a brand-new server-side player, so inputs predicted
+        // against the previous session must not be replayed onto the new spawn.
+        this._pendingInputs = [];
+        this._currentMovementVector = { dx: 0, dy: 0 };
+        this._isMoving = false;
 
         if (this._coordinateConverter) {
             const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);

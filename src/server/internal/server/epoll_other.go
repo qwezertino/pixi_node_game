@@ -49,6 +49,11 @@ func (g *goroutineReadHandler) readLoop(svr *Server, c *Connection) {
 			}
 			return
 		}
+		if !validClientHeader(hdr) {
+			metrics.WSReadErrors.Inc()
+			svr.logRejectedFrame(c, hdr)
+			return
+		}
 
 		var payload []byte
 		if hdr.Length > 0 {
@@ -58,9 +63,7 @@ func (g *goroutineReadHandler) readLoop(svr *Server, c *Connection) {
 				return
 			}
 		}
-		if hdr.Masked {
-			ws.Cipher(payload, hdr.Mask, 0)
-		}
+		ws.Cipher(payload, hdr.Mask, 0)
 
 		atomic.StoreInt64(&c.lastActivity, time.Now().UnixNano())
 
@@ -75,13 +78,18 @@ func (g *goroutineReadHandler) readLoop(svr *Server, c *Connection) {
 				default:
 				}
 			}
-		case ws.OpBinary, ws.OpText:
+		case ws.OpBinary:
 			metrics.BytesReceived.Add(float64(len(payload)))
 			if !c.rateLimiter.Allow() {
+				// See epoll_linux.go: a burst is absorbed, a sustained overage is not.
 				metrics.MessagesRateLimited.Inc()
-			} else {
-				svr.processMessage(c, payload)
+				if atomic.AddInt32(&c.rateLimitStreak, 1) >= maxRateLimitStreak {
+					return
+				}
+				continue
 			}
+			atomic.StoreInt32(&c.rateLimitStreak, 0)
+			svr.processMessage(c, payload)
 		}
 	}
 }

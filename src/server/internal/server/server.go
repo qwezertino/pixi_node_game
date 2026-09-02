@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -40,21 +39,24 @@ type Server struct {
 	rateLimiters sync.Map // map[string]*rate.Limiter
 
 	// Server state
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx        context.Context
+	cancel     context.CancelFunc
+	httpServer *http.Server
 
 	// Throttled diagnostics
-	lastSlowFanoutLog int64 // atomic UnixNano timestamp
-	lastBatchTuneLog  int64 // atomic UnixNano timestamp
+	lastSlowFanoutLog  int64 // atomic UnixNano timestamp
+	lastBatchTuneLog   int64 // atomic UnixNano timestamp
+	lastFrameRejectLog int64 // atomic UnixNano timestamp
 
 	// Adaptive broadcast pacing
-	adaptiveBatchNs int64 // atomic
-	lastBroadcastNs int64 // atomic
-	worldStateSeq   uint32
+	adaptiveBatchNs     int64 // atomic
+	lastBroadcastNs     int64 // atomic; advances only when a state frame is emitted
+	lastAckPassNs       int64 // atomic; paces the per-tick movement-ACK sweep
+	tickIntervalNs      int64 // simulation tick period; replication is quantised to it
+	worldStateSeq       uint32
+	writePressurePeakNs int64 // atomic max queue+write latency observed since last fanout tune
 
-	// Parallel fanout enqueue workers
-	fanoutWorkers                  int
-	fanoutJobs                     chan fanoutJob
+	// Fanout/write controls
 	fanoutDropLimit                int32
 	writeBatchSize                 int
 	fanoutMaxBroadcastBytesPerTick int
@@ -104,7 +106,10 @@ type Connection struct {
 	fanoutFairDebt       int32         // anti-starvation debt for recipient selection fairness (atomic)
 	fanoutDebtEpoch      uint32        // marks whether conn was selected in the current fairness epoch
 	pendingBroadcast     int32         // 0/1: whether a world-state broadcast job is already queued/in-flight
-	lastWorldStateSentNs int64         // UnixNano timestamp of last successfully enqueued world-state frame
+	lastMovementAckSeq   uint32        // latest authoritative input sequence queued to the writer
+	staleInputStreak     int32         // consecutive movement inputs rejected as duplicate/out-of-order
+	rateLimitStreak      int32         // consecutive messages dropped by the per-connection rate limiter
+	lastWorldStateSentNs int64         // UnixNano timestamp of last successfully written world-state frame
 	criticalUntilNs      int64         // UnixNano until which this client receives criticality boost
 	ctx                  context.Context
 	cancel               context.CancelFunc
@@ -127,6 +132,10 @@ func New(cfg *config.Config) *Server {
 		ctx:         ctx,
 		cancel:      cancel,
 		startTime:   time.Now(),
+	}
+
+	if cfg.Game.TickRate > 0 {
+		server.tickIntervalNs = int64(time.Second) / int64(cfg.Game.TickRate)
 	}
 
 	if cfg.Game.BatchInterval > 0 {
@@ -210,8 +219,6 @@ func New(cfg *config.Config) *Server {
 		metrics.FanoutRecipientLimit.Set(0)
 	}
 
-	server.initFanoutWorkers()
-
 	// Start ping/keepalive loop (replaces per-shard ping ticker).
 	go server.runPingLoop()
 
@@ -280,7 +287,111 @@ func (s *Server) Start() error {
 	slog.Info("server listening", "addr", addr)
 	slog.Info("serving static files", "dir", s.cfg.Server.StaticDir)
 
-	return http.ListenAndServe(addr, mux)
+	s.httpServer = &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// Shutdown stops accepting new connections, drains in-flight HTTP requests, then
+// stops the simulation. Order matters: the world must outlive the listener so that
+// a tick already in flight still finds a coherent connection map.
+func (s *Server) Shutdown(ctx context.Context) error {
+	var err error
+	if s.httpServer != nil {
+		err = s.httpServer.Shutdown(ctx)
+	}
+
+	// Cancel per-connection contexts so write loops exit instead of blocking on a
+	// receive, then stop the tick loop and its workers.
+	s.connectionsMu.RLock()
+	conns := make([]*Connection, 0, len(s.connections))
+	for _, conn := range s.connections {
+		conns = append(conns, conn)
+	}
+	s.connectionsMu.RUnlock()
+	for _, conn := range conns {
+		conn.cancel()
+	}
+
+	s.cancel()
+	s.gameWorld.Stop()
+	slog.Info("server stopped", "drained_connections", len(conns))
+	return err
+}
+
+const (
+	maxClientFramePayload int64 = 125
+
+	// maxStaleInputStreak — consecutive duplicate/out-of-order movement steps tolerated
+	// before the connection is considered non-conforming. At the 20 Hz client send rate
+	// this is ~6 s of a client producing nothing the simulation can apply.
+	maxStaleInputStreak int32 = 120
+
+	// maxRateLimitStreak — consecutive rate-limited messages tolerated before disconnect.
+	// A single burst (a middlebox flushing a queue after a stall) is absorbed; only a
+	// client that stays over the limit loses its session.
+	maxRateLimitStreak int32 = 200
+)
+
+// validClientHeader enforces the subset of RFC 6455 used by the game protocol.
+// Fragmented messages and text frames are deliberately unsupported: every client
+// command is a single, small binary frame.
+func validClientHeader(h ws.Header) bool {
+	if !h.Masked || !h.Fin || h.Rsv != 0 || h.Length < 0 || h.Length > maxClientFramePayload {
+		return false
+	}
+	switch h.OpCode {
+	case ws.OpBinary, ws.OpClose, ws.OpPing, ws.OpPong:
+		return true
+	default:
+		return false
+	}
+}
+
+// clientHeaderRejectReason explains a validClientHeader failure. Cold path only —
+// callers must gate it behind the boolean check so the hot path stays branch-free.
+func clientHeaderRejectReason(h ws.Header) string {
+	switch {
+	case !h.Masked:
+		return "unmasked_client_frame"
+	case !h.Fin:
+		return "fragmented_frame"
+	case h.Rsv != 0:
+		return "reserved_bits_set"
+	case h.Length < 0 || h.Length > maxClientFramePayload:
+		return "payload_too_large"
+	default:
+		return "unsupported_opcode"
+	}
+}
+
+// logRejectedFrame reports at most one rejected frame per second across the whole
+// server. Without it a single misbehaving client would flood the log, and without
+// any logging at all a protocol-level disconnect is undiagnosable in production.
+func (s *Server) logRejectedFrame(c *Connection, hdr ws.Header) {
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&s.lastFrameRejectLog)
+	if now-last < int64(time.Second) {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&s.lastFrameRejectLog, last, now) {
+		return
+	}
+	slog.Warn("rejected client frame",
+		"player_id", c.player.ID,
+		"reason", clientHeaderRejectReason(hdr),
+		"opcode", hdr.OpCode,
+		"length", hdr.Length,
+		"masked", hdr.Masked,
+		"fin", hdr.Fin)
 }
 
 // handleWebSocket обрабатывает WebSocket соединения
@@ -321,9 +432,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	player := s.gameWorld.AddPlayer()
 	connection := s.createConnection(player, rawConn)
 
+	// Explicit identity must precede all state/event messages for this connection.
+	s.sendWelcome(connection)
+
 	// Send initial state BEFORE adding to s.connections so that the write loop
 	// delivers the full world snapshot as the very first message the client
-	// receives. If we add to the map first, a 30 Hz tick can race here and
+	// receives. If we add to the map first, a world tick can race here and
 	// enqueue a delta/gamestate frame ahead of the initial state.
 	s.sendInitialState(connection)
 
@@ -331,8 +445,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.connections[player.ID] = connection
 	s.connectionsMu.Unlock()
 
-	// Notify all existing players about the new player
-	s.notifyPlayerJoined(player)
+	// Existing clients discover the new player in the next world-state delta.
+	// A separate PLAYER_JOINED broadcast duplicates that information and creates
+	// O(N²) control messages during a connection ramp, delaying state frames.
 
 	// Update metrics
 	metrics.ConnectionsTotal.Inc()
@@ -380,51 +495,37 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		metrics.MessagesReceived.WithLabelValues("move").Inc()
 		s.markConnectionCritical(connection)
 
-		// Server-authoritative: process movement vector, server computes position
-		event := types.GameEvent{
-			PlayerID:   connection.player.ID,
-			Type:       types.EventMove,
-			VectorX:    clientMsg.MovementVector.DX,
-			VectorY:    clientMsg.MovementVector.DY,
-			ClientTick: clientMsg.InputSequence,
-		}
-		s.gameWorld.ProcessEvent(event)
+		switch s.gameWorld.QueueMovementInput(
+			connection.player.ID,
+			clientMsg.MovementVector.DX,
+			clientMsg.MovementVector.DY,
+			clientMsg.InputSequence,
+		) {
+		case types.InputAccepted:
+			atomic.StoreInt32(&connection.staleInputStreak, 0)
 
-		// ACK with the position the client predicted (current + this move vector).
-		// The server will apply the same formula in its next tick.
-		// Sending this avoids false reconciliation: client delta = 0.
-		speed := int32(s.cfg.Game.PlayerSpeedPerTick)
-		dx := int32(clientMsg.MovementVector.DX)
-		dy := int32(clientMsg.MovementVector.DY)
-		ackX32 := int32(connection.player.GetX()) + dx*speed
-		ackY32 := int32(connection.player.GetY()) + dy*speed
+		case types.InputStale:
+			// A duplicate or reordered step is not evidence of a bad client: proxies
+			// and TCP-level retransmits produce both. Skipping it keeps the applied
+			// sequence monotonic, which is all reconciliation needs. Only a client
+			// that never sends anything usable is disconnected.
+			metrics.MovementInputsRejected.Inc()
+			if atomic.AddInt32(&connection.staleInputStreak, 1) >= maxStaleInputStreak {
+				go s.cleanupConnection(connection)
+			}
+			return
 
-		// Clamp to world bounds (same as updatePlayerPosition)
-		if ackX32 > int32(s.cfg.World.MaxX) {
-			ackX32 = int32(s.cfg.World.MaxX)
-		} else if ackX32 < int32(s.cfg.World.MinX) {
-			ackX32 = int32(s.cfg.World.MinX)
-		}
-		if ackY32 > int32(s.cfg.World.MaxY) {
-			ackY32 = int32(s.cfg.World.MaxY)
-		} else if ackY32 < int32(s.cfg.World.MinY) {
-			ackY32 = int32(s.cfg.World.MinY)
+		default:
+			// A full ring means the client is PlayerInputQueueCapacity steps behind
+			// and can no longer be reconciled; InputInvalid means the sender is not
+			// speaking this protocol. Neither is recoverable.
+			metrics.MovementInputsRejected.Inc()
+			go s.cleanupConnection(connection)
+			return
 		}
 
-		// Send movement acknowledgment via shard directChan (priority over broadcast).
-		// Encode directly into a stack array to avoid a heap allocation:
-		// EncodeMovementAck returns []byte which normally escapes; with a fixed-size
-		// stack array we pass a slice that doesn't outlive this scope (CompileFrame
-		// copies the payload into its own buffer before sendDirect returns).
-		var ackBuf [13]byte
-		ackBuf[0] = protocol.MessageMovementAck
-		binary.LittleEndian.PutUint32(ackBuf[1:], connection.player.ID)
-		binary.LittleEndian.PutUint16(ackBuf[5:], uint16(ackX32))
-		binary.LittleEndian.PutUint16(ackBuf[7:], uint16(ackY32))
-		binary.LittleEndian.PutUint32(ackBuf[9:], clientMsg.InputSequence)
-		s.sendDirect(connection, ackBuf[:])
-
-		// Обновление позиции разошлётся через tick broadcast, не здесь.
+		// ACK is emitted from broadcastTick after the world worker has applied the
+		// velocity. Sending it here would acknowledge a predicted pre-tick position.
 
 	case protocol.MessageDirection:
 		metrics.MessagesReceived.WithLabelValues("direction").Inc()
@@ -447,6 +548,10 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 
 	case protocol.MessageViewportUpdate:
 		// Silently accepted — viewport-based culling not yet implemented.
+
+	case protocol.MessageSyncRequest:
+		metrics.MessagesReceived.WithLabelValues("sync_request").Inc()
+		s.sendInitialState(connection)
 	}
 }
 

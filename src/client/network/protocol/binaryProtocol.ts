@@ -74,6 +74,10 @@ export class BinaryProtocol {
         return new Uint8Array(buffer);
     }
 
+    static encodeSyncRequest(): Uint8Array {
+        return new Uint8Array([MessageType.SYNC_REQUEST]);
+    }
+
     // Decode messages
     static decodeMessage(data: Uint8Array): any {
         if (data.length === 0) return null;
@@ -91,6 +95,7 @@ export class BinaryProtocol {
             case MessageType.PLAYER_JOINED: return this.decodePlayerJoined(data, view);
             case MessageType.PLAYER_LEFT: return this.decodePlayerLeft(data, view);
             case MessageType.MOVEMENT_ACK: return this.decodeMovementAck(data, view);
+            case MessageType.WELCOME: return this.decodeWelcome(data, view);
 
             // Broadcast message types from server
             case 255: return this.decodePlayerMovementBroadcast(data, view);
@@ -165,36 +170,52 @@ export class BinaryProtocol {
     }
 
     private static decodeGameState(data: Uint8Array, view: DataView): GameStateMessage {
-        const { players, stateSequence } = this.decodePlayerBlock(data, view);
+        const { players, stateSequence, worldTick } = this.decodePlayerBlock(data, view);
         return {
             type: 'gameState',
             players,
             timestamp: Date.now(),
             stateSequence,
+            worldTick,
         };
     }
 
     private static decodeDeltaGameState(data: Uint8Array, view: DataView) {
-        const { players, stateSequence } = this.decodePlayerBlock(data, view);
+        const { players, stateSequence, worldTick } = this.decodePlayerBlock(data, view);
         return {
             type: 'deltaGameState',
             players,
             timestamp: Date.now(),
             stateSequence,
+            worldTick,
         };
     }
 
-    private static decodePlayerBlock(data: Uint8Array, view: DataView): { players: Record<string, PlayerState>; stateSequence?: number } {
+    private static decodePlayerBlock(data: Uint8Array, view: DataView): { players: Record<string, PlayerState>; stateSequence?: number; worldTick: number } {
         const header = this.decodeWorldStateHeader(data, view);
         const playerCount = header.playerCount;
         const players: Record<string, PlayerState> = {};
 
         let offset = header.offset;
+        let prevId = 0;
         for (let i = 0; i < playerCount; i++) {
-            if (offset + 11 > data.length) break;
+            // Player IDs are delta-encoded as LEB128 varints against the previous
+            // record (the server sorts by ID), so the record stride is variable.
+            let delta = 0;
+            let shift = 0;
+            let byte = 0;
+            do {
+                if (offset >= data.length) return { players, stateSequence: header.stateSequence, worldTick: header.worldTick };
+                byte = data[offset++];
+                delta += (byte & 0x7f) * 2 ** shift;
+                shift += 7;
+            } while (byte & 0x80);
 
-            const playerId = view.getUint32(offset, true).toString();
-            offset += 4;
+            if (offset + 7 > data.length) break;
+
+            const id = (prevId + delta) >>> 0;
+            prevId = id;
+            const playerId = id.toString();
 
             const x = view.getUint16(offset, true);
             offset += 2;
@@ -225,24 +246,26 @@ export class BinaryProtocol {
             };
         }
 
-        return { players, stateSequence: header.stateSequence };
+        return { players, stateSequence: header.stateSequence, worldTick: header.worldTick };
     }
 
-    private static decodeWorldStateHeader(data: Uint8Array, view: DataView): { stateSequence?: number; playerCount: number; offset: number } {
-        // New format: [type:1][stateSequence:4][playerCount:4][players...]
-        if (data.length >= 9) {
-            const stateSequence = view.getUint32(1, true);
-            const playerCount = view.getUint32(5, true);
-            const expectedLength = 9 + playerCount * 11;
-            if (expectedLength <= data.length) {
-                return { stateSequence, playerCount, offset: 9 };
-            }
+    // [type:1][stateSequence:4][worldTick:4][playerCount:4][players...]
+    // worldTick is the simulation step the records describe; the client needs it to
+    // dead-reckon the players this frame omits.
+    // Records are variable-length (varint ID delta + 7 fixed bytes), so the header
+    // cannot be validated against a total length — the record loop bounds-checks
+    // instead. The pre-sequence legacy layout is deliberately not accepted: it is
+    // indistinguishable from a valid frame and would decode into wrong player IDs
+    // rather than failing. PROTOCOL_VERSION in WELCOME is what guards compatibility.
+    private static decodeWorldStateHeader(data: Uint8Array, view: DataView): { stateSequence?: number; worldTick: number; playerCount: number; offset: number } {
+        if (data.length < 13) {
+            return { worldTick: 0, playerCount: 0, offset: data.length };
         }
-
-        // Backward-compatible fallback: [type:1][playerCount:4][players...]
         return {
-            playerCount: view.getUint32(1, true),
-            offset: 5,
+            stateSequence: view.getUint32(1, true),
+            worldTick: view.getUint32(5, true),
+            playerCount: view.getUint32(9, true),
+            offset: 13,
         };
     }
 
@@ -301,6 +324,17 @@ export class BinaryProtocol {
             playerId,
             position: { x, y },
             inputSequence,
+        };
+    }
+
+    private static decodeWelcome(data: Uint8Array, view: DataView) {
+        if (data.length !== 8) return null;
+
+        return {
+            type: 'welcome',
+            protocolVersion: view.getUint8(1),
+            tickRate: view.getUint16(2, true),
+            playerId: view.getUint32(4, true).toString(),
         };
     }
 

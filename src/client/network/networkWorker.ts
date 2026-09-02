@@ -38,7 +38,20 @@ self.onmessage = (e: MessageEvent<WorkerMessage>) => {
 };
 
 function connect(url: string) {
+    // A reconnect must not leave the previous socket delivering events: its
+    // handlers would keep posting messages for a session the main thread has
+    // already reset.
+    if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+        socket = null;
+    }
+
     socket = new WebSocket(url);
+    socket.binaryType = 'arraybuffer';
 
     socket.onopen = () => {
         postMessage({ type: 'open' });
@@ -52,7 +65,7 @@ function connect(url: string) {
             data = await data.arrayBuffer();
         }
 
-        postMessage({ type: 'message', data });
+        postMessage({ type: 'message', data }, data instanceof ArrayBuffer ? [data] : []);
     };
 
     socket.onclose = () => {
@@ -64,6 +77,9 @@ function connect(url: string) {
     };
 }
 
-function postMessage(msg: SocketMessage) {
-    (self as any).postMessage(msg);
+function postMessage(msg: SocketMessage, transfer: Transferable[] = []) {
+    const workerScope = self as unknown as {
+        postMessage(message: SocketMessage, transfer: Transferable[]): void;
+    };
+    workerScope.postMessage(msg, transfer);
 }

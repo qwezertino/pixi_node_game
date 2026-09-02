@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"syscall"
+	"time"
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/server"
@@ -32,9 +36,29 @@ func main() {
 
 	// Create and start game server
 	gameServer := server.New(cfg)
-	if err := gameServer.Start(); err != nil {
-		slog.Error("failed to start server", "error", err)
-		os.Exit(1)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- gameServer.Start()
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			slog.Error("failed to start server", "error", err)
+			os.Exit(1)
+		}
+	case sig := <-signals:
+		slog.Info("shutdown signal received", "signal", sig.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := gameServer.Shutdown(ctx); err != nil {
+			slog.Error("graceful shutdown failed", "error", err)
+			os.Exit(1)
+		}
 	}
 }
 

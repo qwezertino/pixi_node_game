@@ -1,20 +1,14 @@
-import { Container, Point, AnimatedSprite, Texture } from "pixi.js";
+import { Container, Point, AnimatedSprite } from "pixi.js";
 import { NetworkManager } from "../network/networkManager";
 import { PlayerState, TICK_RATE } from "../network/protocol/messages";
-import { SpriteLoader } from "../utils/spriteLoader";
+import { CharacterVisual, SpriteLoader } from "../utils/spriteLoader";
 import {
     AnimationController,
     PlayerState as AnimationPlayerState,
 } from "../controllers/animationController";
-import { PLAYER } from "../../shared/gameConfig";
+import { MOVEMENT, PLAYER } from "../../shared/gameConfig";
 import { CoordinateConverter } from "../utils/coordinateConverter";
 //import { LagCompensationSystem } from "../utils/lagCompensation";
-
-// Тип для результата SpriteLoader.loadCharacterVisual после await
-type CharacterVisual = {
-    animations: Map<string, Texture[]>;
-    getAnimation: (name: string) => AnimatedSprite | undefined;
-};
 
 // Represents a remote player in the game
 // Снимок состояния для entity interpolation
@@ -95,6 +89,41 @@ class RemotePlayer {
         this.animationController = new AnimationController(
             characterVisual.animations,
             this.sprite
+        );
+    }
+
+    /**
+     * Advance a player the server deliberately omitted from a frame.
+     *
+     * Position is a deterministic function of velocity on both sides (`pos += v*speed`
+     * per tick, integer), so the server only sends a record when that integration would
+     * be wrong — a velocity change, or a world-boundary clamp. For every other player
+     * the client reproduces the record the server chose not to send and feeds it to the
+     * same snapshot buffer, so the interpolator below is unchanged and cannot tell the
+     * difference.
+     *
+     * Deliberately unclamped: it mirrors the server's prediction, and any clamp the
+     * server applied arrives as a real record on the next frame.
+     */
+    deadReckon(elapsedTicks: number, stateSequence?: number) {
+        if (elapsedTicks <= 0) return;
+
+        const last = this.snapshots[this.snapshots.length - 1];
+        if (!last) return;
+
+        if (this.movementVector.dx === 0 && this.movementVector.dy === 0) {
+            // A stationary player produces the same position every frame. Still push a
+            // snapshot: the interpolator needs a steady arrival cadence, and its
+            // adaptive delay is driven by that cadence.
+            this.pushSnapshot(last.x, last.y, stateSequence);
+            return;
+        }
+
+        const step = MOVEMENT.playerSpeedPerTick * elapsedTicks;
+        this.pushSnapshot(
+            last.x + this.movementVector.dx * step,
+            last.y + this.movementVector.dy * step,
+            stateSequence
         );
     }
 
@@ -260,6 +289,7 @@ class RemotePlayer {
 
 export class PlayerManager {
     private remotePlayers: Map<string, RemotePlayer> = new Map();
+    private pendingPlayers: Map<string, Promise<void>> = new Map();
     private playerContainer: Container;
     private networkManager: NetworkManager;
     private coordinateConverter: CoordinateConverter;
@@ -280,9 +310,9 @@ export class PlayerManager {
     }
 
     private setupNetworkCallbacks() {
-        this.networkManager.onPlayerJoined(async (player) => {
+        this.networkManager.onPlayerJoined((player) => {
             if (player.id === this.networkManager.getPlayerId()) return;
-            await this.addRemotePlayer(player);
+            void this.addRemotePlayer(player);
         });
 
         this.networkManager.onPlayerLeft((playerId) => {
@@ -299,8 +329,6 @@ export class PlayerManager {
             const player = this.remotePlayers.get(playerId);
             if (player) {
                 player.setMovementVector(dx, dy);
-            } else {
-
             }
         });
 
@@ -308,20 +336,29 @@ export class PlayerManager {
             const player = this.remotePlayers.get(playerId);
             if (player) {
                 player.setDirection(direction);
-            } else {
-
             }
         });
 
-        this.networkManager.onPlayerAttack((playerId, _position) => {
+        this.networkManager.onPlayerAttack((playerId) => {
             const player = this.remotePlayers.get(playerId);
             if (player) {
                 player.performAttack();
             }
         });
 
-        this.networkManager.onGameState(async (players, stateSequence) => {
+        this.networkManager.onGameState((players, stateSequence, fullState, elapsedTicks) => {
             const currentPlayerId = this.networkManager.getPlayerId();
+
+            // Players the frame omits did not stand still — the server withheld them
+            // because their movement was predictable. Reproduce it before applying the
+            // records, so both paths land in the buffer with the same arrival time.
+            if (!fullState && elapsedTicks > 0) {
+                for (const [playerId, remote] of this.remotePlayers) {
+                    if (playerId !== currentPlayerId && !players[playerId]) {
+                        remote.deadReckon(elapsedTicks, stateSequence);
+                    }
+                }
+            }
 
             for (const [playerId, playerState] of Object.entries(players)) {
 
@@ -346,27 +383,47 @@ export class PlayerManager {
                         playerState.vy ?? 0
                     );
                 } else {
-                    await this.addRemotePlayer(playerState);
+                    void this.addRemotePlayer(playerState);
                 }
             }
 
-            for (const playerId of this.remotePlayers.keys()) {
-                if (playerId !== currentPlayerId && !players[playerId]) {
-                    this.removeRemotePlayer(playerId);
+            // A delta contains only changed players. Absence means removal only in a full snapshot.
+            if (fullState) {
+                for (const playerId of this.remotePlayers.keys()) {
+                    if (playerId !== currentPlayerId && !players[playerId]) {
+                        this.removeRemotePlayer(playerId);
+                    }
                 }
             }
         });
     }
 
     async addRemotePlayer(playerState: PlayerState) {
-
         if (this.remotePlayers.has(playerState.id)) {
             return;
         }
 
+        const pending = this.pendingPlayers.get(playerState.id);
+        if (pending) {
+            return pending;
+        }
+
+        const creation = this.createRemotePlayer(playerState)
+            .finally(() => this.pendingPlayers.delete(playerState.id));
+        this.pendingPlayers.set(playerState.id, creation);
+        return creation;
+    }
+
+    private async createRemotePlayer(playerState: PlayerState): Promise<void> {
+
         const characterVisual = await SpriteLoader.loadCharacterVisual(
             "/assets/16x16_knight_2_v3.png"
         );
+
+        // The player may have left while the shared asset promise was resolving.
+        if (this.remotePlayers.has(playerState.id) || !this.networkManager.getPlayers()[playerState.id]) {
+            return;
+        }
 
         const screenPos = this.coordinateConverter.virtualToScreen(
             playerState.position.x,
@@ -395,7 +452,6 @@ export class PlayerManager {
         this.playerContainer.addChild(remotePlayer.sprite);
 
         this.remotePlayers.set(playerState.id, remotePlayer);
-
     }
 
     setMovementController(movementController: any) {
@@ -429,6 +485,8 @@ export class PlayerManager {
         if (player) {
             this.playerContainer.removeChild(player.sprite);
             this.remotePlayers.delete(playerId);
+            player.sprite.stop();
+            player.sprite.destroy();
         }
     }
 
@@ -445,7 +503,7 @@ export class PlayerManager {
         for (const [playerId, playerState] of Object.entries(existingPlayers)) {
             if (playerId === currentPlayerId) continue;
 
-            await this.addRemotePlayer(playerState);
+            void this.addRemotePlayer(playerState);
         }
     }
 }
