@@ -45,14 +45,15 @@ type Server struct {
 
 	// Throttled diagnostics
 	lastSlowFanoutLog  int64 // atomic UnixNano timestamp
-	lastBatchTuneLog   int64 // atomic UnixNano timestamp
+	lastDilationLog    int64 // atomic UnixNano timestamp
 	lastFrameRejectLog int64 // atomic UnixNano timestamp
 
-	// Adaptive broadcast pacing
-	adaptiveBatchNs     int64 // atomic
-	lastBroadcastNs     int64 // atomic; advances only when a state frame is emitted
-	lastAckPassNs       int64 // atomic; paces the per-tick movement-ACK sweep
-	tickIntervalNs      int64 // simulation tick period; replication is quantised to it
+	// Time dilation (EVE-style TiDi): replaces the old silent replication-interval
+	// backoff. dilationBps is basis points, 10000 = 100% (nominal), floor at
+	// minDilationBps. When it changes, GameWorld's tick ticker itself is slowed via
+	// SetTickInterval — see world.go — so replication cadence follows the simulation
+	// rate automatically instead of being paced separately.
+	dilationBps         int64 // atomic
 	worldStateSeq       uint32
 	writePressurePeakNs int64 // atomic max queue+write latency observed since last fanout tune
 
@@ -108,7 +109,6 @@ type Connection struct {
 	pendingBroadcast     int32         // 0/1: whether a world-state broadcast job is already queued/in-flight
 	lastMovementAckSeq   uint32        // latest authoritative input sequence queued to the writer
 	staleInputStreak     int32         // consecutive movement inputs rejected as duplicate/out-of-order
-	rateLimitStreak      int32         // consecutive messages dropped by the per-connection rate limiter
 	lastWorldStateSentNs int64         // UnixNano timestamp of last successfully written world-state frame
 	criticalUntilNs      int64         // UnixNano until which this client receives criticality boost
 	ctx                  context.Context
@@ -134,14 +134,9 @@ func New(cfg *config.Config) *Server {
 		startTime:   time.Now(),
 	}
 
-	if cfg.Game.TickRate > 0 {
-		server.tickIntervalNs = int64(time.Second) / int64(cfg.Game.TickRate)
-	}
-
-	if cfg.Game.BatchInterval > 0 {
-		server.adaptiveBatchNs = cfg.Game.BatchInterval.Nanoseconds()
-		metrics.AdaptiveBatchIntervalMs.Set(float64(cfg.Game.BatchInterval.Milliseconds()))
-	}
+	server.dilationBps = dilationBpsFull
+	metrics.TimeDilationPercent.Set(100)
+	metrics.TickIntervalMs.Set(float64(server.gameWorld.GetNominalTickInterval().Milliseconds()))
 
 	server.fanoutDropLimit = int32(cfg.Net.FanoutDropStreak)
 	if server.fanoutDropLimit < 1 {
@@ -330,15 +325,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 const (
 	maxClientFramePayload int64 = 125
 
-	// maxStaleInputStreak — consecutive duplicate/out-of-order movement steps tolerated
-	// before the connection is considered non-conforming. At the 20 Hz client send rate
-	// this is ~6 s of a client producing nothing the simulation can apply.
+	// maxStaleInputStreak — consecutive duplicate/old transitions tolerated before the
+	// connection is considered non-conforming.
 	maxStaleInputStreak int32 = 120
-
-	// maxRateLimitStreak — consecutive rate-limited messages tolerated before disconnect.
-	// A single burst (a middlebox flushing a queue after a stall) is absorbed; only a
-	// client that stays over the limit loses its session.
-	maxRateLimitStreak int32 = 200
 )
 
 // validClientHeader enforces the subset of RFC 6455 used by the game protocol.
@@ -495,37 +484,35 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		metrics.MessagesReceived.WithLabelValues("move").Inc()
 		s.markConnectionCritical(connection)
 
-		switch s.gameWorld.QueueMovementInput(
+		result := s.gameWorld.QueueMovementInput(
 			connection.player.ID,
 			clientMsg.MovementVector.DX,
 			clientMsg.MovementVector.DY,
 			clientMsg.InputSequence,
-		) {
+		)
+		switch result {
 		case types.InputAccepted:
 			atomic.StoreInt32(&connection.staleInputStreak, 0)
 
 		case types.InputStale:
-			// A duplicate or reordered step is not evidence of a bad client: proxies
-			// and TCP-level retransmits produce both. Skipping it keeps the applied
-			// sequence monotonic, which is all reconciliation needs. Only a client
-			// that never sends anything usable is disconnected.
+			// Idempotently ignore a duplicate/old transition. WebSocket preserves
+			// order, so a long stale streak indicates a non-conforming sender.
 			metrics.MovementInputsRejected.Inc()
+			slog.Warn("movement input rejected", "player_id", connection.player.ID, "reason", result.String(), "sequence", clientMsg.InputSequence)
 			if atomic.AddInt32(&connection.staleInputStreak, 1) >= maxStaleInputStreak {
 				go s.cleanupConnection(connection)
 			}
 			return
 
 		default:
-			// A full ring means the client is PlayerInputQueueCapacity steps behind
-			// and can no longer be reconciled; InputInvalid means the sender is not
-			// speaking this protocol. Neither is recoverable.
+			// A sequence gap or invalid sample indicates a broken client stream.
 			metrics.MovementInputsRejected.Inc()
+			slog.Warn("movement input rejected", "player_id", connection.player.ID, "reason", result.String(), "sequence", clientMsg.InputSequence)
 			go s.cleanupConnection(connection)
 			return
 		}
 
-		// ACK is emitted from broadcastTick after the world worker has applied the
-		// velocity. Sending it here would acknowledge a predicted pre-tick position.
+		// ACK is emitted after the world worker has reconstructed the segment boundary.
 
 	case protocol.MessageDirection:
 		metrics.MessagesReceived.WithLabelValues("direction").Inc()
@@ -552,6 +539,10 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 	case protocol.MessageSyncRequest:
 		metrics.MessagesReceived.WithLabelValues("sync_request").Inc()
 		s.sendInitialState(connection)
+
+	case protocol.MessagePing:
+		metrics.MessagesReceived.WithLabelValues("ping").Inc()
+		s.sendPong(connection, clientMsg.Nonce)
 	}
 }
 

@@ -6,39 +6,50 @@ import (
 	"time"
 )
 
-const PlayerInputQueueCapacity = 256
-
 type MovementInput struct {
 	Sequence uint32
 	DX       int8
 	DY       int8
 }
 
-// InputResult explains why a movement step was not queued. The distinction matters:
-// a stale sequence is routinely produced by retransmits and reordering middleboxes and
-// must not cost the player their session, while a full ring means the client is more
-// than PlayerInputQueueCapacity steps behind and can no longer be reconciled.
+// InputResult explains why an input sample was not accepted.
 type InputResult uint8
 
 const (
 	InputAccepted InputResult = iota
 	InputStale
-	InputQueueFull
 	InputInvalid
+	InputGap
 )
+
+func (r InputResult) String() string {
+	switch r {
+	case InputAccepted:
+		return "accepted"
+	case InputStale:
+		return "stale_sequence"
+	case InputInvalid:
+		return "invalid_input"
+	case InputGap:
+		return "sequence_gap"
+	default:
+		return "unknown"
+	}
+}
 
 // Player представляет игрока в системе
 type Player struct {
-	ID                uint32 // Atomic access
-	X                 uint32 // Atomic access (stores uint16 value)
-	Y                 uint32 // Atomic access (stores uint16 value)
-	VX                uint32 // Atomic access (stores int8: -1, 0, 1)
-	VY                uint32 // Atomic access (stores int8: -1, 0, 1)
-	FacingRight       uint32 // Atomic bool (0/1)
-	State             uint32 // Atomic player state
-	ClientTick        uint32 // Atomic client tick for reconciliation
-	AppliedClientTick uint32 // Latest client tick captured and applied by world simulation
-	AttackStartTime   int64  // Atomic nanosecond timestamp of attack start (0 = not attacking)
+	ID                   uint32 // Atomic access
+	X                    uint32 // Atomic access (stores uint16 value)
+	Y                    uint32 // Atomic access (stores uint16 value)
+	VX                   uint32 // Atomic access (stores int8: -1, 0, 1)
+	VY                   uint32 // Atomic access (stores int8: -1, 0, 1)
+	FacingRight          uint32 // Atomic bool (0/1)
+	State                uint32 // Atomic player state
+	AppliedInputSequence uint32
+	MovementAckX         uint32 // Position after AppliedInputSequence was simulated
+	MovementAckY         uint32
+	AttackStartTick      uint32 // Atomic worldTick attack started on (0 = not attacking); tick-based so time dilation slows attacks the same way it slows movement
 
 	// Timestamps для performance tracking
 	LastUpdate   int64 // Atomic timestamp
@@ -48,13 +59,11 @@ type Player struct {
 	// Metrics
 	MessageCount uint64 // Atomic counter
 
-	inputMu            sync.Mutex
-	inputQueue         [PlayerInputQueueCapacity]MovementInput
-	inputHead          uint16
-	inputTail          uint16
-	inputCount         uint16
-	lastQueuedInput    uint32
-	hasLastQueuedInput bool
+	inputMu              sync.Mutex
+	pendingInput         MovementInput
+	hasPendingInput      bool
+	lastReceivedInput    uint32
+	hasLastReceivedInput bool
 }
 
 // GameEvent представляет игровое событие
@@ -64,7 +73,7 @@ type GameEvent struct {
 	VectorX     int8
 	VectorY     int8
 	FacingRight bool
-	ClientTick  uint32
+	InputSequence uint32
 	Timestamp   int64
 }
 
@@ -86,7 +95,6 @@ type PlayerState struct {
 	VY          int8
 	FacingRight bool
 	State       uint8
-	ClientTick  uint32
 }
 
 // PerformanceMetrics содержит метрики производительности
@@ -148,57 +156,53 @@ func (p *Player) SetVY(vy int8) {
 	atomic.StoreUint32(&p.VY, uint32(vy))
 }
 
-func (p *Player) GetClientTick() uint32 {
-	return atomic.LoadUint32(&p.ClientTick)
+func (p *Player) GetAppliedInputSequence() uint32 {
+	return atomic.LoadUint32(&p.AppliedInputSequence)
 }
 
-func (p *Player) SetClientTick(tick uint32) {
-	atomic.StoreUint32(&p.ClientTick, tick)
+func (p *Player) SetMovementAck(sequence uint32, x, y uint16) {
+	atomic.StoreUint32(&p.MovementAckX, uint32(x))
+	atomic.StoreUint32(&p.MovementAckY, uint32(y))
+	atomic.StoreUint32(&p.AppliedInputSequence, sequence)
 }
 
-func (p *Player) GetAppliedClientTick() uint32 {
-	return atomic.LoadUint32(&p.AppliedClientTick)
+func (p *Player) GetMovementAckPosition() (uint16, uint16) {
+	return uint16(atomic.LoadUint32(&p.MovementAckX)), uint16(atomic.LoadUint32(&p.MovementAckY))
 }
 
-func (p *Player) SetAppliedClientTick(tick uint32) {
-	atomic.StoreUint32(&p.AppliedClientTick, tick)
-}
-
-// EnqueueMovementInput preserves every predicted movement step in WebSocket order.
-// The fixed-size, pointer-free ring avoids hot-path allocations and bounds memory.
-func (p *Player) EnqueueMovementInput(input MovementInput) InputResult {
+// OfferMovementInput validates WebSocket order and overwrites the pending sample.
+// If several samples arrive before one server tick, only the newest can affect that
+// tick; old samples are not a backlog of movement steps.
+func (p *Player) OfferMovementInput(input MovementInput) InputResult {
 	p.inputMu.Lock()
 	defer p.inputMu.Unlock()
 
-	if p.hasLastQueuedInput {
-		delta := input.Sequence - p.lastQueuedInput
+	if p.hasLastReceivedInput {
+		delta := input.Sequence - p.lastReceivedInput
 		if delta == 0 || delta >= 1<<31 {
 			return InputStale
 		}
+		if delta != 1 {
+			return InputGap
+		}
 	}
-	if p.inputCount == PlayerInputQueueCapacity {
-		return InputQueueFull
-	}
-
-	p.inputQueue[p.inputTail] = input
-	p.inputTail = (p.inputTail + 1) % PlayerInputQueueCapacity
-	p.inputCount++
-	p.lastQueuedInput = input.Sequence
-	p.hasLastQueuedInput = true
+	p.pendingInput = input
+	p.hasPendingInput = true
+	p.lastReceivedInput = input.Sequence
+	p.hasLastReceivedInput = true
 	return InputAccepted
 }
 
-func (p *Player) DequeueMovementInput() (MovementInput, bool) {
+func (p *Player) ConsumeLatestMovementInput() (MovementInput, bool) {
 	p.inputMu.Lock()
 	defer p.inputMu.Unlock()
 
-	if p.inputCount == 0 {
+	if !p.hasPendingInput {
 		return MovementInput{}, false
 	}
-	input := p.inputQueue[p.inputHead]
-	p.inputQueue[p.inputHead] = MovementInput{}
-	p.inputHead = (p.inputHead + 1) % PlayerInputQueueCapacity
-	p.inputCount--
+	input := p.pendingInput
+	p.pendingInput = MovementInput{}
+	p.hasPendingInput = false
 	return input, true
 }
 
@@ -218,12 +222,12 @@ func (p *Player) GetMessageCount() uint64 {
 	return atomic.LoadUint64(&p.MessageCount)
 }
 
-func (p *Player) GetAttackStartTime() int64 {
-	return atomic.LoadInt64(&p.AttackStartTime)
+func (p *Player) GetAttackStartTick() uint32 {
+	return atomic.LoadUint32(&p.AttackStartTick)
 }
 
-func (p *Player) SetAttackStartTime(t int64) {
-	atomic.StoreInt64(&p.AttackStartTime, t)
+func (p *Player) SetAttackStartTick(tick uint32) {
+	atomic.StoreUint32(&p.AttackStartTick, tick)
 }
 
 // ToState преобразует Player в PlayerState для сериализации
@@ -236,6 +240,5 @@ func (p *Player) ToState() PlayerState {
 		VY:          p.GetVY(),
 		FacingRight: p.GetFacingRight(),
 		State:       p.GetState(),
-		ClientTick:  p.GetAppliedClientTick(),
 	}
 }

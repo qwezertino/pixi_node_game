@@ -8,7 +8,7 @@ import (
 	"pixi_game_server/internal/types"
 )
 
-func TestDelayedMoveAndStopAreAppliedOnceInOrder(t *testing.T) {
+func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
 			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
@@ -19,39 +19,88 @@ func TestDelayedMoveAndStopAreAppliedOnceInOrder(t *testing.T) {
 	player := &types.Player{ID: 1, X: 100, Y: 100}
 	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
 
-	for _, input := range []types.MovementInput{
-		{Sequence: 1, DX: 1},
-		{Sequence: 2, DX: 1},
-		{Sequence: 3}, // delayed STOP
-	} {
-		if got := player.EnqueueMovementInput(input); got != types.InputAccepted {
-			t.Fatalf("failed to enqueue %+v: %d", input, got)
-		}
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
+		t.Fatalf("offer start = %s", got)
 	}
-
 	gw.updatePlayerPosition(player, 1)
-	if player.GetX() != 104 || player.GetAppliedClientTick() != 1 {
-		t.Fatalf("after first tick x=%d seq=%d", player.GetX(), player.GetAppliedClientTick())
+	if player.GetX() != 104 || player.GetVX() != 1 {
+		t.Fatalf("after start x=%d vx=%d", player.GetX(), player.GetVX())
 	}
-	gw.updatePlayerPosition(player, 2)
-	if player.GetX() != 108 || player.GetAppliedClientTick() != 2 {
-		t.Fatalf("after second tick x=%d seq=%d", player.GetX(), player.GetAppliedClientTick())
-	}
-	gw.updatePlayerPosition(player, 3)
-	if player.GetX() != 108 || player.GetVX() != 0 || player.GetAppliedClientTick() != 3 {
-		t.Fatalf("after stop x=%d vx=%d seq=%d", player.GetX(), player.GetVX(), player.GetAppliedClientTick())
-	}
-	gw.updatePlayerPosition(player, 4)
-	if player.GetX() != 108 {
-		t.Fatalf("server drifted without another input: x=%d", player.GetX())
+	ackX, ackY := player.GetMovementAckPosition()
+	if ackX != 104 || ackY != 100 || player.GetAppliedInputSequence() != 1 {
+		t.Fatalf("ACK after start x=%d y=%d seq=%d", ackX, ackY, player.GetAppliedInputSequence())
 	}
 }
 
-// A player held against a world boundary keeps consuming inputs while every
-// replicated field stays constant, so it contributes nothing to the delta. This is
-// why broadcastTick emits movement ACKs independently of the delta payload: if the
-// ACK rode on the delta, this client would never prune its pending-input ring.
-func TestClampedPlayerAdvancesInputSequenceWithoutChangingState(t *testing.T) {
+// Once a sample sets a non-zero vector, the server keeps integrating it on every
+// subsequent tick without requiring a fresh sample — a client resending the same
+// vector every fixed tick is a fail-safe choice, not a correctness requirement.
+func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
+	gw := &GameWorld{
+		cfg: &config.Config{
+			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
+			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
+		},
+		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
+	}
+	player := &types.Player{ID: 1, X: 100, Y: 100}
+	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
+
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
+		t.Fatalf("offer start = %s", got)
+	}
+	gw.updatePlayerPosition(player, 1)
+	gw.updatePlayerPosition(player, 2)
+	gw.updatePlayerPosition(player, 3)
+	if player.GetX() != 112 {
+		t.Fatalf("persisted velocity did not keep integrating: x=%d", player.GetX())
+	}
+	// No new sample was consumed on ticks 2/3, so the ACK boundary stays at tick 1.
+	ackX, _ := player.GetMovementAckPosition()
+	if ackX != 104 || player.GetAppliedInputSequence() != 1 {
+		t.Fatalf("ACK boundary moved without a new sample: x=%d seq=%d", ackX, player.GetAppliedInputSequence())
+	}
+}
+
+func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
+	gw := &GameWorld{
+		cfg: &config.Config{
+			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
+			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
+		},
+		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
+	}
+	player := &types.Player{ID: 1, X: 100, Y: 100}
+	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
+
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
+		t.Fatalf("offer start = %s", got)
+	}
+	gw.updatePlayerPosition(player, 1)
+	gw.updatePlayerPosition(player, 2)
+
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 2}); got != types.InputAccepted {
+		t.Fatalf("offer stop = %s", got)
+	}
+	gw.updatePlayerPosition(player, 3)
+	stopped := player.GetX()
+	if player.GetVX() != 0 {
+		t.Fatalf("velocity did not clear on stop: vx=%d", player.GetVX())
+	}
+	gw.updatePlayerPosition(player, 4)
+	if player.GetX() != stopped {
+		t.Fatalf("player drifted after stop: before=%d after=%d", stopped, player.GetX())
+	}
+	ackX, _ := player.GetMovementAckPosition()
+	if ackX != stopped || player.GetAppliedInputSequence() != 2 {
+		t.Fatalf("ACK after stop x=%d seq=%d", ackX, player.GetAppliedInputSequence())
+	}
+}
+
+// A held vector continues to integrate at a boundary; its replicated state stays
+// constant (clamped) and contributes nothing to the delta, but the ACK still tracks
+// the latest applied sequence.
+func TestUpdatePlayerPositionClampsAtWorldBoundary(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
 			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
@@ -62,27 +111,87 @@ func TestClampedPlayerAdvancesInputSequenceWithoutChangingState(t *testing.T) {
 	player := &types.Player{ID: 1, X: 1000, Y: 100}
 	gw.visibilityManager.AddPlayer(player.ID, 1000, 100)
 
-	for sequence := uint32(1); sequence <= 3; sequence++ {
-		if got := player.EnqueueMovementInput(types.MovementInput{Sequence: sequence, DX: 1}); got != types.InputAccepted {
-			t.Fatalf("enqueue %d = %d, want InputAccepted", sequence, got)
-		}
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
+		t.Fatalf("offer start = %s", got)
 	}
-
-	// First tick establishes VX=1, which does change the replicated record.
 	gw.updatePlayerPosition(player, 1)
 	baseline := player.ToState()
 
-	for sequence := uint32(2); sequence <= 3; sequence++ {
-		gw.updatePlayerPosition(player, int64(sequence))
+	for tick := int64(2); tick <= 3; tick++ {
+		gw.updatePlayerPosition(player, tick)
 		st := player.ToState()
+		if st.X != baseline.X || st.Y != baseline.Y || st.VX != baseline.VX || st.VY != baseline.VY {
+			t.Fatalf("clamped player changed a replicated field at tick %d: %+v vs %+v", tick, st, baseline)
+		}
+	}
+}
 
-		if st.X != baseline.X || st.Y != baseline.Y || st.VX != baseline.VX ||
-			st.VY != baseline.VY || st.State != baseline.State || st.FacingRight != baseline.FacingRight {
-			t.Fatalf("clamped player changed a replicated field at sequence %d: %+v vs %+v", sequence, st, baseline)
-		}
-		if player.GetAppliedClientTick() != sequence {
-			t.Fatalf("applied sequence = %d, want %d", player.GetAppliedClientTick(), sequence)
-		}
+func TestOfferMovementInputKeepsOnlyLatestSampleBeforeConsume(t *testing.T) {
+	player := &types.Player{ID: 1}
+
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
+		t.Fatalf("offer 1 = %s", got)
+	}
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 2, DX: -1}); got != types.InputAccepted {
+		t.Fatalf("offer 2 = %s", got)
+	}
+
+	input, ok := player.ConsumeLatestMovementInput()
+	if !ok || input.Sequence != 2 || input.DX != -1 {
+		t.Fatalf("consumed stale sample instead of latest: %+v ok=%v", input, ok)
+	}
+	if _, ok := player.ConsumeLatestMovementInput(); ok {
+		t.Fatal("second consume should find nothing pending")
+	}
+}
+
+func TestOfferMovementInputRejectsStaleAndGap(t *testing.T) {
+	player := &types.Player{ID: 1}
+
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 5}); got != types.InputAccepted {
+		t.Fatalf("offer 5 = %s", got)
+	}
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 5}); got != types.InputStale {
+		t.Fatalf("duplicate sequence = %s, want InputStale", got)
+	}
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 4}); got != types.InputStale {
+		t.Fatalf("older sequence = %s, want InputStale", got)
+	}
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 8}); got != types.InputGap {
+		t.Fatalf("skipped sequence = %s, want InputGap", got)
+	}
+}
+
+// Attack cooldown is measured in ticks, not wall-clock time, so it dilates along
+// with movement under time dilation instead of ticking at a fixed real-world rate.
+func TestTryAttackCooldownIsTickBasedNotWallClock(t *testing.T) {
+	gw := &GameWorld{attackDurationTicks: 20}
+	player := &types.Player{ID: 1}
+	gw.playersMap = map[uint32]*types.Player{1: player}
+
+	gw.tickCount = 100
+	if _, _, accepted := gw.TryAttack(1); !accepted {
+		t.Fatal("first attack should be accepted")
+	}
+	if start := player.GetAttackStartTick(); start != 100 {
+		t.Fatalf("attack start tick = %d, want 100", start)
+	}
+
+	// Still inside the cooldown window in ticks, no matter how much real time an
+	// external caller might imagine has passed — this function only looks at
+	// gw.tickCount, which nothing here has advanced.
+	gw.tickCount = 119
+	if _, _, accepted := gw.TryAttack(1); accepted {
+		t.Fatal("attack inside the tick-based cooldown must be rejected")
+	}
+
+	// Exactly attackDurationTicks later, cooldown has elapsed.
+	gw.tickCount = 120
+	if _, _, accepted := gw.TryAttack(1); !accepted {
+		t.Fatal("attack should be accepted once attackDurationTicks have elapsed")
+	}
+	if start := player.GetAttackStartTick(); start != 120 {
+		t.Fatalf("second attack start tick = %d, want 120", start)
 	}
 }
 

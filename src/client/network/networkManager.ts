@@ -27,11 +27,14 @@ export type OnGameStateCallback = (
     fullState: boolean,
     // Simulation ticks elapsed since the previous frame this client received.
     // Players missing from the frame advanced by exactly this many steps.
-    elapsedTicks: number
+    elapsedTicks: number,
+    // Server's current time-dilation factor as a percentage (100 = nominal).
+    dilationPct: number
 ) => void;
 export type OnCorrectionCallback = (position: PlayerPosition) => void;
 export type OnMovementAckCallback = (position: PlayerPosition, inputSequence: number) => void;
 export type OnSessionStartCallback = (position: PlayerPosition) => void;
+export type OnLatencyCallback = (latencyMs: number) => void;
 export type OnPlayerAttackCallback = (
     playerId: string,
     position: PlayerPosition
@@ -52,6 +55,10 @@ export class NetworkManager {
     private receivedInitialPosition = false;
     private lastWorldTick = 0;
     private hasWorldTick = false;
+    // Server's current time-dilation factor (100 = nominal tick rate). main.ts scales
+    // its fixed-timestep accumulator by this so local prediction stays in lockstep
+    // with a server that has slowed its own simulation under pressure.
+    private dilationPct = 100;
 
     // Reconnect state
     private wsUrl = "";
@@ -59,6 +66,9 @@ export class NetworkManager {
     private reconnectAttempts = 0;
     private closedByClient = false;
     private protocolMismatch = false;
+    private directPingTimer: number | null = null;
+    private directPingNonce = 0;
+    private directPendingPings = new Map<number, number>();
 
     // Callback handlers
     private onSessionStartCallbacks: OnSessionStartCallback[] = [];
@@ -70,9 +80,7 @@ export class NetworkManager {
     private onCorrectionCallbacks: OnCorrectionCallback[] = [];
     private onMovementAckCallbacks: OnMovementAckCallback[] = [];
     private onPlayerAttackCallbacks: OnPlayerAttackCallback[] = [];
-
-    // Reference to FPS display for ping tracking
-    private fpsDisplay: any = null;
+    private onLatencyCallbacks: OnLatencyCallback[] = [];
 
     constructor() {
         if (this.useWorker && typeof Worker !== 'undefined') {
@@ -101,12 +109,19 @@ export class NetworkManager {
                     case 'error':
                         this.onSocketError();
                         break;
+                    case 'latency':
+                        if (typeof msg.latencyMs === 'number') {
+                            this.emitLatency(msg.latencyMs);
+                        }
+                        break;
                 }
             };
 
             this.worker.onerror = (error) => {
                 console.error('Network Worker error:', error);
                 // Fallback to direct socket
+                this.worker?.terminate();
+                this.worker = null;
                 this.useWorker = false;
                 this.initDirectSocket();
             };
@@ -136,10 +151,12 @@ export class NetworkManager {
     private onSocketOpen() {
         this.connected = true;
         this.reconnectAttempts = 0;
+        if (!this.worker) this.startDirectPings();
     }
 
     private onSocketClose() {
         this.connected = false;
+        this.stopDirectPings();
         if (this.resyncRetryTimer !== null) {
             window.clearTimeout(this.resyncRetryTimer);
             this.resyncRetryTimer = null;
@@ -405,8 +422,10 @@ export class NetworkManager {
                             }
                         }
 
+                        this.dilationPct = message.dilationPct ?? 100;
+
                         this.onGameStateCallbacks.forEach((callback) =>
-                            callback(incomingPlayers, message.stateSequence, fullState, elapsedTicks)
+                            callback(incomingPlayers, message.stateSequence, fullState, elapsedTicks, this.dilationPct)
                         );
                         break;
                     }
@@ -419,6 +438,15 @@ export class NetworkManager {
                             );
                         }
                         break;
+
+                    case "pong": {
+                        const sentAt = this.directPendingPings.get(message.nonce);
+                        if (sentAt !== undefined) {
+                            this.directPendingPings.delete(message.nonce);
+                            this.emitLatency(performance.now() - sentAt);
+                        }
+                        break;
+                    }
 
                     // case "correction":
                     //     if (message.playerId === this.playerId) {
@@ -469,23 +497,21 @@ export class NetworkManager {
         this.onMovementAckCallbacks.push(callback);
     }
 
+    public onLatency(callback: OnLatencyCallback): void {
+        this.onLatencyCallbacks.push(callback);
+    }
+
     public onPlayerAttack(callback: OnPlayerAttackCallback): void {
         this.onPlayerAttackCallbacks.push(callback);
     }
 
     // Send movement to server
-    public sendMovement(dx: number, dy: number, inputSequence?: number): void {
+    public sendMovement(dx: number, dy: number, inputSequence: number): void {
         const moveMsg = {
             type: "move" as const,
             movementVector: { dx, dy },
-            inputSequence: inputSequence || 0,
-            position: { x: 0, y: 0 },
+            inputSequence,
         };
-
-        // Track ping if FPS display is available
-        if (this.fpsDisplay && inputSequence !== undefined) {
-            this.fpsDisplay.trackMovementSend(inputSequence);
-        }
 
         // Use binary protocol for frequent updates
         const binaryData = BinaryProtocol.encodeMove(moveMsg);
@@ -579,6 +605,11 @@ export class NetworkManager {
         return this.players;
     }
 
+    // Server's current time-dilation factor (100 = nominal tick rate).
+    public getDilationPct(): number {
+        return this.dilationPct;
+    }
+
     // Get connection status
     public getConnectionStatus(): string {
         if (this.worker) {
@@ -599,6 +630,7 @@ export class NetworkManager {
     // Cleanup method
     public disconnect(): void {
         this.closedByClient = true;
+        this.stopDirectPings();
         if (this.reconnectTimer !== null) {
             window.clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
@@ -617,8 +649,27 @@ export class NetworkManager {
         }
     }
 
-    // Set FPS display reference for ping tracking
-    public setFpsDisplay(fpsDisplay: any): void {
-        this.fpsDisplay = fpsDisplay;
+    private emitLatency(latencyMs: number): void {
+        this.onLatencyCallbacks.forEach((callback) => callback(latencyMs));
+    }
+
+    private startDirectPings(): void {
+        this.stopDirectPings();
+        const send = () => {
+            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+            this.directPingNonce = (this.directPingNonce + 1) >>> 0;
+            this.directPendingPings.set(this.directPingNonce, performance.now());
+            this.socket.send(BinaryProtocol.encodePing(this.directPingNonce) as Uint8Array<ArrayBuffer>);
+        };
+        send();
+        this.directPingTimer = window.setInterval(send, 1000);
+    }
+
+    private stopDirectPings(): void {
+        if (this.directPingTimer !== null) {
+            window.clearInterval(this.directPingTimer);
+            this.directPingTimer = null;
+        }
+        this.directPendingPings.clear();
     }
 }

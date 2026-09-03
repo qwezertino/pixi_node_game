@@ -18,10 +18,10 @@ interface PositionSnapshot {
     y: number;
 }
 
-// При 20Hz тик = 50ms. Держим буфер 2 тика (100ms) чтобы
-// всегда было 2 снапшота для интерполяции даже при лёгком джиттере.
-const MIN_INTERPOLATION_DELAY_MS = 100;
-const MAX_INTERPOLATION_DELAY_MS = 300;
+// Replication is 20 Hz by default. One-frame interpolation hides ordinary jitter
+// without keeping remote players hundreds of milliseconds in the past.
+const MIN_INTERPOLATION_DELAY_MS = 50;
+const MAX_INTERPOLATION_DELAY_MS = 150;
 const SNAPSHOT_EWMA_ALPHA = 0.15;
 const MAX_SNAPSHOTS = 32;
 
@@ -34,7 +34,7 @@ class RemotePlayer {
 
     // Буфер серверных позиций для интерполяции
     private snapshots: PositionSnapshot[] = [];
-    private interpolationDelayMs = 130;
+    private interpolationDelayMs = 75;
     private interArrivalEwmaMs = 1000 / Math.max(TICK_RATE, 1);
     private jitterEwmaMs = 0;
     private lastSnapshotTimeMs = 0;
@@ -154,7 +154,7 @@ class RemotePlayer {
                     MAX_INTERPOLATION_DELAY_MS,
                     Math.max(
                         MIN_INTERPOLATION_DELAY_MS,
-                        this.interArrivalEwmaMs * 2.2 + this.jitterEwmaMs * 1.8
+                        this.interArrivalEwmaMs * 1.25 + this.jitterEwmaMs * 2
                     )
                 );
                 this.interpolationDelayMs =
@@ -202,8 +202,8 @@ class RemotePlayer {
                 this.virtualPosition.x = older.x + (newer.x - older.x) * t;
                 this.virtualPosition.y = older.y + (newer.y - older.y) * t;
             } else {
-                // renderTime опережает новейший снимок — буфер 100ms (2 тика × 50ms)
-                // делает этот случай редким. Держим последнюю известную позицию:
+                // If jitter exhausts the adaptive buffer, hold the newest position.
+                // The normal 20 Hz path targets roughly 60–75 ms of history.
                 // никакой экстраполяции → никакого телепорта-назад при получении снимка.
                 this.virtualPosition.x = newest.x;
                 this.virtualPosition.y = newest.y;

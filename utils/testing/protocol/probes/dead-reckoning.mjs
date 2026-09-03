@@ -18,6 +18,7 @@ for (let t = 0; t < STEPS; t++) {
     mover.move(direction[0], direction[1]);
     await sleep(1000 / 20);
 }
+mover.move(0, 0);
 await sleep(900);
 
 const belief = watcher.belief(mover.id);
@@ -31,7 +32,7 @@ const failures = [...mover.decodeFailures, ...watcher.decodeFailures];
 
 mover.close(); watcher.close();
 report('dead reckoning: converges on the authoritative position', [
-    { label: 'every input acknowledged', actual: `${mover.lastAckSequence}/${STEPS}`, pass: mover.lastAckSequence === STEPS },
+    { label: 'latest transition acknowledged', actual: `${mover.lastAckSequence}/${mover.sequence}`, pass: mover.lastAckSequence === mover.sequence },
     { label: 'reconstructed position error', actual: error === null ? 'no samples' : `${error.toFixed(2)}px`, pass: error === 0 },
     { label: 'decoder failures', actual: failures.length, pass: failures.length === 0 },
 ], {

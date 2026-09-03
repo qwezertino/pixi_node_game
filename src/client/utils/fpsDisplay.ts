@@ -15,8 +15,6 @@ export class FpsDisplay {
     private messagesReceived: number = 0;
     private connectionStartTime: number = Date.now();
     private pingHistory: number[] = [];
-    private pendingPings: Map<number, number> = new Map(); // inputSequence -> sendTime
-    private pingInterval: number | null = null;
     private lastPingTime: number = 0; // Время последнего измерения пинга
 
     constructor(app: Application, networkManager: NetworkManager) {
@@ -67,14 +65,6 @@ export class FpsDisplay {
         // Track network messages
         this.setupNetworkTracking();
 
-        // Start periodic ping for better latency measurement
-        this.startPingInterval();
-    }
-
-    private startPingInterval() {
-        // Не отправляем искусственные ping-сообщения
-        // Вместо этого будем измерять пинг на основе реальных движений
-        // Если игрок долго не двигается, покажем последний известный пинг
     }
 
     private setupNetworkTracking() {
@@ -104,27 +94,9 @@ export class FpsDisplay {
             }
         }, 100);
 
-        // Track movement acknowledgments for ping calculation
-        this.networkManager.onMovementAck((_, inputSequence) => {
-            const sendTime = this.pendingPings.get(inputSequence);
-            if (sendTime) {
-                const ping = Date.now() - sendTime;
-                this.addPingMeasurement(ping);
-                this.pendingPings.delete(inputSequence);
-            }
+        this.networkManager.onLatency((latencyMs) => {
+            this.addPingMeasurement(latencyMs);
         });
-    }
-
-    public trackMovementSend(inputSequence: number) {
-        this.pendingPings.set(inputSequence, Date.now());
-
-        // Clean up old pending pings (older than 5 seconds)
-        const now = Date.now();
-        for (const [seq, time] of this.pendingPings.entries()) {
-            if (now - time > 5000) {
-                this.pendingPings.delete(seq);
-            }
-        }
     }
 
     private addPingMeasurement(ping: number) {
@@ -220,8 +192,7 @@ export class FpsDisplay {
 
     private getPingDisplayText(): string {
         if (this.pingHistory.length === 0) {
-            // Если еще не было измерений пинга
-            return "Waiting for movement...";
+            return "Measuring...";
         }
 
         const ping = this.calculateAveragePing();
@@ -280,10 +251,5 @@ export class FpsDisplay {
 
     // Cleanup method
     destroy() {
-        // Больше не используем pingInterval, но оставляем для совместимости
-        if (this.pingInterval) {
-            window.clearInterval(this.pingInterval);
-            this.pingInterval = null;
-        }
     }
 }

@@ -24,9 +24,10 @@ type broadcastFuncHolder struct {
 // Workers do only the CPU-heavy part (position update + attack timeout).
 // State snapshot (ToState + delta) remains sequential in the gameLoop goroutine.
 type tickWorkerInput struct {
-	ptrs          []*types.Player
-	nowNano       int64
-	attackDurNano int64
+	ptrs                []*types.Player
+	nowNano             int64
+	worldTick           uint32
+	attackDurationTicks uint32
 }
 
 // GameWorld управляет состоянием игрового мира
@@ -65,9 +66,24 @@ type GameWorld struct {
 	tickDuration  int64          // atomic
 	lastSyncTime  int64          // atomic
 
-	// Tick management
-	ticker   *time.Ticker
+	// Tick management. ticker is an atomic.Pointer because SetTickInterval can be
+	// called from the gameLoop goroutine itself (the normal, production path — tick()
+	// invokes it synchronously) or, in tests exercising the dilation controller in
+	// isolation, from a different goroutine — it must be safe either way.
+	ticker   atomic.Pointer[time.Ticker]
 	stopChan chan struct{}
+	// Time dilation (EVE-style): nominalTickIntervalNs is the configured TickRate
+	// baseline, fixed at startup. currentTickIntervalNs is what the ticker actually
+	// runs at right now — Server slows it under pressure via SetTickInterval so
+	// movement/cooldowns (unchanged in tick-units) take proportionally longer in
+	// wall-clock time, instead of the simulation silently falling behind.
+	nominalTickIntervalNs int64 // atomic
+	currentTickIntervalNs int64 // atomic
+	// AttackDuration converted to a tick count once at startup, so attack cooldown
+	// is measured in ticks (like movement) instead of wall-clock nanoseconds. Under
+	// time dilation the ticker itself slows down, so a fixed tick count takes
+	// proportionally longer in real time — attacks dilate the same way movement does.
+	attackDurationTicks uint32
 
 	// Player ID generation
 	nextPlayerID uint32 // atomic
@@ -146,12 +162,24 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 	gw.visibilityManager = systems.NewVisibilityManager(
 		cfg.World.Width, cfg.World.Height, 100) // 100-unit grid cells
 
+	// Set before spawning gameLoop so GetNominalTickInterval/GetTickInterval are safe
+	// to call immediately after NewGameWorld returns (Server reads them at startup).
+	nominalInterval := time.Second / time.Duration(cfg.Game.TickRate)
+	gw.nominalTickIntervalNs = nominalInterval.Nanoseconds()
+	gw.currentTickIntervalNs = nominalInterval.Nanoseconds()
+
+	gw.attackDurationTicks = uint32((cfg.Game.AttackDuration.Nanoseconds() + nominalInterval.Nanoseconds()/2) / nominalInterval.Nanoseconds())
+	if gw.attackDurationTicks < 1 {
+		gw.attackDurationTicks = 1
+	}
+
 	// Start game loop
 	go gw.gameLoop()
 
 	slog.Info("gameworld initialized",
 		"tick_rate_hz", cfg.Game.TickRate,
-		"batch_interval_ms", cfg.Game.BatchInterval.Milliseconds())
+		"tick_interval_ms", nominalInterval.Milliseconds(),
+		"attack_duration_ticks", gw.attackDurationTicks)
 
 	return gw
 }
@@ -207,8 +235,8 @@ func (gw *GameWorld) ProcessEvent(event types.GameEvent) {
 	gw.handleEvent(event)
 }
 
-// QueueMovementInput appends one deterministic movement step. The simulation
-// consumes at most one step per server tick, so delayed bursts cannot increase speed.
+// QueueMovementInput stores the newest fixed-rate input sample. Network delivery can
+// coalesce samples before a server tick; old samples never become movement backlog.
 func (gw *GameWorld) QueueMovementInput(playerID uint32, dx, dy int8, sequence uint32) types.InputResult {
 	if abs(int(dx)) > 1 || abs(int(dy)) > 1 {
 		return types.InputInvalid
@@ -219,7 +247,7 @@ func (gw *GameWorld) QueueMovementInput(playerID uint32, dx, dy int8, sequence u
 	if !exists {
 		return types.InputInvalid
 	}
-	result := player.EnqueueMovementInput(types.MovementInput{Sequence: sequence, DX: dx, DY: dy})
+	result := player.OfferMovementInput(types.MovementInput{Sequence: sequence, DX: dx, DY: dy})
 	if result == types.InputAccepted {
 		metrics.EventsProcessed.WithLabelValues("move").Inc()
 	}
@@ -257,9 +285,10 @@ func (gw *GameWorld) gameLoop() {
 	// each connection still owns one writer goroutine. Forced runtime.GC cycles
 	// would turn allocation spikes into avoidable latency spikes.
 
-	tickInterval := time.Second / time.Duration(gw.cfg.Game.TickRate)
-	gw.ticker = time.NewTicker(tickInterval)
-	defer gw.ticker.Stop()
+	tickInterval := gw.GetNominalTickInterval()
+	ticker := time.NewTicker(tickInterval)
+	gw.ticker.Store(ticker)
+	defer ticker.Stop()
 
 	slog.Info("game loop started",
 		"interval_ms", tickInterval.Milliseconds(),
@@ -267,7 +296,7 @@ func (gw *GameWorld) gameLoop() {
 
 	for {
 		select {
-		case <-gw.ticker.C:
+		case <-ticker.C:
 			start := time.Now()
 			gw.tick()
 			duration := time.Since(start)
@@ -275,14 +304,15 @@ func (gw *GameWorld) gameLoop() {
 			metrics.TickDuration.Observe(duration.Seconds())
 			metrics.TicksTotal.Inc()
 
-			if duration > tickInterval {
+			budget := gw.GetTickInterval()
+			if duration > budget {
 				nowNano := time.Now().UnixNano()
 				prev := atomic.LoadInt64(&gw.lastSlowTickLog)
 				if nowNano-prev >= int64(5*time.Second) &&
 					atomic.CompareAndSwapInt64(&gw.lastSlowTickLog, prev, nowNano) {
 					slog.Warn("slow tick detected",
 						"duration_ms", duration.Milliseconds(),
-						"budget_ms", tickInterval.Milliseconds(),
+						"budget_ms", budget.Milliseconds(),
 						"players", gw.GetPlayerCount())
 				}
 			}
@@ -302,9 +332,43 @@ func (gw *GameWorld) SetTickBroadcaster(fn func(all []types.PlayerState, changed
 	gw.broadcastFn.Store(broadcastFuncHolder{fn: fn})
 }
 
+// SetTickInterval changes the simulation tick period going forward — this is the
+// mechanism behind time dilation. Movement-per-tick and cooldown-per-tick stay in
+// tick-units unchanged; slowing the ticker itself is what stretches them in
+// wall-clock time, same as EVE's TiDi. In production this always runs on the
+// gameLoop goroutine (Server calls it from inside broadcastTick, which tick()
+// invokes synchronously), but ticker is an atomic.Pointer so this is also safe to
+// call from any other goroutine — e.g. a test exercising the dilation controller
+// directly, or a future caller that doesn't share that assumption.
+func (gw *GameWorld) SetTickInterval(d time.Duration) {
+	t := gw.ticker.Load()
+	if d <= 0 || t == nil {
+		return
+	}
+	atomic.StoreInt64(&gw.currentTickIntervalNs, d.Nanoseconds())
+	t.Reset(d)
+}
+
+// GetTickInterval returns the ticker's current (possibly dilated) period.
+func (gw *GameWorld) GetTickInterval() time.Duration {
+	return time.Duration(atomic.LoadInt64(&gw.currentTickIntervalNs))
+}
+
+// GetNominalTickInterval returns the configured TickRate baseline, fixed at startup.
+func (gw *GameWorld) GetNominalTickInterval() time.Duration {
+	return time.Duration(atomic.LoadInt64(&gw.nominalTickIntervalNs))
+}
+
+// GetTickDuration returns how long the most recently completed tick took to compute.
+func (gw *GameWorld) GetTickDuration() time.Duration {
+	return time.Duration(atomic.LoadInt64(&gw.tickDuration))
+}
+
 // TryAttack проверяет cooldown и запускает атаку если она разрешена.
 // Возвращает (x, y, true) если атака принята, (0, 0, false) если в cooldown.
-// Потокобезопасно: использует атомарный CAS на AttackStartTime.
+// Cooldown измеряется в тиках, не в wall-clock времени: под time dilation тик идёт
+// реже, значит те же attackDurationTicks растягиваются в реальном времени так же,
+// как и движение — атака честно замедляется вместе с остальной симуляцией.
 func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
 	gw.playersMu.RLock()
 	player, ok := gw.playersMap[playerID]
@@ -313,17 +377,17 @@ func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
 		return 0, 0, false
 	}
 
-	now := time.Now().UnixNano()
-	cooldown := gw.cfg.Game.AttackDuration.Nanoseconds()
-	start := player.GetAttackStartTime()
+	currentTick := gw.GetTickCount()
+	start := player.GetAttackStartTick()
 
-	// Reject if still in attack cooldown
-	if start > 0 && now-start < cooldown {
+	// Reject if still in attack cooldown. Unsigned subtraction wraps correctly for
+	// any realistic elapsed tick count, same convention as movement sequence math.
+	if start > 0 && currentTick-start < gw.attackDurationTicks {
 		return 0, 0, false
 	}
 
 	player.SetState(1)
-	player.SetAttackStartTime(now)
+	player.SetAttackStartTick(currentTick)
 	metrics.EventsProcessed.WithLabelValues("attack").Inc()
 
 	return player.GetX(), player.GetY(), true
@@ -339,7 +403,6 @@ func (gw *GameWorld) tick() {
 	clear(gw.scratchSeenIDs)
 
 	nowNano := time.Now().UnixNano()
-	attackDurNano := gw.cfg.Game.AttackDuration.Nanoseconds()
 
 	worldTick := atomic.AddUint32(&gw.tickCount, 1)
 	// Full sync is controlled by configured SyncInterval (usually tens of seconds),
@@ -388,9 +451,10 @@ func (gw *GameWorld) tick() {
 			}
 			end := min(start+chunkSize, total)
 			ch <- tickWorkerInput{
-				ptrs:          gw.scratchPtrs[start:end],
-				nowNano:       nowNano,
-				attackDurNano: attackDurNano,
+				ptrs:                gw.scratchPtrs[start:end],
+				nowNano:             nowNano,
+				worldTick:           worldTick,
+				attackDurationTicks: gw.attackDurationTicks,
 			}
 		}
 		gw.tickWorkerWg.Wait()
@@ -465,10 +529,8 @@ func (gw *GameWorld) tick() {
 	metrics.DeltaPlayersCount.Observe(float64(changedCount))
 	metrics.DeltaRatio.Set(float64(changedCount) / float64(len(gw.scratchStates)))
 
-	// A tick with no replicated change still reaches the replication layer: that is
-	// where movement ACKs are emitted, and a client whose inputs change no visible
-	// field (stopped, or held against a boundary) would otherwise never learn that
-	// its input sequence was applied and would overflow its pending-input ring.
+	// A tick with no replicated change still reaches the replication layer, where
+	// transition ACKs are emitted independently from the state payload.
 	// broadcastTick paces this pass itself and sends no state frame for an empty delta.
 
 	// Call broadcastFn synchronously — it enqueues one push() per connection (non-blocking
@@ -609,69 +671,42 @@ func (gw *GameWorld) reportDeltaComposition() {
 	gw.deltaWindowBroadcasts = 0
 }
 
-// updatePlayerPosition обновляет позицию игрока на основе его векторов движения.
-// nowNano передаётся из tick() чтобы избежать лишних time.Now() на горячем пути.
+// updatePlayerPosition consumes at most one latest sample and advances exactly one
+// authoritative server step. A burst can change the current vector but cannot add
+// extra distance or leave STOP trapped behind stale MOVE packets.
 func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) {
-	input, ok := player.DequeueMovementInput()
-	if !ok {
-		return
+	originalX := player.GetX()
+	originalY := player.GetY()
+	input, appliedInput := player.ConsumeLatestMovementInput()
+	if appliedInput {
+		player.SetVX(input.DX)
+		player.SetVY(input.DY)
 	}
 
-	vx := input.DX
-	vy := input.DY
-	player.SetVX(vx)
-	player.SetVY(vy)
-	player.SetClientTick(input.Sequence)
-	player.SetAppliedClientTick(input.Sequence)
-	player.SetLastUpdate(nowNano)
-
-	if vx == 0 && vy == 0 {
-		return
+	vx, vy := player.GetVX(), player.GetVY()
+	if vx != 0 || vy != 0 {
+		newX, newY := gw.integrateMovement(originalX, originalY, vx, vy, 1)
+		player.SetX(newX)
+		player.SetY(newY)
+		player.SetLastUpdate(nowNano)
 	}
 
-	currentX := player.GetX()
-	currentY := player.GetY()
-
-	// Calculate new position using int32 to handle negative values
-	newX32 := int32(currentX)
-	newY32 := int32(currentY)
-
-	if vx != 0 {
-		newX32 += int32(vx) * int32(gw.cfg.Game.PlayerSpeedPerTick)
+	finalX, finalY := player.GetX(), player.GetY()
+	if appliedInput {
+		player.SetMovementAck(input.Sequence, finalX, finalY)
 	}
-	if vy != 0 {
-		newY32 += int32(vy) * int32(gw.cfg.Game.PlayerSpeedPerTick)
+	if finalX != originalX || finalY != originalY {
+		gw.visibilityManager.MovePlayer(player.ID, finalX, finalY)
 	}
+}
 
-	// Apply world boundaries with clamping (matches client-side behavior)
-	maxX := int32(gw.cfg.World.MaxX)
-	minX := int32(gw.cfg.World.MinX)
-	maxY := int32(gw.cfg.World.MaxY)
-	minY := int32(gw.cfg.World.MinY)
-
-	if newX32 >= maxX {
-		newX32 = maxX
-	} else if newX32 < minX {
-		newX32 = minX
-	}
-
-	if newY32 >= maxY {
-		newY32 = maxY
-	} else if newY32 < minY {
-		newY32 = minY
-	}
-
-	// Convert back to uint16 after boundary checks
-	newX := uint16(newX32)
-	newY := uint16(newY32)
-
-	// Update position atomically
-	player.SetX(newX)
-	player.SetY(newY)
-
-	if newX != currentX || newY != currentY {
-		gw.visibilityManager.MovePlayer(player.ID, newX, newY)
-	}
+func (gw *GameWorld) integrateMovement(x, y uint16, vx, vy int8, ticks uint32) (uint16, uint16) {
+	distance := int64(gw.cfg.Game.PlayerSpeedPerTick) * int64(ticks)
+	newX := int64(x) + int64(vx)*distance
+	newY := int64(y) + int64(vy)*distance
+	newX = max(int64(gw.cfg.World.MinX), min(newX, int64(gw.cfg.World.MaxX)))
+	newY = max(int64(gw.cfg.World.MinY), min(newY, int64(gw.cfg.World.MaxY)))
+	return uint16(newX), uint16(newY)
 }
 
 // handleEvent обрабатывает одно событие инлайн (atomic-операции, потокобезопасно)
@@ -685,9 +720,8 @@ func (gw *GameWorld) handleEvent(event types.GameEvent) {
 
 	switch event.Type {
 	case types.EventMove:
-		// Legacy callers should use QueueMovementInput so overflow is observable.
-		player.EnqueueMovementInput(types.MovementInput{
-			Sequence: event.ClientTick,
+		player.OfferMovementInput(types.MovementInput{
+			Sequence: event.InputSequence,
 			DX:       event.VectorX,
 			DY:       event.VectorY,
 		})
@@ -704,7 +738,7 @@ func (gw *GameWorld) handleEvent(event types.GameEvent) {
 			break
 		}
 		player.SetState(1)
-		player.SetAttackStartTime(time.Now().UnixNano())
+		player.SetAttackStartTick(gw.GetTickCount())
 	}
 }
 
@@ -734,12 +768,13 @@ func (gw *GameWorld) Stop() {
 func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
 	for input := range ch {
 		for _, player := range input.ptrs {
-			// Server-authoritative attack timeout
+			// Server-authoritative attack timeout, measured in ticks so it dilates
+			// with the simulation the same way movement does.
 			if player.GetState() == 1 {
-				start := player.GetAttackStartTime()
-				if start > 0 && input.nowNano-start >= input.attackDurNano {
+				start := player.GetAttackStartTick()
+				if start > 0 && input.worldTick-start >= input.attackDurationTicks {
 					player.SetState(0)
-					player.SetAttackStartTime(0)
+					player.SetAttackStartTick(0)
 				}
 			}
 			gw.updatePlayerPosition(player, input.nowNano)

@@ -43,6 +43,7 @@ export class GameClient {
         this.id = null;
         this.protocolVersion = null;
         this.sequence = 0;
+        this.vector = { dx: 0, dy: 0 };
 
         this.acks = new Map();          // inputSequence -> authoritative position
         this.lastAckSequence = null;
@@ -92,7 +93,7 @@ export class GameClient {
             return;
         }
         if (msg.type === 'movementAck') {
-            this.acks.set(msg.inputSequence, msg.position);
+            this.acks.set(msg.inputSequence, { ...msg.position });
             this.lastAckSequence = msg.inputSequence;
             return;
         }
@@ -131,13 +132,14 @@ export class GameClient {
         }
     }
 
-    /** Sends one movement step and returns the sequence it was given. */
+    /** Advances one local simulation tick and sends only an input-state transition. */
     move(dx, dy) {
+        if (dx === this.vector.dx && dy === this.vector.dy) return this.sequence;
+        this.vector = { dx, dy };
         this.ws.send(this.protocol.encodeMove({
             type: 'move',
             movementVector: { dx, dy },
             inputSequence: ++this.sequence,
-            position: { x: 0, y: 0 },
         }));
         return this.sequence;
     }

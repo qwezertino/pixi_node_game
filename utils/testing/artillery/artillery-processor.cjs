@@ -76,6 +76,7 @@ module.exports = {
   // Initialize client with proper state tracking
   initializeClient: function(context, events, done) {
     context.vars.inputSequence = 1;
+    context.vars.lastMovement = { dx: 0, dy: 0 };
     // Use spawn area from gameConfig (100-900 range)
     context.vars.position = {
       x: Math.floor(Math.random() * 800) + 100, // 100-900
@@ -129,6 +130,10 @@ module.exports = {
       return done();
     }
 
+    if (movement.dx === context.vars.lastMovement.dx && movement.dy === context.vars.lastMovement.dy) {
+      return done();
+    }
+    context.vars.lastMovement = movement;
     const binaryMessage = encodeMove(movement, context.vars.inputSequence++);
     if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
       context.ws.send(binaryMessage);

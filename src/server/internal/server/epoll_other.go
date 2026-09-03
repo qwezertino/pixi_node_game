@@ -81,14 +81,10 @@ func (g *goroutineReadHandler) readLoop(svr *Server, c *Connection) {
 		case ws.OpBinary:
 			metrics.BytesReceived.Add(float64(len(payload)))
 			if !c.rateLimiter.Allow() {
-				// See epoll_linux.go: a burst is absorbed, a sustained overage is not.
+				// Never continue an ordered transition stream after dropping a command.
 				metrics.MessagesRateLimited.Inc()
-				if atomic.AddInt32(&c.rateLimitStreak, 1) >= maxRateLimitStreak {
-					return
-				}
-				continue
+				return
 			}
-			atomic.StoreInt32(&c.rateLimitStreak, 0)
 			svr.processMessage(c, payload)
 		}
 	}

@@ -74,7 +74,29 @@ var (
 
 	MovementInputsRejected = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_movement_inputs_rejected_total",
-		Help: "Movement inputs rejected due to duplicate/out-of-order sequence or a full input ring",
+		Help: "Movement transitions rejected due to stale/gapped sequence, invalid client tick, or a full ring",
+	})
+
+	MovementTransitionsLate = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_movement_transitions_late_total",
+		Help: "Movement transitions applied after their scheduled server tick",
+	})
+
+	MovementTransitionLatenessTicks = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_movement_transition_lateness_ticks",
+		Help:    "How many server ticks late a movement transition was applied",
+		Buckets: []float64{0, 1, 2, 3, 4, 6, 8, 12, 20},
+	})
+
+	MovementCorrectionDistance = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_movement_correction_distance_units",
+		Help:    "Authoritative distance corrected when a late transition closes a segment",
+		Buckets: []float64{0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 128},
+	})
+
+	MovementTimelineRebases = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_movement_timeline_rebases_total",
+		Help: "Excessively late movement timelines rebased without historical position rollback",
 	})
 
 	BytesReceived = promauto.NewCounter(prometheus.CounterOpts{
@@ -241,9 +263,14 @@ var (
 		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 16),
 	})
 
-	AdaptiveBatchIntervalMs = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "game_adaptive_batch_interval_ms",
-		Help: "Current adaptive batch interval in milliseconds for broadcast pacing",
+	TimeDilationPercent = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "game_time_dilation_percent",
+		Help: "Current simulation time scale (100 = nominal tick rate, EVE-style TiDi)",
+	})
+
+	TickIntervalMs = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "game_tick_interval_ms",
+		Help: "Current (possibly dilated) simulation tick period in milliseconds",
 	})
 
 	// ── Delta tracking ────────────────────────────────────────────────────────

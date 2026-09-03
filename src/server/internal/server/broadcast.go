@@ -140,10 +140,13 @@ const (
 	// directWriteTimeout — deadline for ACK, pong, initial-state writes.
 	directWriteTimeout = 30 * time.Millisecond
 
-	// maxAdaptiveBatchInterval — fallback ceiling for replication backoff when the tick
-	// rate is unknown. With a known tick rate the ceiling is derived from it instead,
-	// so that the backoff survives quantisation to whole ticks.
-	maxAdaptiveBatchInterval = 120 * time.Millisecond
+	// Time dilation bounds (EVE-style TiDi), in basis points: 10000 = 100% (nominal
+	// tick rate), floor at 1000 = 10%, matching EVE's own floor. Below this the
+	// simulation would be too slow to be meaningfully playable — a real overload
+	// past this point needs a different fix (fewer players, more instances), not a
+	// deeper time slowdown.
+	dilationBpsFull = 10000
+	minDilationBps  = 1000
 
 	// maxWriteFailures — consecutive write failures before declaring a connection dead.
 	// With broadcastWriteTimeout=100ms: 150 failures = 15s of sustained
@@ -174,6 +177,8 @@ type writeJob struct {
 	ackX           uint16
 	ackY           uint16
 	ackSeq         uint32
+	pong           bool
+	pongNonce      uint32
 	stateCreatedNs int64 // non-zero for world-state jobs
 	enqueuedNs     int64
 	timeout        time.Duration
@@ -182,6 +187,13 @@ type writeJob struct {
 func writeJobFrame(job *writeJob, ackBuffer *[15]byte) []byte {
 	if job.frame != nil {
 		return job.frame.frame
+	}
+	if job.pong {
+		ackBuffer[0] = 0x82
+		ackBuffer[1] = 5
+		ackBuffer[2] = protocol.MessagePong
+		binary.LittleEndian.PutUint32(ackBuffer[3:], job.pongNonce)
+		return ackBuffer[:7]
 	}
 	if !job.ack {
 		return job.direct
@@ -198,6 +210,16 @@ func writeJobFrame(job *writeJob, ackBuffer *[15]byte) []byte {
 	binary.LittleEndian.PutUint16(ackBuffer[9:], job.ackY)
 	binary.LittleEndian.PutUint32(ackBuffer[11:], job.ackSeq)
 	return ackBuffer[:]
+}
+
+// sendPong is encoded by the persistent writer into its reusable buffer, so
+// periodic RTT measurement does not allocate a compiled WebSocket frame per ping.
+func (s *Server) sendPong(conn *Connection, nonce uint32) {
+	select {
+	case conn.writeCh <- writeJob{pong: true, pongNonce: nonce, timeout: directWriteTimeout}:
+	default:
+		metrics.BroadcastsDropped.Inc()
+	}
 }
 
 func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCreatedNs int64) bool {
@@ -699,25 +721,84 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 	}
 }
 
-// replicationIntervalNs rounds the requested batch interval to a whole number of
-// simulation ticks. Replication is evaluated on tick boundaries, so an interval that
-// is not a tick multiple cannot be honoured — it beats against the tick instead. With
-// a 50 ms tick and a 100 ms request, roughly half the ticks landed a fraction under
-// the threshold and deferred a full tick, producing a 100/150 ms alternation: an
-// effective 8 Hz instead of 10 Hz, and enough arrival jitter to pin the client's
-// adaptive interpolation delay at its 300 ms ceiling.
+// tuneTimeDilation is EVE-style TiDi: when the zone can't keep up, slow the
+// simulation's own tick rate instead of silently letting replication go stale. It
+// replaces the old adaptive-batch-interval backoff — that only throttled how often
+// state was *sent*; this actually reduces how often a tick is *computed*, and any
+// client watching knows exactly why movement/cooldowns feel slower (a dilation
+// factor accompanies every state frame — see protocol.AppendGameState/DeltaGameState).
 //
-// This also bounds the adaptive controller honestly: its ±3..10 ms steps are below
-// tick granularity and can only take effect once they accumulate past half a tick.
-func replicationIntervalNs(batchNs, tickNs int64) int64 {
-	if batchNs <= 0 || tickNs <= 0 {
-		return batchNs
+// Trigger is deliberately broad — both compute overrun (tick() itself running long,
+// EVE's classic trigger) and write/fanout pressure (this project's actually observed
+// bottleneck) — since either means the zone cannot sustain full-rate simulation right
+// now. Steps down fast, recovers slowly, same hysteresis shape the old batch-interval
+// controller used, floored at 10% (minDilationBps) same as EVE's own floor.
+func (s *Server) tuneTimeDilation(writePressure, fanoutDur, computeDur time.Duration) {
+	nominal := s.gameWorld.GetNominalTickInterval()
+	if nominal <= 0 {
+		return
 	}
-	ticks := (batchNs + tickNs/2) / tickNs
-	if ticks < 1 {
-		ticks = 1
+
+	curr := atomic.LoadInt64(&s.dilationBps)
+	if curr <= 0 {
+		curr = dilationBpsFull
 	}
-	return ticks * tickNs
+	next := curr
+
+	switch {
+	case writePressure > 75*time.Millisecond || fanoutDur > 30*time.Millisecond ||
+		computeDur > nominal+nominal/2:
+		next = curr - 1000 // -10%
+	case writePressure > 30*time.Millisecond || fanoutDur > 15*time.Millisecond ||
+		computeDur > nominal:
+		next = curr - 500 // -5%
+	case writePressure < 10*time.Millisecond && fanoutDur < 6*time.Millisecond &&
+		computeDur < nominal/2 && curr < dilationBpsFull:
+		next = curr + 200 // +2%, slower than the drop — recovery should not overshoot
+	}
+
+	if next < minDilationBps {
+		next = minDilationBps
+	}
+	if next > dilationBpsFull {
+		next = dilationBpsFull
+	}
+
+	if next == curr {
+		return
+	}
+	atomic.StoreInt64(&s.dilationBps, next)
+	metrics.TimeDilationPercent.Set(float64(next) / 100)
+
+	newInterval := time.Duration(int64(nominal) * dilationBpsFull / next)
+	s.gameWorld.SetTickInterval(newInterval)
+	metrics.TickIntervalMs.Set(float64(newInterval.Milliseconds()))
+
+	nowNano := time.Now().UnixNano()
+	prev := atomic.LoadInt64(&s.lastDilationLog)
+	if nowNano-prev >= int64(5*time.Second) &&
+		atomic.CompareAndSwapInt64(&s.lastDilationLog, prev, nowNano) {
+		slog.Info("time dilation updated",
+			"from_pct", curr/100,
+			"to_pct", next/100,
+			"tick_interval_ms", newInterval.Milliseconds(),
+			"compute_ms", computeDur.Milliseconds(),
+			"fanout_ms", fanoutDur.Milliseconds(),
+			"write_pressure_ms", writePressure.Milliseconds())
+	}
+}
+
+// currentDilationBps returns the current time-dilation factor in basis points
+// (10000 = 100%, nominal), for encoding into each outgoing state frame.
+func (s *Server) currentDilationBps() uint16 {
+	v := atomic.LoadInt64(&s.dilationBps)
+	if v <= 0 {
+		v = dilationBpsFull
+	}
+	if v > 65535 {
+		v = 65535
+	}
+	return uint16(v)
 }
 
 // shouldEmitFrame decides whether a paced tick puts a frame on the wire.
@@ -726,36 +807,13 @@ func replicationIntervalNs(batchNs, tickNs int64) int64 {
 // dead-reckons omitted players when a frame arrives, using the worldTick in its header
 // as the step count — so suppressing empty frames would freeze every remote player
 // until somebody happened to change direction. The heartbeat is a bare 13-byte header,
-// roughly 2 Mbit/s across 2000 clients at 10 Hz, against the hundreds of Mbit/s the
+// roughly 4.2 Mbit/s across 2000 clients at 20 Hz, against the hundreds of Mbit/s the
 // omitted records would otherwise have cost.
 //
 // In legacy mode nothing dead-reckons, so an empty delta carries no information and is
 // suppressed as before.
 func shouldEmitFrame(fullSync bool, changedCount int, velocityReplication bool) bool {
 	return fullSync || changedCount > 0 || velocityReplication
-}
-
-// adaptiveBatchCeiling bounds how far replication may back off under write pressure.
-// The ceiling has to be reachable in tick units, not just in milliseconds:
-// replicationIntervalNs rounds to the nearest tick, so a ceiling below base + 1.5
-// ticks quantises straight back to base and the backoff silently becomes a no-op.
-// Two ticks of headroom guarantee the controller can reach at least one longer
-// interval, which is what shedding actually costs.
-func adaptiveBatchCeiling(base time.Duration, tickIntervalNs int64) time.Duration {
-	if tickIntervalNs <= 0 {
-		return maxAdaptiveBatchInterval
-	}
-	return base + time.Duration(2*tickIntervalNs)
-}
-
-// replicationDue allows a half-tick of slack so that ordinary ticker jitter cannot
-// push an on-schedule tick just under the threshold and cost it a whole tick. A tick
-// can only arrive on the tick grid, so the slack never admits an extra emission.
-func replicationDue(nowNs, lastNs, intervalNs, tickNs int64) bool {
-	if intervalNs <= 0 {
-		return true
-	}
-	return nowNs-lastNs >= intervalNs-tickNs/2
 }
 
 // ── Broadcast ─────────────────────────────────────────────────────────────────
@@ -769,26 +827,11 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		return false
 	}
 
-	// Two independent pacing clocks. The ACK pass is throttled by lastAckPassNs so it
-	// runs at the replication rate rather than the simulation rate; the state frame is
-	// throttled by lastBroadcastNs, which advances only when a frame is actually sent.
-	// Sharing one clock would let a tick that emits only ACKs consume the state slot
-	// and delay the next real delta by up to a full interval.
-	nowNs := time.Now().UnixNano()
-	intervalNs := int64(0)
-	if !fullSync {
-		intervalNs = replicationIntervalNs(atomic.LoadInt64(&s.adaptiveBatchNs), s.tickIntervalNs)
-	}
-
-	if !replicationDue(nowNs, atomic.LoadInt64(&s.lastAckPassNs), intervalNs, s.tickIntervalNs) {
-		return false
-	}
-	atomic.StoreInt64(&s.lastAckPassNs, nowNs)
-
+	// Replication cadence is now simply "once per simulation tick": there is no
+	// separate send-interval backoff on top of it any more. Under pressure, time
+	// dilation (see tuneTimeDilation below) slows the tick itself, which slows
+	// replication along with it — a single lever instead of two independent ones.
 	hasState := shouldEmitFrame(fullSync, len(changed), s.cfg.Net.VelocityReplication)
-	if hasState && !replicationDue(nowNs, atomic.LoadInt64(&s.lastBroadcastNs), intervalNs, s.tickIntervalNs) {
-		hasState = false
-	}
 
 	t1 := time.Now()
 	sentAtNs := t1.UnixNano()
@@ -811,17 +854,14 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.BroadcastTargets.Observe(float64(n))
 	s.connectionsMu.RUnlock()
 
-	// ACKs must not depend on the delta payload being non-empty. A player held
-	// against a world boundary keeps consuming inputs without changing any
-	// replicated field; if the ACK rode on the delta, that client would never prune
-	// its pending-input ring and would overflow it after PlayerInputQueueCapacity steps.
+	// ACKs have their own delivery path and may coalesce several transitions that
+	// were applied inside one replication interval.
 	s.enqueueAuthoritativeMovementAcks(conns)
 
 	if !hasState {
 		releaseConnSlice(conns, buf)
 		return false
 	}
-	atomic.StoreInt64(&s.lastBroadcastNs, nowNs)
 
 	t0 := time.Now()
 	// Increment only once a state frame is actually produced: the client treats a
@@ -831,10 +871,11 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	f.data = f.data[:0]
 	// Reserve 10 bytes at front for the WS binary frame header (filled by wsFrameSlice below).
 	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	dilationBps := s.currentDilationBps()
 	if fullSync {
-		f.data = s.protocol.AppendGameState(f.data, allPlayers, stateSequence, worldTick)
+		f.data = s.protocol.AppendGameState(f.data, allPlayers, stateSequence, worldTick, dilationBps)
 	} else {
-		f.data = s.protocol.AppendDeltaGameState(f.data, changed, stateSequence, worldTick)
+		f.data = s.protocol.AppendDeltaGameState(f.data, changed, stateSequence, worldTick, dilationBps)
 	}
 	f.frame = wsFrameSlice(f.data)
 	payloadSize := len(f.data) - 10
@@ -927,40 +968,8 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.TickFanoutDuration.Observe(fanoutDur.Seconds())
 	s.tuneRecipientLimit(n, m, overdue, dropped, fanoutDur)
 
-	if base := s.cfg.Game.BatchInterval; base > 0 {
-		curr := time.Duration(atomic.LoadInt64(&s.adaptiveBatchNs))
-		if curr <= 0 {
-			curr = base
-		}
-
-		ceiling := adaptiveBatchCeiling(base, s.tickIntervalNs)
-
-		pressure := time.Duration(atomic.SwapInt64(&s.writePressurePeakNs, 0))
-		next := curr
-		if pressure > 75*time.Millisecond || fanoutDur > 30*time.Millisecond {
-			next = minDuration(curr+10*time.Millisecond, ceiling)
-		} else if pressure > 30*time.Millisecond || fanoutDur > 15*time.Millisecond {
-			next = minDuration(curr+5*time.Millisecond, ceiling)
-		} else if pressure < 10*time.Millisecond && fanoutDur < 6*time.Millisecond && curr > base {
-			next = maxDuration(curr-3*time.Millisecond, base)
-		}
-
-		if next != curr {
-			atomic.StoreInt64(&s.adaptiveBatchNs, next.Nanoseconds())
-			metrics.AdaptiveBatchIntervalMs.Set(float64(next.Milliseconds()))
-
-			nowNano := time.Now().UnixNano()
-			prev := atomic.LoadInt64(&s.lastBatchTuneLog)
-			if nowNano-prev >= int64(5*time.Second) &&
-				atomic.CompareAndSwapInt64(&s.lastBatchTuneLog, prev, nowNano) {
-				slog.Info("adaptive batch interval updated",
-					"from_ms", curr.Milliseconds(),
-					"to_ms", next.Milliseconds(),
-					"fanout_ms", fanoutDur.Milliseconds(),
-					"write_pressure_ms", pressure.Milliseconds())
-			}
-		}
-	}
+	pressure := time.Duration(atomic.SwapInt64(&s.writePressurePeakNs, 0))
+	s.tuneTimeDilation(pressure, fanoutDur, s.gameWorld.GetTickDuration())
 
 	if fanoutDur > 20*time.Millisecond {
 		nowNano := time.Now().UnixNano()
@@ -978,20 +987,6 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		}
 	}
 	return true
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func maxDuration(a, b time.Duration) time.Duration {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // broadcastEvent sends a pre-compiled WS frame to every connected client.
@@ -1026,7 +1021,7 @@ func (s *Server) sendInitialState(conn *Connection) {
 	// simulation step lands between the two. A one-step dead-reckoning offset is
 	// corrected by the next record or keyframe for that player.
 	worldTick := s.gameWorld.GetTickCount()
-	f.data = s.protocol.AppendGameState(f.data, allPlayers, seq, worldTick) // zero-alloc into pool buf
+	f.data = s.protocol.AppendGameState(f.data, allPlayers, seq, worldTick, s.currentDilationBps()) // zero-alloc into pool buf
 	frame := wsFrameSlice(f.data)                                           // zero-alloc sub-slice
 
 	// Copy frame bytes before returning pool buffer: write loop reads them later.
@@ -1079,11 +1074,12 @@ func (s *Server) sendMovementAck(conn *Connection, playerID uint32, x, y uint16,
 
 func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) {
 	for _, conn := range conns {
-		sequence := conn.player.GetAppliedClientTick()
+		sequence := conn.player.GetAppliedInputSequence()
 		if sequence == atomic.LoadUint32(&conn.lastMovementAckSeq) {
 			continue
 		}
-		if s.sendMovementAck(conn, conn.player.ID, conn.player.GetX(), conn.player.GetY(), sequence) {
+		x, y := conn.player.GetMovementAckPosition()
+		if s.sendMovementAck(conn, conn.player.ID, x, y, sequence) {
 			atomic.StoreUint32(&conn.lastMovementAckSeq, sequence)
 		}
 	}

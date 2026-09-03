@@ -78,6 +78,14 @@ export class BinaryProtocol {
         return new Uint8Array([MessageType.SYNC_REQUEST]);
     }
 
+    static encodePing(nonce: number): Uint8Array {
+        const buffer = new ArrayBuffer(5);
+        const view = new DataView(buffer);
+        view.setUint8(0, MessageType.PING);
+        view.setUint32(1, nonce, true);
+        return new Uint8Array(buffer);
+    }
+
     // Decode messages
     static decodeMessage(data: Uint8Array): any {
         if (data.length === 0) return null;
@@ -96,6 +104,9 @@ export class BinaryProtocol {
             case MessageType.PLAYER_LEFT: return this.decodePlayerLeft(data, view);
             case MessageType.MOVEMENT_ACK: return this.decodeMovementAck(data, view);
             case MessageType.WELCOME: return this.decodeWelcome(data, view);
+            case MessageType.PONG:
+                if (data.length !== 5) return null;
+                return { type: "pong", nonce: view.getUint32(1, true) };
 
             // Broadcast message types from server
             case 255: return this.decodePlayerMovementBroadcast(data, view);
@@ -170,28 +181,30 @@ export class BinaryProtocol {
     }
 
     private static decodeGameState(data: Uint8Array, view: DataView): GameStateMessage {
-        const { players, stateSequence, worldTick } = this.decodePlayerBlock(data, view);
+        const { players, stateSequence, worldTick, dilationPct } = this.decodePlayerBlock(data, view);
         return {
             type: 'gameState',
             players,
             timestamp: Date.now(),
             stateSequence,
             worldTick,
+            dilationPct,
         };
     }
 
     private static decodeDeltaGameState(data: Uint8Array, view: DataView) {
-        const { players, stateSequence, worldTick } = this.decodePlayerBlock(data, view);
+        const { players, stateSequence, worldTick, dilationPct } = this.decodePlayerBlock(data, view);
         return {
             type: 'deltaGameState',
             players,
             timestamp: Date.now(),
             stateSequence,
             worldTick,
+            dilationPct,
         };
     }
 
-    private static decodePlayerBlock(data: Uint8Array, view: DataView): { players: Record<string, PlayerState>; stateSequence?: number; worldTick: number } {
+    private static decodePlayerBlock(data: Uint8Array, view: DataView): { players: Record<string, PlayerState>; stateSequence?: number; worldTick: number; dilationPct: number } {
         const header = this.decodeWorldStateHeader(data, view);
         const playerCount = header.playerCount;
         const players: Record<string, PlayerState> = {};
@@ -205,7 +218,7 @@ export class BinaryProtocol {
             let shift = 0;
             let byte = 0;
             do {
-                if (offset >= data.length) return { players, stateSequence: header.stateSequence, worldTick: header.worldTick };
+                if (offset >= data.length) return { players, stateSequence: header.stateSequence, worldTick: header.worldTick, dilationPct: header.dilationPct };
                 byte = data[offset++];
                 delta += (byte & 0x7f) * 2 ** shift;
                 shift += 7;
@@ -246,26 +259,30 @@ export class BinaryProtocol {
             };
         }
 
-        return { players, stateSequence: header.stateSequence, worldTick: header.worldTick };
+        return { players, stateSequence: header.stateSequence, worldTick: header.worldTick, dilationPct: header.dilationPct };
     }
 
-    // [type:1][stateSequence:4][worldTick:4][playerCount:4][players...]
+    // [type:1][stateSequence:4][worldTick:4][playerCount:4][dilationBps:2][players...]
     // worldTick is the simulation step the records describe; the client needs it to
-    // dead-reckon the players this frame omits.
+    // dead-reckon the players this frame omits. dilationBps is the server's current
+    // time-dilation factor (10000 = 100%, EVE-style TiDi) — when the server slows its
+    // own tick rate under pressure, the client scales its local prediction step by the
+    // same factor (dilationPct/100) so it stays in lockstep instead of running ahead.
     // Records are variable-length (varint ID delta + 7 fixed bytes), so the header
     // cannot be validated against a total length — the record loop bounds-checks
     // instead. The pre-sequence legacy layout is deliberately not accepted: it is
     // indistinguishable from a valid frame and would decode into wrong player IDs
     // rather than failing. PROTOCOL_VERSION in WELCOME is what guards compatibility.
-    private static decodeWorldStateHeader(data: Uint8Array, view: DataView): { stateSequence?: number; worldTick: number; playerCount: number; offset: number } {
-        if (data.length < 13) {
-            return { worldTick: 0, playerCount: 0, offset: data.length };
+    private static decodeWorldStateHeader(data: Uint8Array, view: DataView): { stateSequence?: number; worldTick: number; playerCount: number; dilationPct: number; offset: number } {
+        if (data.length < 15) {
+            return { worldTick: 0, playerCount: 0, dilationPct: 100, offset: data.length };
         }
         return {
             stateSequence: view.getUint32(1, true),
             worldTick: view.getUint32(5, true),
             playerCount: view.getUint32(9, true),
-            offset: 13,
+            dilationPct: view.getUint16(13, true) / 100,
+            offset: 15,
         };
     }
 
@@ -313,12 +330,12 @@ export class BinaryProtocol {
         };
     }
 
-    private static decodeMovementAck(_data: Uint8Array, view: DataView) {
+    private static decodeMovementAck(data: Uint8Array, view: DataView) {
+        if (data.length !== 13) return null;
         const playerId = view.getUint32(1, true).toString();
         const x = view.getUint16(5, true);
         const y = view.getUint16(7, true);
         const inputSequence = view.getUint32(9, true);
-
         return {
             type: 'movementAck',
             playerId,

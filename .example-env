@@ -5,39 +5,98 @@
 # src/shared/gameConfig.json, embedded into the binary at build time,
 # and shared with the TypeScript client.
 #
-# Values here take priority over embedded gameConfig.json defaults.
+# Values here take priority over embedded gameConfig.json defaults, which in
+# turn take priority over the hardcoded fallbacks shown below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Network bind ─────────────────────────────────────────────────────────────
 PORT=8108
 HOST=0.0.0.0
+STATIC_DIR=../dist
 
 # ─── Connection limits ────────────────────────────────────────────────────────
 MAX_CONNECTIONS=12000
-EVENT_CHANNEL_SIZE=100000
-SEND_CHANNEL_SIZE=2048
 
 # ─── Worker pools (0 = auto-detect CPU count) ────────────────────────────────
 WORKERS=0
-BROADCAST_WORKERS=0
-
-# ─── WebSocket buffers ───────────────────────────────────────────────────────
-READ_BUFFER_SIZE=4096
-WRITE_BUFFER_SIZE=4096
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 # Max messages per second per client
 RATE_LIMIT_MSG_SEC=120
 RATE_LIMIT_BURST=20
 
+# IP-based connection rate limit (connections/sec per IP). 0 = disabled.
+IP_CONN_RATE=10
+IP_CONN_BURST=20
+
+# ─── Game rule overrides ──────────────────────────────────────────────────────
+# Defaults come from embedded src/shared/gameConfig.json; only set these to
+# deviate from the shared client/server values.
+# TICK_RATE=20
+# SYNC_INTERVAL_SEC=30
+# PLAYER_SPEED=4
+# ATTACK_DURATION_MS=1000
+# WORLD_WIDTH=6000
+# WORLD_HEIGHT=3000
+# SPAWN_MIN_X=1500
+# SPAWN_MAX_X=3000
+# SPAWN_MIN_Y=500
+# SPAWN_MAX_Y=1500
+
+# ─── Broadcast / fanout tuning ────────────────────────────────────────────────
+# Replication runs once per simulation tick (TICK_RATE) — under pressure, time
+# dilation slows the tick itself rather than throttling send frequency separately.
+# Batch size for the persistent per-connection write loop.
+WRITE_BATCH_SIZE=8
+# Disconnect client after N consecutive broadcast enqueue drops.
+FANOUT_DROP_STREAK=120
+# Queue depth watermark for queue-aware world-state shedding (0 = disabled).
+FANOUT_QUEUE_SHED_DEPTH=6
+# Hard cap for total world-state bytes enqueued per tick (0 = disabled).
+FANOUT_MAX_BROADCAST_BYTES_PER_TICK=0
+# Anti-starvation fairness debt tuning for recipient selection.
+# Debt grows for skipped clients and decays for selected clients.
+FANOUT_FAIR_DEBT_MAX=12
+FANOUT_FAIR_DEBT_INC=1
+FANOUT_FAIR_DEBT_DEC=2
+# Score bonus per debt point in nanoseconds (250_000ns = 0.25ms).
+FANOUT_FAIR_DEBT_WEIGHT_NS=250000
+# Tie-break rotation for clients with similar score (150_000ns = 0.15ms).
+FANOUT_ROUND_ROBIN_WEIGHT_NS=150000
+# Per-client criticality boost after local input events.
+FANOUT_CRITICAL_WINDOW_MS=400
+FANOUT_CRITICAL_BOOST_NS=3000000
+# Minimum/maximum selected recipients per tick for world-state broadcast (0 = all).
+FANOUT_MIN_RECIPIENTS_PER_TICK=256
+FANOUT_MAX_RECIPIENTS_PER_TICK=0
+# Target fanout phase duration used by adaptive recipient limiter.
+FANOUT_TARGET_MS=12
+
+# Omit delta records a client can dead-reckon from velocity instead of shipping
+# every position-only change (see docs/pixi_node_game_rag.md §7/§9).
+VELOCITY_REPLICATION=true
+# 1/N of players force-refreshed per broadcast regardless of predictability.
+KEYFRAME_DIVISOR=100
+
+# Staleness SLA for active/idle clients and the activity-detection window used
+# to classify a connection as active vs idle for fanout freshness.
+WORLD_STATE_ACTIVE_STALENESS_MS=150
+WORLD_STATE_IDLE_STALENESS_MS=350
+WORLD_STATE_ACTIVE_WINDOW_MS=1000
+
 # ─── Go runtime tuning ────────────────────────────────────────────────────────
-# Reduce GC frequency for high-throughput workloads (default is 100)
+# GOGC=400: heap can grow 4x before GC triggers. With near-zero per-tick alloc
+# (frame pool + prevStates updates), GC fires ~4x less often → mark assist
+# duration drops proportionally. Centrifuge uses GOGC=400 in production.
+# See: https://go.dev/doc/gc-guide#GOGC
 GOGC=400
 # CPU cores to use (0 = all available)
 GOMAXPROCS=0
-# Hard memory cap — GC will run more frequently before hitting this limit
+# Hard memory ceiling: GC kicks in regardless of GOGC once heap approaches this.
+# Prevents OOM from the lazy GC that GOGC=400 allows.
 GOMEMLIMIT=512MiB
-# ─── Monitoring external ports ────────────────────────────────────────────────────────────────────────
+
+# ─── Monitoring external ports ────────────────────────────────────────────────
 PROMETHEUS_PORT=9090
 GRAFANA_PORT=3000
 GRAFANA_ADMIN_PASSWORD=admin

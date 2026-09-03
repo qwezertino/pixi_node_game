@@ -35,7 +35,6 @@ export interface MoveMessage extends ClientMessage {
         dy: number;
     };
     inputSequence: number;
-    position: PlayerPosition; // Позиция клиента в момент отправки
 }
 
 export interface DirectionChangeMessage extends ClientMessage {
@@ -103,14 +102,17 @@ export interface GameStateMessage extends ServerMessage {
     // Simulation tick the records describe. Players absent from a delta are
     // dead-reckoned forward by the tick difference since the previous frame.
     worldTick: number;
+    // Server's current time-dilation factor as a percentage (100 = nominal tick
+    // rate, EVE-style TiDi). Scale local prediction step by dilationPct/100 to stay
+    // in lockstep with a dilated server instead of running ahead of it.
+    dilationPct: number;
 }
 
 export interface MovementAcknowledgmentMessage extends ServerMessage {
     type: 'movementAck';
     playerId: string;
-    acknowledgedPosition: PlayerPosition;
+    position: PlayerPosition;
     inputSequence: number;
-    timestamp: number;
 }
 
 export interface ServerCorrectionMessage extends ServerMessage {
@@ -129,7 +131,7 @@ export interface WelcomeMessage extends ServerMessage {
 // Must match protocol.ProtocolVersion on the server. The wire format carries no
 // per-record framing, so a mismatched decoder does not fail — it silently yields
 // wrong player IDs. Checking the version turns that into a visible error.
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 6;
 
 export enum MessageType {
     JOIN = 1,
@@ -147,4 +149,6 @@ export enum MessageType {
     DELTA_GAME_STATE = 14,
     WELCOME = 15,
     SYNC_REQUEST = 16,
+    PING = 17,
+    PONG = 18,
 }

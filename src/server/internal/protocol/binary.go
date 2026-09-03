@@ -26,18 +26,28 @@ const (
 	MessageDeltaGameState = 14 // DELTA_GAME_STATE (only changed players)
 	MessageWelcome        = 15 // WELCOME (protocol version + authoritative self ID + tick rate)
 	MessageSyncRequest    = 16 // SYNC_REQUEST (client detected a delta sequence gap)
+	MessagePing           = 17 // PING (application RTT nonce)
+	MessagePong           = 18 // PONG (echoes application RTT nonce)
 )
 
-// ProtocolVersion 3 carries the simulation tick in every world-state frame. A client
+// ProtocolVersion 6 adds a time-dilation factor to every world-state frame (EVE-style
+// TiDi: the server slows its own tick rate under pressure instead of silently
+// throttling replication, and the client needs the current factor to scale its local
+// prediction step so it doesn't run ahead of a dilated server).
+// Version 5 uses fixed-rate input samples. MOVE carries the current vector
+// and sequence; the server applies only the newest sample available for a tick and
+// ACKs the position after that authoritative step.
+// Version 3 carries the simulation tick in every world-state frame. A client
 // dead-reckons players the frame omits, and needs the exact number of elapsed steps to
 // do so — wall-clock arrival time is not precise enough and does not survive a frame
 // the fanout shed. Version 2 introduced varint-delta player IDs: records are sorted by
 // ID so each delta is positive and, for the dense IDs the server hands out, almost
 // always fits in one byte instead of four.
-const ProtocolVersion = 3
+const ProtocolVersion = 6
 
-// worldStateHeaderSize — type(1) + stateSequence(4) + worldTick(4) + playerCount(4).
-const worldStateHeaderSize = 13
+// worldStateHeaderSize — type(1) + stateSequence(4) + worldTick(4) + playerCount(4) +
+// dilationBps(2).
+const worldStateHeaderSize = 15
 
 // maxPlayerRecordSize — varint ID (≤5) + X(2) + Y(2) + VX(1) + VY(1) + flags(1).
 const maxPlayerRecordSize = 12
@@ -54,7 +64,7 @@ func appendUvarint(dst []byte, v uint32) []byte {
 // appendWorldState serialises a world-state frame. It sorts players in place: both
 // callers pass a scratch slice owned by the current tick, and delta-encoding IDs
 // requires ascending order.
-func appendWorldState(dst []byte, messageType uint8, players []types.PlayerState, stateSequence, worldTick uint32) []byte {
+func appendWorldState(dst []byte, messageType uint8, players []types.PlayerState, stateSequence, worldTick uint32, dilationBps uint16) []byte {
 	slices.SortFunc(players, func(a, b types.PlayerState) int {
 		switch {
 		case a.ID < b.ID:
@@ -78,6 +88,7 @@ func appendWorldState(dst []byte, messageType uint8, players []types.PlayerState
 	dst = binary.LittleEndian.AppendUint32(dst, stateSequence)
 	dst = binary.LittleEndian.AppendUint32(dst, worldTick)
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(players)))
+	dst = binary.LittleEndian.AppendUint16(dst, dilationBps)
 
 	prevID := uint32(0)
 	for _, player := range players {
@@ -115,6 +126,7 @@ type ClientMessage struct {
 	MovementVector MovementVector
 	Direction      bool // FacingRight
 	InputSequence  uint32
+	Nonce          uint32
 }
 
 // PackMovement упаковывает движение в один байт (совместимо с artillery-processor.cjs)
@@ -177,6 +189,12 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (ClientMessage, error
 			return ClientMessage{}, fmt.Errorf("sync request has invalid length")
 		}
 
+	case MessagePing:
+		if len(data) != 5 {
+			return ClientMessage{}, fmt.Errorf("ping message has invalid length")
+		}
+		msg.Nonce = binary.LittleEndian.Uint32(data[1:5])
+
 	case MessageViewportUpdate:
 		if len(data) != 5 {
 			return ClientMessage{}, fmt.Errorf("viewport message has invalid length")
@@ -190,27 +208,28 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (ClientMessage, error
 }
 
 // EncodeGameState кодирует состояние игры для отправки клиенту
-func (bp *BinaryProtocol) EncodeGameState(players []types.PlayerState, stateSequence, worldTick uint32) []byte {
-	return bp.AppendGameState(nil, players, stateSequence, worldTick)
+func (bp *BinaryProtocol) EncodeGameState(players []types.PlayerState, stateSequence, worldTick uint32, dilationBps uint16) []byte {
+	return bp.AppendGameState(nil, players, stateSequence, worldTick, dilationBps)
 }
 
 // AppendGameState encodes full game state and appends it to dst (preserves existing
 // content). When dst has a header prefix (e.g. 10 reserved WS frame bytes), the payload
 // is written after those bytes. Reorders players by ID — see appendWorldState.
-func (bp *BinaryProtocol) AppendGameState(dst []byte, players []types.PlayerState, stateSequence, worldTick uint32) []byte {
-	return appendWorldState(dst, MessageGameState, players, stateSequence, worldTick)
+// dilationBps is the current time-dilation factor (10000 = 100%, nominal tick rate).
+func (bp *BinaryProtocol) AppendGameState(dst []byte, players []types.PlayerState, stateSequence, worldTick uint32, dilationBps uint16) []byte {
+	return appendWorldState(dst, MessageGameState, players, stateSequence, worldTick, dilationBps)
 }
 
 // EncodeDeltaGameState кодирует дельту — только изменившихся игроков.
-func (bp *BinaryProtocol) EncodeDeltaGameState(players []types.PlayerState, stateSequence, worldTick uint32) []byte {
-	return bp.AppendDeltaGameState(nil, players, stateSequence, worldTick)
+func (bp *BinaryProtocol) EncodeDeltaGameState(players []types.PlayerState, stateSequence, worldTick uint32, dilationBps uint16) []byte {
+	return bp.AppendDeltaGameState(nil, players, stateSequence, worldTick, dilationBps)
 }
 
 // AppendDeltaGameState encodes a delta game state and appends it to dst. Format is
 // identical to AppendGameState, but the message type tells the client to merge the
 // records into its existing state instead of replacing it.
-func (bp *BinaryProtocol) AppendDeltaGameState(dst []byte, players []types.PlayerState, stateSequence, worldTick uint32) []byte {
-	return appendWorldState(dst, MessageDeltaGameState, players, stateSequence, worldTick)
+func (bp *BinaryProtocol) AppendDeltaGameState(dst []byte, players []types.PlayerState, stateSequence, worldTick uint32, dilationBps uint16) []byte {
+	return appendWorldState(dst, MessageDeltaGameState, players, stateSequence, worldTick, dilationBps)
 }
 
 // EncodePlayerJoined кодирует сообщение о присоединении игрока
@@ -252,7 +271,7 @@ func (bp *BinaryProtocol) EncodePlayerLeft(playerID uint32) []byte {
 
 // EncodeMovementAck кодирует подтверждение движения для отправки клиенту
 func (bp *BinaryProtocol) EncodeMovementAck(playerID uint32, x, y uint16, inputSequence uint32) []byte {
-	// Header: message type (1) + player ID (4) + position (4) + input sequence (4) = 13 bytes
+	// type(1) + player ID(4) + position(4) + input sequence(4) = 13 bytes
 	buffer := make([]byte, 13)
 	offset := 0
 
@@ -274,7 +293,6 @@ func (bp *BinaryProtocol) EncodeMovementAck(playerID uint32, x, y uint16, inputS
 
 	// Input sequence (4 bytes)
 	binary.LittleEndian.PutUint32(buffer[offset:], inputSequence)
-	offset += 4
 
 	return buffer
 }

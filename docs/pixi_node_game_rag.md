@@ -1,6 +1,6 @@
 # pixi_node_game — актуальная база знаний проекта
 
-> Срез по коду на 2026-09-02: рабочее дерево поверх commit `0ec0572` (`main`). Этот файл — быстрый контекст для RAG/AI и разработчика. При конфликте документации с кодом источником истины является код.
+> Срез по коду на 2026-09-03. Этот файл — быстрый контекст для RAG/AI и разработчика. При конфликте документации с кодом источником истины является код.
 
 ## 1. Назначение и фактический статус
 
@@ -25,7 +25,7 @@
 | Параметр | Значение |
 |---|---:|
 | Server tick rate | 20 Hz |
-| Base replication interval | 100 ms (10 Hz) |
+| Base replication interval | 50 ms (20 Hz) |
 | Full sync interval | 30 s |
 | Player speed | 4 world units/tick |
 | World | 6000 × 3000 |
@@ -37,8 +37,9 @@
 | Per-connection message rate | 120 msg/s, burst 20 |
 | Per-IP connect rate | 10 conn/s, burst 20 |
 | Velocity replication | on |
-| Keyframe divisor | 50 (1/50 игроков за broadcast) |
-| Protocol version | 3 |
+| Movement input delay | 1 tick (50 ms) |
+| Keyframe divisor | 100 (1/100 игроков за broadcast) |
+| Protocol version | 4 |
 
 Важно: при `20 Hz` скорость 4 units/tick означает 80 units/s по каждой активной оси. Диагональ не нормализуется, поэтому её модуль выше в `sqrt(2)` раза.
 
@@ -123,17 +124,17 @@
 |---|---|
 | Bind/static | `PORT`, `HOST`, `STATIC_DIR` |
 | Workers/admission | `WORKERS`, `MAX_CONNECTIONS` |
-| Input limits | `RATE_LIMIT_MSG_SEC`, `RATE_LIMIT_BURST`, `IP_CONN_RATE`, `IP_CONN_BURST` |
+| Input limits | `RATE_LIMIT_MSG_SEC`, `RATE_LIMIT_BURST`, `IP_CONN_RATE`, `IP_CONN_BURST`, `MOVEMENT_INPUT_DELAY_TICKS`, `MOVEMENT_MAX_ROLLBACK_TICKS` |
 | Game override | `TICK_RATE`, `SYNC_INTERVAL_SEC`, `BATCH_INTERVAL_MS`, `PLAYER_SPEED`, `ATTACK_DURATION_MS` |
 | World override | `WORLD_WIDTH`, `WORLD_HEIGHT`, `SPAWN_MIN_X`, `SPAWN_MAX_X`, `SPAWN_MIN_Y`, `SPAWN_MAX_Y` |
-| Replication model | `VELOCITY_REPLICATION` (bool, default `true`), `KEYFRAME_DIVISOR` (default 50, `0` = off) |
+| Replication model | `VELOCITY_REPLICATION` (bool, default `true`), `KEYFRAME_DIVISOR` (default 100, `0` = off) |
 | Fanout | `FANOUT_MAX_BROADCAST_BYTES_PER_TICK`, `FANOUT_QUEUE_SHED_DEPTH`, `FANOUT_DROP_STREAK`, `WRITE_BATCH_SIZE` |
 | Selection/fairness | `FANOUT_FAIR_DEBT_MAX`, `FANOUT_FAIR_DEBT_INC`, `FANOUT_FAIR_DEBT_DEC`, `FANOUT_FAIR_DEBT_WEIGHT_NS`, `FANOUT_ROUND_ROBIN_WEIGHT_NS` |
 | Critical/freshness | `FANOUT_CRITICAL_WINDOW_MS`, `FANOUT_CRITICAL_BOOST_NS`, `FANOUT_MIN_RECIPIENTS_PER_TICK`, `FANOUT_MAX_RECIPIENTS_PER_TICK`, `FANOUT_TARGET_MS` |
 | Staleness | `WORLD_STATE_ACTIVE_STALENESS_MS`, `WORLD_STATE_IDLE_STALENESS_MS`, `WORLD_STATE_ACTIVE_WINDOW_MS` |
 | Runtime/profiling | `GOGC`, `GOMAXPROCS`, `GOMEMLIMIT`, `PPROF_BLOCK_RATE` |
 
-`.example-env` содержит устаревшие неиспользуемые параметры: `EVENT_CHANNEL_SIZE`, `SEND_CHANNEL_SIZE`, `BROADCAST_WORKERS`, `READ_BUFFER_SIZE`, `WRITE_BUFFER_SIZE`. Он также не перечисляет новые fanout/IP parameters. Не считать его полной схемой конфигурации.
+`.example-env` содержит основные movement/replication defaults, но также исторические неиспользуемые параметры: `EVENT_CHANNEL_SIZE`, `SEND_CHANNEL_SIZE`, `BROADCAST_WORKERS`, `READ_BUFFER_SIZE`, `WRITE_BUFFER_SIZE`. Он не является полной схемой всех fanout/IP parameters.
 
 `GOGC` фактически задаётся через `debug.SetGCPercent`: default 400, если env невалиден/отсутствует. `GOMEMLIMIT` читает сам Go runtime; hardcoded `2GiB` нет. В tracked `.example-env` сейчас указано `512MiB`.
 
@@ -189,7 +190,7 @@ Block/mutex profiler включается только при `PPROF_BLOCK_RATE=
 6. Linux: fd регистрируется в epoll; non-Linux: запускается read goroutine.
 7. Cleanup идемпотентен через `sync.Once`: remove epoll/map, `PLAYER_LEFT`, cancel/drain/close, remove world player.
 
-Дисконнект по вине клиента ограничен реально невосстановимыми случаями. Duplicate/out-of-order movement sequence — штатное следствие retransmit и reordering middlebox, поэтому шаг игнорируется, а сессия рвётся только после `maxStaleInputStreak = 120` подряд. Переполнение input ring (`PlayerInputQueueCapacity = 256`, около 12.8 s отставания) означает, что реконсиляция уже невозможна — это разрыв. Rate limit дропает сообщение и рвёт соединение после `maxRateLimitStreak = 200` подряд, чтобы одиночный burst от прокси не стоил сессии. Отказ по WS-заголовку логируется с троттлингом не чаще раза в секунду на весь сервер.
+Movement transitions идут как непрерывный sequence stream. Duplicate/старый sequence идемпотентно игнорируется, разрыв sequence, неверный client tick или переполнение transition ring закрывают connection. Per-connection rate limit тоже закрывает connection сразу: продолжать поток после тихо потерянного START/STOP нельзя. Отказ по WS-заголовку логируется с троттлингом не чаще раза в секунду на весь сервер.
 
 `SIGINT`/`SIGTERM` запускают graceful shutdown: `http.Server.Shutdown` с таймаутом 10 s, затем отмена per-connection контекстов и `GameWorld.Stop()`.
 
@@ -212,7 +213,7 @@ Non-Linux implementation использует одну read goroutine на conne
 
 Read path принимает только одиночные (`FIN=1`) masked binary/control frames без RSV bits и с payload не более 125 bytes. Fragmentation, continuation, text, unmasked и oversized frames приводят к закрытию connection до payload allocation. Origin при upgrade пока не ограничивается.
 
-Превышение per-connection message rate закрывает connection, а не молча выбрасывает MOVE: продолжать sequence stream после потерянного шага означало бы необратимо нарушить deterministic reconciliation.
+Превышение per-connection message rate закрывает connection, а не молча выбрасывает MOVE: продолжать sequence stream после потерянного transition означало бы необратимо нарушить deterministic reconciliation.
 
 ### World tick
 
@@ -221,13 +222,13 @@ Read path принимает только одиночные (`FIN=1`) masked bi
 Каждый tick:
 
 1. Под коротким `RLock` копируются player pointers.
-2. До `GOMAXPROCS` persistent workers параллельно потребляют максимум один queued movement input на игрока и применяют attack timeout.
+2. До `GOMAXPROCS` persistent workers параллельно применяют накопленные input transitions, интегрируют sticky movement vector и применяют attack timeout.
 3. Game loop последовательно строит `PlayerState`, сравнивает с последним успешно принятым replication baseline и получает накопленный global changed set.
 4. Нет изменений — delta broadcast пропускается.
-5. Один adaptive replication gate ограничивает рассылку: base 100 ms, под write/fanout pressure интервал может вырасти до 120 ms.
+5. Один adaptive replication gate ограничивает рассылку: base 50 ms, под write/fanout pressure интервал может вырасти до 150 ms.
 6. Раз в 30 s отправляется full state.
 
-Movement server-authoritative и детерминирован по шагам: каждый клиентский MOVE — ровно один predicted step; server хранит pointer-free ring на 256 inputs для каждого player и потребляет максимум один input за simulation tick. MOVE и STOP проходят в TCP/WebSocket порядке. Если новых inputs нет, сервер самопроизвольно позицию не меняет. Duplicate/out-of-order sequence или переполнение ring закрывает connection вместо тихой потери шага и необратимого рассинхрона.
+Movement использует timestamped transitions. Клиент локально симулирует 20 Hz, но отправляет MOVE только при старте, STOP или смене вектора. Пакет несёт monotonic `sequence` и `clientTick`. Первый transition фиксирует offset между client/server timeline; default `MOVEMENT_INPUT_DELAY_TICKS=1` планирует применение на следующий server tick, то есть даёт 50 ms на поглощение джиттера. Следующие transitions получают `ApplyTick = clientTick + offset` и ждут его в pointer-free ring. Сервер затем каждый simulation tick интегрирует sticky vector. Умеренно поздний transition (до `MOVEMENT_MAX_ROLLBACK_TICKS`, default 20) точно закрывает исторический сегмент. Более старый transition не откатывает координату через карту: применяется у текущей позиции и переякоривает client/server tick mapping. Client-tick pace ограничен server wall time плюс jitter allowance, чтобы подделкой tick нельзя было телепортироваться.
 
 ### Spatial grid
 
@@ -271,9 +272,9 @@ Adaptive pacing учитывает и fanout duration, и максимальны
 
 ### Pacing квантуется целыми тиками
 
-Репликация вычисляется на границах тиков, поэтому интервал, не кратный тику, честно выдержать нельзя — он бьётся о тик. При 50 ms тике и запросе 100 ms примерно половина тиков попадала чуть-чуть под порог и откладывалась на целый тик: измеренная каденция была бимодальной `100/150 ms` (mean 125.6, stdev 24.8), фактические `8.0 Hz` вместо 10, а клиентская adaptive interpolation delay упиралась в потолок 300 ms.
+Репликация вычисляется на границах тиков, поэтому интервал, не кратный тику, честно выдержать нельзя — он бьётся о тик. Исторически при 50 ms тике и запросе 100 ms простой gate давал бимодальные `100/150 ms`. `replicationIntervalNs` и half-tick slack устраняют это биение.
 
-`replicationIntervalNs` округляет интервал до целого числа тиков, `replicationDue` добавляет допуск в полтика против дрожания тикера (тик приходит только по сетке тиков, поэтому допуск не может впустить лишнюю отправку). После этого: mean 99.8 ms, stdev 0.6 ms, шаг позиции ровно 8 px, расчётная delay около 220 ms.
+Current base равен одному тику. End-to-end probe показывает mean 49.8 ms и stdev 0.4 ms. `replicationIntervalNs` округляет adaptive interval до целого числа тиков, `replicationDue` добавляет допуск в полтика против дрожания тикера.
 
 Следствие: шаги adaptive controller в 3–10 ms лежат ниже гранулярности тика. Его потолок поэтому выводится из тика (`adaptiveBatchCeiling` = base + 2 тика), иначе квантование вернуло бы значение к base и backoff стал бы no-op.
 
@@ -281,11 +282,11 @@ Adaptive pacing учитывает и fanout duration, и максимальны
 
 `lastAckPassNs` пасует проход по movement ACK, `lastBroadcastNs` — кадр состояния и продвигается только при реальной отправке. Общий счётчик позволил бы тику, отдавшему только ACK, занять слот состояния и задержать следующую дельту на полный интервал.
 
-ACK эмитятся **до** проверки на пустую дельту. Игрок, прижатый к границе мира, продолжает потреблять инпуты, не меняя ни одного реплицируемого поля; если бы ACK ехал на дельте, такой клиент никогда не подрезал бы pending-input ring и переполнил бы его.
+ACK эмитятся независимо от наличия state payload. Несколько transitions между replication ticks коалесцируются до последнего применённого sequence; held vector новых ACK не создаёт.
 
 ### Heartbeat-кадр
 
-При velocity replication пустая дельта всё равно уходит — голым 13-байтным заголовком (`shouldEmitFrame`). Клиент доинтегрирует пропущенных игроков **только при приходе кадра**, используя `worldTick` из заголовка как счётчик шагов; подавление пустых кадров заморозило бы всех удалённых игроков до чьей-нибудь смены направления. Стоимость — около 2 Mbit/s на 2000 клиентов при 10 Hz против сотен Mbit/s, которые стоили бы опущенные записи.
+При velocity replication пустая дельта всё равно уходит — голым 13-байтным заголовком (`shouldEmitFrame`). Клиент доинтегрирует пропущенных игроков **только при приходе кадра**, используя `worldTick` из заголовка как счётчик шагов. Стоимость heartbeat — около 4.2 Mbit/s server egress на 2000 клиентов при 20 Hz против сотен Mbit/s, которые стоили бы опущенные записи.
 
 Keyframe-ротация досылает `1/KEYFRAME_DIVISOR` игроков за broadcast с абсолютной позицией, чтобы клиент, пропустивший запись (shed, потеря), сошёлся не дожидаясь смены направления у того игрока.
 
@@ -299,11 +300,12 @@ Keyframe-ротация досылает `1/KEYFRAME_DIVISOR` игроков з�
 |---:|---|---:|---|
 | 1 | JOIN | 1 | constant есть, decoder не принимает; клиент не отправляет |
 | 2 | LEAVE | 1 | constant есть, decoder не принимает; disconnect идёт через WS close |
-| 3 | MOVE | 6 | `type + packed(dx,dy) + inputSequence:u32` |
+| 3 | MOVE | 10 | `type + packed(dx,dy) + inputSequence:u32 + clientTick:u32` |
 | 4 | DIRECTION | 2 | client посылает signed `-1/+1`; server считает `1` right, всё прочее left |
 | 5 | ATTACK | 9 | client добавляет `x:f32,y:f32`; server валидирует размер, но координаты игнорирует |
 | 6 | ATTACK_END | 1 | принимается, но server игнорирует: timeout authoritative |
 | 13 | VIEWPORT | 5 | client enum/encoder отсутствует; server валидирует размер, но размеры не читает и не сохраняет |
+| 17 | PING | 5 | `type + nonce:u32`; отправляется network worker раз в секунду для измерения RTT |
 
 Packed movement: bits 0–1 = `dx+1`, bits 2–3 = `dy+1`; нормальные значения `dx/dy ∈ {-1,0,1}`.
 
@@ -312,13 +314,14 @@ Packed movement: bits 0–1 = `dx+1`, bits 2–3 = `dy+1`; нормальные 
 | ID | Имя | Формат |
 |---:|---|---|
 | 7 | GAME_STATE | `type:1 + stateSequence:u32 + worldTick:u32 + count:u32 + N×player` |
-| 8 | MOVEMENT_ACK | `type:1 + playerID:u32 + x:u16 + y:u16 + inputSequence:u32` = 13 bytes |
+| 8 | MOVEMENT_ACK | `type:1 + playerID:u32 + x:u16 + y:u16 + inputSequence:u32 + clientTick:u32` = 17 bytes |
 | 11 | PLAYER_JOINED | `type:1 + player` = 12 bytes |
 | 12 | PLAYER_LEFT | `type:1 + playerID:u32` = 5 bytes |
 | 14 | DELTA_GAME_STATE | тот же header/player layout, только changed players |
 | 15 | WELCOME | `type:1 + protocolVersion:u8 + tickRate:u16 + playerID:u32` = 8 bytes |
+| 18 | PONG | `type:1 + nonce:u32` = 5 bytes; echo кодируется без allocation в reusable writer buffer |
 
-`ProtocolVersion = 3`. Клиент сверяет её с `PROTOCOL_VERSION` из `messages.ts` и при расхождении отказывается декодировать world state. Проверка обязательна, а не гигиена: world-state кадр не содержит per-record framing, поэтому разошедшийся декодер не падает — он молча выдаёт неверные player ID.
+`ProtocolVersion = 4`. Клиент сверяет её с `PROTOCOL_VERSION` из `messages.ts` и при расхождении отказывается декодировать world state. Проверка обязательна, а не гигиена: world-state кадр не содержит per-record framing, поэтому разошедшийся декодер не падает — он молча выдаёт неверные player ID.
 
 История версий: v2 ввела varint-делта ID, v3 добавила `worldTick`.
 
@@ -351,7 +354,7 @@ State sequence — uint32, увеличивается на каждый реал
 - payload = `13 + ~8R` bytes;
 - server application egress ≈ `(WS frame bytes) × recipients × F`.
 
-При default replication `F = 10 Hz` ровно (после квантования по тикам). Simulation работает на 20 Hz. TCP/IP/TLS/Ethernet overhead и retransmits ниже не учтены.
+При default replication `F = 20 Hz`, как и simulation. TCP/IP/TLS/Ethernet overhead и retransmits ниже не учтены.
 
 Ключевой вопрос — чему равно `R`. Без velocity replication `R = M`, числу изменившихся игроков, то есть при общем движении `R ≈ N`. С velocity replication `R` определяется частотой смены направления, а не числом движущихся:
 
@@ -366,7 +369,7 @@ State sequence — uint32, увеличивается на каждый реал
 
 | Сценарий, все двигаются | На клиента | Server egress |
 |---|---:|---:|
-| 2000 players, all-to-all по позициям | ~160 KB/s | ~320 MB/s = 2.56 Gbit/s |
+| 2000 players, all-to-all по позициям | ~320 KB/s | ~640 MB/s = 5.12 Gbit/s |
 | 2000 players, velocity replication при 1.5 смен/с | ~42 KB/s | ~83 MB/s ≈ 0.67 Gbit/s |
 
 Full sync добавляет `(13 + ~8N) × N` bytes раз в 30 s.
@@ -399,12 +402,12 @@ Remote interpolation:
 
 - snapshots timestamped локальным `performance.now()` при получении;
 - buffer max 32;
-- adaptive delay 100–300 ms;
+- adaptive delay 50–150 ms; при ровных 20 Hz probes target держится около 60–75 ms;
 - EWMA по arrival interval/jitter;
 - interpolation без extrapolation, после newest snapshot позиция удерживается;
 - server clock synchronization отсутствует.
 
-Local player использует fixed-step prediction и ACK reconciliation. Server ACK содержит фактическую позицию после world update и последний применённый input sequence; несколько inputs между replication ticks коалесцируются. Клиент заменяет logical position на `ACK position + replay(unacknowledged inputs)`, поэтому network delay сдвигает момент обработки MOVE/STOP, но не итоговую координату. ACK cadence связан с replication gate и обычно составляет до 10 Hz, а не simulation 20 Hz. Catch-up после background-tab ограничен четырьмя шагами, pending buffer — 256 inputs.
+Local player использует fixed-step prediction, но pending history хранит только смены input-state. ACK содержит точную позицию на границе подтверждённого сегмента, `inputSequence` и `clientTick`. Клиент от этой границы переигрывает интервалы всех более новых transitions до текущего local tick. Поэтому held input не создаёт трафик, а обычная задержка MOVE/STOP не меняет итоговую координату. При `blur`/hidden вкладка синхронно очищает клавиши и отправляет STOP до browser throttling; при resume local tick продвигается на прошедшее wall time, чтобы следующий START не попал в прошлое server timeline. Pending buffer — 256 transitions. Displayed ping берётся из отдельного worker PING/PONG, а не из времени ожидания movement ACK.
 
 Фактический browser budget на 1500–2000 `AnimatedSprite` всё ещё не подтверждён benchmark. Основные оставшиеся риски клиента: отдельный auto-updating `AnimatedSprite`/animation ticker на сущность, object churn при decode, main-thread decode и отсутствие render LOD/ParticleContainer strategy.
 
@@ -441,11 +444,11 @@ Probes декодируют кадры **настоящим клиентским
 
 | Probe | Что фиксирует |
 |---|---|
-| `determinism` | Один инпут — ровно один шаг симуляции; дистанция равна `steps × playerSpeedPerTick` для каждого взгляда каждого клиента на каждого. |
+| `determinism` | Held vector отправляется одним START и одним STOP; дистанция сегмента равна `clientTicks × playerSpeedPerTick` для каждого взгляда каждого клиента на каждого. |
 | `pacing` | Ровная каденция репликации; джиттер оплачивается дважды — меньше обновлений и больше interpolation delay. |
 | `dead-reckoning` | Наблюдатель, восстанавливающий позицию одной скоростью, сходится точно на авторитетный `MOVEMENT_ACK` движущегося. |
-| `ack-flow` | ACK продолжают идти при пустой дельте. |
-| `resilience` | Дубликаты sequence и burst стоят сообщений, а не сессии. |
+| `ack-flow` | Несколько transitions внутри replication interval коалесцируются до последнего авторитетного ACK. |
+| `resilience` | Duplicate transition идемпотентен, а rate-limit burst закрывает поток вместо тихой потери команды. |
 | `bandwidth` | Не pass/fail: отдаёт записи и байты на проводе плюс состав дельты. Используется `ab-velocity.sh`. |
 
 Probes читают `src/shared/gameConfig.json`, поэтому смена tick rate или скорости не обесценивает ассерты молча. Экрана они не видят: доказывают корректность и ровность потока, но не то, как выглядит движение.
@@ -453,7 +456,7 @@ Probes читают `src/shared/gameConfig.json`, поэтому смена tick
 Основные Prometheus metrics:
 
 - connections: `game_players_connected`, `game_connections_total`, `game_disconnections_total`;
-- input integrity: `game_movement_inputs_rejected_total`;
+- input integrity: `game_movement_inputs_rejected_total`, `game_movement_transitions_late_total`, `game_movement_transition_lateness_ticks`, `game_movement_correction_distance_units`;
 - tick: `game_tick_duration_seconds`, `game_ticks_total`, `game_tick_phase_seconds`, `game_tick_world_step_seconds`;
 - fanout: `game_tick_fanout_send_seconds`, `...select_seconds`, `...enqueue_seconds`;
 - payload/targets: `game_broadcast_payload_bytes`, `game_broadcast_targets`, `game_broadcast_recipients`;
@@ -472,7 +475,7 @@ Probes читают `src/shared/gameConfig.json`, поэтому смена tick
 
 ### P0 — до заявления «1500–2000 playable»
 
-1. **Проверить плавность в браузере.** Ни одна автоматическая проверка в репозитории не смотрит на экран. Velocity replication даёт коррекцию около 8–23 px при смене направления, которую interpolation delay (~220 ms) должна скрывать. Нужны две вкладки и живой взгляд. Если рывки заметны — сначала поднять `KEYFRAME_DIVISOR`, при необходимости `VELOCITY_REPLICATION=false` для сравнения.
+1. **Проверить плавность в браузере.** Ни одна автоматическая проверка в репозитории не смотрит на экран. Current remote interpolation обычно около 60–75 ms и ограничена 150 ms; default server input delay добавляет удалённым наблюдателям ещё 50 ms, но локальный player двигается сразу через prediction. Следить за late/correction metrics и сравнить две вкладки под искусственным jitter.
 2. **Собрать `game_delta_*` на живых сессиях.** Выигрыш velocity replication определяется частотой смены направления, а она у ботов и людей разная. Все текущие цифры получены ботами.
 3. Провести browser benchmark 1500/2000 entities: decode ms, main-thread frame time p95/p99, draw calls, GPU/CPU memory и downstream.
 4. Провести отдельный-host end-to-end load test; локальный Artillery конкурирует с сервером за CPU и loopback.
@@ -489,7 +492,7 @@ Probes читают `src/shared/gameConfig.json`, поэтому смена tick
 
 1. Синхронизировать local `.env`, README и historical performance docs с current code; в local `.env` есть параметры несуществующих AOI/WebRTC implementations.
 2. Проверить переход remote rendering на более дешёвый общий animation clock/ParticleContainer, если visual requirements позволяют.
-3. Рассмотреть sticky vector на сервере (продолжать последний вектор при пустой очереди инпутов, с жёстким лимитом шагов). Это сократило бы upstream с 20 msg/s на клиента, но требует, чтобы экстраполированные шаги потребляли sequence — иначе ACK и клиентский реплей дважды учтут одни и те же шаги и дадут рывок.
+3. Для будущей collision/rollback системы сохранить тот же `clientTick` timeline: current one-tick input delay и точный пересчёт безопасны для свободного движения/boundary clamp, но сложные взаимодействия потребуют history buffer.
 
 ## 13. Проверенный baseline этого среза
 
@@ -498,19 +501,19 @@ bun/Vite production client build: PASS
 TypeScript noEmit: PASS
 ESLint: PASS
 Go build / vet: PASS
-go test ./...: PASS (52 assertions)
+go test ./...: PASS
 go test -race ./...: PASS
 make protocol-test: PASS (5 probes)
 ```
 
 Замеры протокольных probes на этом срезе:
 
-- `determinism`: 8 клиентов, 64/64 замеров дистанции ровно 240 px, 0 разрывов sequence, 0 ошибок декодера;
-- `pacing`: mean 99.8 ms, stdev 0.6 ms, все интервалы в одной корзине;
-- `dead-reckoning`: 300 инпутов с 8 сменами направления, восстановленная позиция расходится с авторитетной на 0 px, 88% обновлений синтезированы клиентом;
-- `ack-flow`: 51/51 подтверждено, ACK продолжают идти при пустой дельте;
-- `resilience`: дубликаты sequence и burst из 200 сообщений не разрывают сессию;
-- `ab-velocity` (12 клиентов, 1.5 смен/с): 1001 → 305 записей, 9240 → 3770 байт.
+- `determinism`: 8 клиентов, только 2 movement messages на клиента (START/STOP), 64/64 замеров дистанции ровно 240 px, 0 разрывов sequence, 0 ошибок декодера;
+- `pacing`: mean 49.8 ms, stdev 0.4 ms, все интервалы в одной корзине;
+- `dead-reckoning`: 21/21 transitions подтверждены, восстановленная позиция расходится с авторитетной на 0 px, 95.6% обновлений синтезированы клиентом;
+- `ack-flow`: 4/4 быстрых transitions подтверждены последним коалесцированным ACK;
+- `resilience`: duplicate sequences идемпотентны; rate-limit burst закрывает connection вместо потери перехода;
+- старый `ab-velocity` (12 клиентов, 1.5 смен/с): 1001 → 305 записей, 9240 → 3770 байт; после перехода на timestamped transitions A/B нужно повторить.
 
 Байтовое отношение отстаёт от отношения записей, потому что 13-байтный заголовок — заметная доля маленького кадра; на тысячах игроков они сходятся.
 
@@ -520,13 +523,13 @@ make protocol-test: PASS (5 probes)
 
 ## 14. Gotchas для следующего разработчика/AI
 
-- Не писать «30 Hz»: current shared default — 20 Hz simulation, 10 Hz replication.
+- Не писать «30 Hz» или «10 Hz replication»: current shared default — 20 Hz simulation и replication.
 - Не писать «full sync каждую секунду»: current default — 30 s.
 - Не писать `writeCh cap=4`: current constant — 32.
 - Не писать `broadcastWriteTimeout=5ms`: current constant — 100 ms.
 - Не писать «11 байт на игрока»: record переменной длины, типично 8 (varint ID delta).
 - Не писать «header 9 байт»: current — 13 (добавлен `worldTick`).
-- Protocol version — 3. Клиент её проверяет; расхождение декодера **не** даёт ошибку, а даёт неверные player ID.
+- Protocol version — 4. Клиент её проверяет; расхождение декодера **не** даёт ошибку, а даёт неверные player ID.
 - Не называть visibility grid действующим AOI: у него нет query API, он только ведёт учёт.
 - Не переносить white-box Go-тесты (`classifyDelta`, `replicationIntervalNs`, `appendUvarint`, `validClientHeader` и т.д.) в отдельную папку: Go даёт доступ к неэкспортированным символам только файлам в той же директории, что и код. В отдельную папку (`src/server/tests/`) вынесены только тесты, использующие исключительно публичный API — см. `src/server/tests/README.md`.
 - Не добавлять обратно `FANOUT_WORKERS`: старый неиспользуемый pool удалён.

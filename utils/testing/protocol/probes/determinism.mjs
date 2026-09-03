@@ -1,6 +1,5 @@
-// Every input must produce exactly one simulation step — no step lost, duplicated or
-// reordered — across concurrent clients. This is the core guarantee of the input-queue
-// model, and the one that breaks loudest if the movement path regresses.
+// A held vector is sent once. A delayed STOP must still close a segment at the exact
+// client tick, independently of packet arrival time.
 import { GameClient, connectAll, loadProtocol, sleep, SPEED, report } from '../lib/harness.mjs';
 
 const CLIENTS = Number(process.env.CLIENTS ?? 8);
@@ -15,10 +14,11 @@ for (let i = 0; i < STEPS; i++) {
     for (const c of clients) c.move(1, 0);
     await sleep(1000 / 20);
 }
+for (const c of clients) c.move(0, 0);
 await sleep(800);
 
 // Each client's own ACKs are the authoritative record of what the server applied.
-const fullyAcked = clients.filter((c) => c.lastAckSequence === STEPS).length;
+const fullyAcked = clients.filter((c) => c.lastAckSequence === 2).length;
 const travels = [];
 for (const watcher of clients) {
     for (const other of clients) {
@@ -33,9 +33,9 @@ const failures = clients.flatMap((c) => c.decodeFailures);
 const gaps = clients.flatMap((c) => c.sequenceGaps());
 
 clients.forEach((c) => c.close());
-report('determinism: one input, one step', [
+report('determinism: timestamped movement segments', [
     { label: 'clients fully acknowledged', actual: `${fullyAcked}/${CLIENTS}`, pass: fullyAcked === CLIENTS },
     { label: `travel is exactly ${expected}px`, actual: `${travels.length - wrong.length}/${travels.length} samples`, pass: travels.length > 0 && wrong.length === 0 },
     { label: 'decoder failures', actual: failures.length, pass: failures.length === 0 },
     { label: 'state sequence gaps', actual: gaps.length, pass: gaps.length === 0 },
-], { protocolVersion: clients[0].protocolVersion, wrongTravels: wrong.slice(0, 5) });
+], { protocolVersion: clients[0].protocolVersion, messagesPerClient: clients[0].sequence, wrongTravels: wrong.slice(0, 5) });

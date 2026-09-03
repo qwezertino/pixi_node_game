@@ -24,9 +24,65 @@ func TestEncodeWelcome(t *testing.T) {
 	}
 }
 
+func TestDecodeMove(t *testing.T) {
+	bp := &BinaryProtocol{}
+	buf := make([]byte, 6)
+	buf[0] = MessageMove
+	buf[1] = PackMovement(-1, 1)
+	binary.LittleEndian.PutUint32(buf[2:6], 77)
+
+	got, err := bp.DecodeClientMessage(buf)
+	if err != nil {
+		t.Fatalf("valid MOVE rejected: %v", err)
+	}
+	if got.InputSequence != 77 ||
+		got.MovementVector.DX != -1 || got.MovementVector.DY != 1 {
+		t.Fatalf("decoded MOVE = %+v", got)
+	}
+	if _, err := bp.DecodeClientMessage(buf[:5]); err == nil {
+		t.Fatal("truncated MOVE was accepted")
+	}
+}
+
+func TestDecodePing(t *testing.T) {
+	bp := &BinaryProtocol{}
+	buf := []byte{MessagePing, 0, 0, 0, 0}
+	binary.LittleEndian.PutUint32(buf[1:], 0xdeadbeef)
+	got, err := bp.DecodeClientMessage(buf)
+	if err != nil {
+		t.Fatalf("valid PING rejected: %v", err)
+	}
+	if got.Type != MessagePing || got.Nonce != 0xdeadbeef {
+		t.Fatalf("decoded PING = %+v", got)
+	}
+	if _, err := bp.DecodeClientMessage(buf[:4]); err == nil {
+		t.Fatal("truncated PING was accepted")
+	}
+}
+
+func TestEncodeMovementAck(t *testing.T) {
+	bp := &BinaryProtocol{}
+	got := bp.EncodeMovementAck(5, 100, 200, 9)
+	if len(got) != 13 || got[0] != MessageMovementAck {
+		t.Fatalf("ACK prefix/length = %v/%d", got[0], len(got))
+	}
+	if id := binary.LittleEndian.Uint32(got[1:5]); id != 5 {
+		t.Fatalf("ACK player id = %d", id)
+	}
+	if x := binary.LittleEndian.Uint16(got[5:7]); x != 100 {
+		t.Fatalf("ACK x = %d", x)
+	}
+	if y := binary.LittleEndian.Uint16(got[7:9]); y != 200 {
+		t.Fatalf("ACK y = %d", y)
+	}
+	if seq := binary.LittleEndian.Uint32(got[9:13]); seq != 9 {
+		t.Fatalf("ACK input sequence = %d", seq)
+	}
+}
+
 // decodeWorldState mirrors the client decoder (binaryProtocol.ts) so that a change to
 // the wire format has to be made on both sides for this test to stay green.
-func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, []types.PlayerState) {
+func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, []types.PlayerState) {
 	t.Helper()
 	if len(buf) < worldStateHeaderSize {
 		t.Fatalf("frame shorter than header: %d", len(buf))
@@ -35,6 +91,7 @@ func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, []types.
 	sequence := binary.LittleEndian.Uint32(buf[1:5])
 	worldTick := binary.LittleEndian.Uint32(buf[5:9])
 	count := binary.LittleEndian.Uint32(buf[9:13])
+	dilationBps := binary.LittleEndian.Uint16(buf[13:15])
 
 	offset := worldStateHeaderSize
 	prevID := uint32(0)
@@ -77,7 +134,7 @@ func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, []types.
 	if offset != len(buf) {
 		t.Fatalf("frame has %d trailing bytes", len(buf)-offset)
 	}
-	return msgType, sequence, worldTick, players
+	return msgType, sequence, worldTick, dilationBps, players
 }
 
 func TestAppendWorldStateRoundTrip(t *testing.T) {
@@ -94,11 +151,11 @@ func TestAppendWorldStateRoundTrip(t *testing.T) {
 		want[p.ID] = p
 	}
 
-	got := bp.AppendGameState(nil, players, 42, 7777)
-	msgType, sequence, worldTick, decoded := decodeWorldState(t, got)
+	got := bp.AppendGameState(nil, players, 42, 7777, 8500)
+	msgType, sequence, worldTick, dilationBps, decoded := decodeWorldState(t, got)
 
-	if msgType != MessageGameState || sequence != 42 || worldTick != 7777 {
-		t.Fatalf("header = type %d seq %d tick %d", msgType, sequence, worldTick)
+	if msgType != MessageGameState || sequence != 42 || worldTick != 7777 || dilationBps != 8500 {
+		t.Fatalf("header = type %d seq %d tick %d dilation %d", msgType, sequence, worldTick, dilationBps)
 	}
 	if len(decoded) != len(want) {
 		t.Fatalf("decoded %d players, want %d", len(decoded), len(want))
@@ -119,13 +176,13 @@ func TestAppendWorldStatePreservesFramePrefix(t *testing.T) {
 	prefix := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0} // reserved WS header bytes
 	players := []types.PlayerState{{ID: 1, X: 1, Y: 2}, {ID: 2, X: 3, Y: 4}}
 
-	got := bp.AppendDeltaGameState(append([]byte(nil), prefix...), players, 7, 99)
+	got := bp.AppendDeltaGameState(append([]byte(nil), prefix...), players, 7, 99, 10000)
 	if len(got) <= len(prefix) {
 		t.Fatal("payload was not appended after the prefix")
 	}
-	msgType, sequence, worldTick, decoded := decodeWorldState(t, got[len(prefix):])
-	if msgType != MessageDeltaGameState || sequence != 7 || worldTick != 99 || len(decoded) != 2 {
-		t.Fatalf("type=%d seq=%d tick=%d players=%d", msgType, sequence, worldTick, len(decoded))
+	msgType, sequence, worldTick, dilationBps, decoded := decodeWorldState(t, got[len(prefix):])
+	if msgType != MessageDeltaGameState || sequence != 7 || worldTick != 99 || dilationBps != 10000 || len(decoded) != 2 {
+		t.Fatalf("type=%d seq=%d tick=%d dilation=%d players=%d", msgType, sequence, worldTick, dilationBps, len(decoded))
 	}
 
 	// Dense consecutive IDs are the case varint encoding exists for: 8 bytes per

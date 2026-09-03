@@ -21,7 +21,7 @@ import (
 
 // readBufPoolSize is the fixed size of pooled read buffers.
 // All client message types fit within 64 bytes:
-//   - Move:        1 (type) + 1 (vector) + 4 (input_seq) = 6 bytes
+//   - Move:        1 (type) + 1 (vector) + 4 (input_seq) + 4 (client_tick) = 10 bytes
 //   - Direction:   1 + 1 = 2 bytes
 //   - Attack:      1 byte
 //   - ViewportUpdate: up to ~16 bytes
@@ -280,20 +280,16 @@ func (ep *epollPoller) processRead(c *Connection) {
 		metrics.BytesReceived.Add(float64(len(payload)))
 
 		if !c.rateLimiter.Allow() {
-			// Drop the message but keep the session: a burst can come from a
-			// middlebox flushing a stalled queue, not only from an abusive client.
-			// Only a sustained overage costs the connection.
+			// Input transitions are an ordered reliable stream. Silently dropping
+			// one would make later acknowledgements describe a state never received.
 			metrics.MessagesRateLimited.Inc()
-			if atomic.AddInt32(&c.rateLimitStreak, 1) >= maxRateLimitStreak {
-				if poolBuf != nil {
-					readBufPool.Put(poolBuf)
-					poolBuf = nil
-				}
-				go ep.svr.cleanupConnection(c)
-				return
+			if poolBuf != nil {
+				readBufPool.Put(poolBuf)
+				poolBuf = nil
 			}
+			go ep.svr.cleanupConnection(c)
+			return
 		} else {
-			atomic.StoreInt32(&c.rateLimitStreak, 0)
 			// processMessage is synchronous and does not retain the payload slice.
 			ep.svr.processMessage(c, payload)
 		}

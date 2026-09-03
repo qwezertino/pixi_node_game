@@ -25,11 +25,11 @@ player IDs. Bundling the shipped decoder is what makes a wire-format change veri
 
 | Probe | Pins |
 |---|---|
-| `determinism` | One input produces exactly one simulation step. Travel must equal `steps × playerSpeedPerTick` for every client's view of every other client. |
+| `determinism` | A held vector uses one START and one STOP; travel equals `client ticks × playerSpeedPerTick` for every client's view. |
 | `pacing` | Replication lands on a steady cadence. Jitter is paid for twice — fewer updates, and a larger interpolation delay to hide them. |
 | `dead-reckoning` | A watcher reconstructing a mover from velocity alone converges exactly on that mover's authoritative `MOVEMENT_ACK`. |
-| `ack-flow` | Acknowledgements keep flowing when the delta is empty. Without this a player pinned against a boundary never prunes its pending-input ring and is eventually disconnected. |
-| `resilience` | Duplicate sequences and a send burst cost messages, not the session. |
+| `ack-flow` | Several input transitions inside one replication interval coalesce to the latest authoritative ACK. |
+| `resilience` | Duplicate transitions are idempotent; a rate-limit burst closes the stream instead of silently losing a command. |
 | `bandwidth` | Not pass/fail — reports records and bytes on the wire plus the delta composition. Used by `ab-velocity.sh`. |
 
 ## Tuning

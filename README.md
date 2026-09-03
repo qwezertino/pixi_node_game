@@ -146,7 +146,7 @@ The Go server is built for minimal goroutine count at scale:
 
 - **Read path**: Linux epoll (`EPOLLONESHOT`) — 1 wait loop + `2×GOMAXPROCS` read workers. No goroutine-per-connection. At 10 000 clients: ~25 read goroutines total.
 - **Write path**: per-connection `writeCh chan writeJob` (buffered 32) with one persistent goroutine per connection (`startWriteLoop`). Broadcast frames are shared/ref-counted; movement ACKs are encoded into reusable writer buffers. Goroutines are long-lived, never created per tick.
-- **Game loop**: single simulation loop at 20 Hz. Position updates are parallelised across `GOMAXPROCS` persistent worker goroutines. Replication is paced separately at a 100 ms base interval (adaptive up to 120 ms); full sync every 30 s.
+- **Game loop**: single simulation loop at 20 Hz. Position updates are parallelised across `GOMAXPROCS` persistent worker goroutines. Replication defaults to the same 20 Hz (50 ms), with adaptive backoff under write pressure; full sync every 30 s.
 - **GC tuning**: concurrent GC remains enabled; the default application setting is `GOGC=400`, while `GOMEMLIMIT` should be set for the deployment memory budget.
 - **Goroutine count at 10 000 clients**: `2×GOMAXPROCS` (epoll readers) + `GOMAXPROCS` (tick workers) + 10 000 (persistent write loops) + a few system goroutines. Write goroutines are long-lived and blocked on channel receive — GC scans stacks but never creates/destroys them during gameplay.
 

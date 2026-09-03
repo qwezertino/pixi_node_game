@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"github.com/gobwas/ws"
+
+	"pixi_game_server/internal/config"
+	"pixi_game_server/internal/game"
 )
 
 func TestWriteJobFrameEncodesMovementAck(t *testing.T) {
@@ -22,6 +25,19 @@ func TestWriteJobFrameEncodesMovementAck(t *testing.T) {
 		binary.LittleEndian.Uint16(got[9:11]) != 456 ||
 		binary.LittleEndian.Uint32(got[11:15]) != 789 {
 		t.Fatalf("unexpected ACK frame payload: %v", got[2:])
+	}
+}
+
+func TestWriteJobFrameEncodesPong(t *testing.T) {
+	job := writeJob{pong: true, pongNonce: 0x12345678}
+	var buf [15]byte
+	got := writeJobFrame(&job, &buf)
+
+	if len(got) != 7 || got[0] != 0x82 || got[1] != 5 || got[2] != 18 {
+		t.Fatalf("unexpected PONG frame prefix: %v", got[:3])
+	}
+	if nonce := binary.LittleEndian.Uint32(got[3:]); nonce != 0x12345678 {
+		t.Fatalf("PONG nonce = %#x", nonce)
 	}
 }
 
@@ -118,98 +134,78 @@ func TestReleaseConnSliceClearsPointers(t *testing.T) {
 	}
 }
 
-func TestReplicationIntervalNsQuantisesToTicks(t *testing.T) {
-	const tick = int64(50 * time.Millisecond)
-
-	cases := []struct {
-		name          string
-		batchNs, want int64
-	}{
-		{"exact multiple", 100 * int64(time.Millisecond), 100 * int64(time.Millisecond)},
-		{"rounds down", 120 * int64(time.Millisecond), 100 * int64(time.Millisecond)},
-		{"rounds up", 130 * int64(time.Millisecond), 150 * int64(time.Millisecond)},
-		{"never below one tick", 5 * int64(time.Millisecond), tick},
-		{"disabled stays disabled", 0, 0},
+// tuneTimeDilation reads/writes GameWorld's real ticker via SetTickInterval, so these
+// tests exercise it through a live GameWorld rather than a bare Server struct.
+func newDilationTestServer(t *testing.T) *Server {
+	t.Helper()
+	cfg := &config.Config{
+		Game: config.GameConfig{TickRate: 20, PlayerSpeedPerTick: 4},
+		World: config.WorldConfig{
+			Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000,
+		},
+		Net: config.NetworkConfig{MaxConnections: 64},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := replicationIntervalNs(tc.batchNs, tick); got != tc.want {
-				t.Fatalf("replicationIntervalNs(%d) = %d, want %d", tc.batchNs, got, tc.want)
-			}
-		})
-	}
+	gw := game.NewGameWorld(cfg)
+	t.Cleanup(gw.Stop)
+	// gameLoop() creates the actual *time.Ticker in its own goroutine; SetTickInterval
+	// silently no-ops until it exists. In production this can never race —
+	// SetTickInterval is only ever called from inside tick(), which only runs after
+	// the ticker already exists — but this test calls it immediately after
+	// construction, so give the goroutine a moment to reach that line.
+	time.Sleep(10 * time.Millisecond)
+	return &Server{cfg: cfg, gameWorld: gw, dilationBps: dilationBpsFull}
+}
 
-	if got := replicationIntervalNs(100, 0); got != 100 {
-		t.Fatalf("unknown tick rate must pass the interval through, got %d", got)
+func TestTuneTimeDilationStepsDownUnderPressure(t *testing.T) {
+	s := newDilationTestServer(t)
+
+	s.tuneTimeDilation(100*time.Millisecond, 0, 0)
+
+	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull-1000 {
+		t.Fatalf("dilationBps = %d, want %d (one severe step down)", got, dilationBpsFull-1000)
+	}
+	// The tick interval must have actually grown — this is what distinguishes time
+	// dilation from the old batch-interval backoff, which never touched the tick rate.
+	nominal := s.gameWorld.GetNominalTickInterval()
+	if got := s.gameWorld.GetTickInterval(); got <= nominal {
+		t.Fatalf("tick interval = %v, want > nominal %v under severe pressure", got, nominal)
 	}
 }
 
-// The regression this guards: a 100 ms interval evaluated on a jittery 50 ms tick grid
-// used to alternate between 2 and 3 ticks, halving into an effective ~8 Hz and adding
-// enough arrival jitter to pin the client's interpolation delay at its ceiling.
-func TestReplicationDueHoldsCadenceUnderTickerJitter(t *testing.T) {
-	const tick = int64(50 * time.Millisecond)
-	interval := replicationIntervalNs(100*int64(time.Millisecond), tick)
+func TestTuneTimeDilationRecoversSlowlyWhenClear(t *testing.T) {
+	s := newDilationTestServer(t)
+	atomic.StoreInt64(&s.dilationBps, dilationBpsFull-2000)
+	s.gameWorld.SetTickInterval(s.gameWorld.GetNominalTickInterval() * 10000 / (dilationBpsFull - 2000))
 
-	// Ticks drift slightly late, which is what pushed the naive comparison under
-	// the threshold. Deterministic pattern, no randomness.
-	jitter := []int64{0, -300 * 1000, 900 * 1000, -1200 * 1000, 400 * 1000}
+	s.tuneTimeDilation(0, 0, 0)
 
-	last := int64(0)
-	emitted := []int{}
-	for i := 1; i <= 40; i++ {
-		now := int64(i)*tick + jitter[i%len(jitter)]
-		if replicationDue(now, last, interval, tick) {
-			emitted = append(emitted, i)
-			last = now
-		}
-	}
-
-	if len(emitted) == 0 {
-		t.Fatal("no frames emitted")
-	}
-	for i := 1; i < len(emitted); i++ {
-		if gap := emitted[i] - emitted[i-1]; gap != 2 {
-			t.Fatalf("emitted at ticks %v: gap %d between #%d and #%d, want a steady 2",
-				emitted, gap, emitted[i-1], emitted[i])
-		}
-	}
-	if len(emitted) != 20 {
-		t.Fatalf("emitted %d frames over 40 ticks, want 20", len(emitted))
+	got := atomic.LoadInt64(&s.dilationBps)
+	if got != dilationBpsFull-1800 {
+		t.Fatalf("dilationBps = %d, want %d (a single +2%% recovery step)", got, dilationBpsFull-1800)
 	}
 }
 
-func TestReplicationDueAlwaysAllowsWhenDisabled(t *testing.T) {
-	if !replicationDue(0, 0, 0, int64(50*time.Millisecond)) {
-		t.Fatal("a zero interval must not gate emission (full sync path)")
+func TestTuneTimeDilationFloorsAtTenPercent(t *testing.T) {
+	s := newDilationTestServer(t)
+	atomic.StoreInt64(&s.dilationBps, minDilationBps)
+
+	s.tuneTimeDilation(200*time.Millisecond, 0, 0)
+
+	if got := atomic.LoadInt64(&s.dilationBps); got != minDilationBps {
+		t.Fatalf("dilationBps = %d, want floor %d", got, minDilationBps)
 	}
 }
 
-// Quantising replication to whole ticks can silently disable the write-pressure
-// backoff: if the controller's ceiling rounds back to the base interval, raising the
-// adaptive value changes nothing. The ceiling must buy at least one more tick.
-func TestAdaptiveBatchCeilingSurvivesQuantisation(t *testing.T) {
-	for _, tc := range []struct{ tickMs, baseMs int64 }{
-		{50, 100}, // shipped defaults: 20 Hz tick, 100 ms replication
-		{50, 50},
-		{33, 100},
-		{25, 100},
-	} {
-		tick := tc.tickMs * int64(time.Millisecond)
-		base := time.Duration(tc.baseMs) * time.Millisecond
+// No write/fanout pressure at all — only a tick that overran its own budget, EVE's
+// classic trigger — must still step dilation down.
+func TestTuneTimeDilationTriggersOnComputeOverrunAlone(t *testing.T) {
+	s := newDilationTestServer(t)
+	nominal := s.gameWorld.GetNominalTickInterval()
 
-		ceiling := adaptiveBatchCeiling(base, tick)
-		baseTicks := replicationIntervalNs(base.Nanoseconds(), tick)
-		ceilingTicks := replicationIntervalNs(ceiling.Nanoseconds(), tick)
+	s.tuneTimeDilation(0, 0, nominal+nominal/2+time.Millisecond)
 
-		if ceilingTicks <= baseTicks {
-			t.Fatalf("tick=%dms base=%dms: ceiling quantises to %dns, base to %dns — backoff is a no-op",
-				tc.tickMs, tc.baseMs, ceilingTicks, baseTicks)
-		}
-	}
-
-	if got := adaptiveBatchCeiling(100*time.Millisecond, 0); got != maxAdaptiveBatchInterval {
-		t.Fatalf("unknown tick rate must fall back to %v, got %v", maxAdaptiveBatchInterval, got)
+	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull-1000 {
+		t.Fatalf("dilationBps = %d, want %d (compute overrun alone must trigger a severe step)", got, dilationBpsFull-1000)
 	}
 }
 

@@ -2,7 +2,6 @@ export interface GameConfig {
   network: {
     tickRate: number;
     syncInterval: number;
-    batchIntervalMs: number;
   };
   movement: {
     playerSpeedPerTick: number;

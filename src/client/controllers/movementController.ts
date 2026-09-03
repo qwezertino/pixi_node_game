@@ -7,6 +7,12 @@ import { MOVEMENT } from "../../shared/gameConfig";
 
 const MAX_PENDING_INPUTS = 256;
 
+interface InputTransition {
+    sequence: number;
+    dx: number;
+    dy: number;
+}
+
 export class MovementController {
     private _isMoving = false;
     private _scale: Point;
@@ -19,10 +25,10 @@ export class MovementController {
     private _currentMovementVector = { dx: 0, dy: 0 };
 
     private _inputSequence = 0;
-    private _pendingInputs: Array<{sequence: number, dx: number, dy: number, timestamp: number}> = [];
-
-    // Флаг для отслеживания отправки стоп-команды во время атаки
-    private _attackStopSent = false;
+    private _pendingInputs: InputTransition[] = [];
+    private _lastAckSequence = 0;
+    private _hasAck = false;
+    private _suspended = false;
 
     get isMoving() {
         return this._isMoving;
@@ -43,22 +49,7 @@ export class MovementController {
      * Применить движение локально (client-side prediction)
      */
     private applyMovement(dx: number, dy: number): void {
-        const moveDistance = MOVEMENT.playerSpeedPerTick;
-
-        if (dx !== 0) {
-            this._virtualPosition.x += dx * moveDistance;
-        }
-        if (dy !== 0) {
-            this._virtualPosition.y += dy * moveDistance;
-        }
-
-        if (this._coordinateConverter) {
-            const clampedPos = this._coordinateConverter.clampToVirtualBounds(
-                this._virtualPosition.x, this._virtualPosition.y
-            );
-            this._virtualPosition.x = clampedPos.x;
-            this._virtualPosition.y = clampedPos.y;
-        }
+        this.advancePosition(this._virtualPosition, dx, dy, 1);
 
         if (this._coordinateConverter) {
             const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
@@ -67,47 +58,57 @@ export class MovementController {
         }
     }
 
+    private advancePosition(
+        position: { x: number; y: number },
+        dx: number,
+        dy: number,
+        ticks: number,
+    ): void {
+        const moveDistance = MOVEMENT.playerSpeedPerTick * ticks;
+        position.x += dx * moveDistance;
+        position.y += dy * moveDistance;
+
+        if (this._coordinateConverter) {
+            const clamped = this._coordinateConverter.clampToVirtualBounds(position.x, position.y);
+            position.x = clamped.x;
+            position.y = clamped.y;
+        }
+    }
+
     /**
      * Обработать acknowledgment от сервера (server authoritative confirmation)
      */
-    handleMovementAcknowledgment(acknowledgedPosition: {x: number, y: number}, inputSequence: number): void {
-        // Remove all inputs up to and including the acknowledged sequence
+    handleMovementAcknowledgment(
+        acknowledgedPosition: {x: number, y: number},
+        inputSequence: number,
+    ): void {
+        if (this._hasAck && !this.isSequenceNewer(inputSequence, this._lastAckSequence)) return;
+
+        const acknowledged = this._pendingInputs.find(input => input.sequence === inputSequence);
+        if (!acknowledged) return;
+
         this._pendingInputs = this._pendingInputs.filter(input =>
             this.isSequenceNewer(input.sequence, inputSequence)
         );
-        this.reconcilePosition(acknowledgedPosition, inputSequence);
+        this._lastAckSequence = inputSequence;
+        this._hasAck = true;
+        this.reconcilePosition(acknowledgedPosition);
     }
 
     /**
      * Пересчет позиции на основе server acknowledgment (server reconciliation)
      */
-    private reconcilePosition(serverPosition: {x: number, y: number}, lastAckedSequence: number): void {
+    private reconcilePosition(serverPosition: {x: number, y: number}): void {
         const reconciledTarget = {
             x: serverPosition.x,
             y: serverPosition.y,
         };
 
-        // Re-apply pending inputs that happened after the acknowledged sequence
-        const futureInputs = this._pendingInputs.filter(input =>
-            this.isSequenceNewer(input.sequence, lastAckedSequence)
-        );
-
-        if (futureInputs.length > 0) {
-            for (const input of futureInputs) {
-                const moveDistance = MOVEMENT.playerSpeedPerTick;
-                reconciledTarget.x += input.dx * moveDistance;
-                reconciledTarget.y += input.dy * moveDistance;
-
-                if (this._coordinateConverter) {
-                    const clampedPos = this._coordinateConverter.clampToVirtualBounds(
-                        reconciledTarget.x, reconciledTarget.y
-                    );
-                    reconciledTarget.x = clampedPos.x;
-                    reconciledTarget.y = clampedPos.y;
-                }
-            }
+        // The ACK position already includes the acknowledged server step. Replay
+        // exactly one predicted step for every input the server has not processed.
+        for (const input of this._pendingInputs) {
+            this.advancePosition(reconciledTarget, input.dx, input.dy, 1);
         }
-
 
         // Logical prediction is corrected exactly. In the normal path this is a
         // no-op because replaying unacknowledged inputs reproduces the current
@@ -162,6 +163,10 @@ export class MovementController {
         scale: Point,
     ) {
         this._scale = scale;
+        this.input.setLifecycleCallbacks(
+            () => this.suspendInput(),
+            () => this.resumeInput(),
+        );
     }
 
     setNetworkManager(networkManager: NetworkManager): void {
@@ -180,84 +185,65 @@ export class MovementController {
      * Основная функция обновления движения с client-side prediction
      */
     update(_deltaTime: number) {
-        // Reset attack stop flag when not attacking
-        if (this._animationController && this._animationController.playerState !== PlayerState.ATTACKING) {
-            this._attackStopSent = false;
+        if (this._suspended) return false;
+
+        const keyboardVector = this.getDesiredMovementVector();
+        const attacking = this._animationController?.playerState === PlayerState.ATTACKING;
+        const desiredVector = attacking ? { dx: 0, dy: 0 } : keyboardVector;
+        const moving = desiredVector.dx !== 0 || desiredVector.dy !== 0;
+
+        // A held vector must be reaffirmed every tick (dead-man's-switch: the server
+        // keeps integrating the last known velocity, so a broken/frozen client has to
+        // stop sending to be detected). An unchanged zero vector carries nothing new —
+        // the server already holds position, so there is nothing to reaffirm.
+        if (moving || this.vectorChanged(desiredVector)) {
+            this.queueInput(desiredVector);
         }
 
-        const desiredVector = this.getDesiredMovementVector();
+        this._isMoving = moving;
+        if (moving) this.applyMovement(desiredVector.dx, desiredVector.dy);
+        return moving;
+    }
 
-        if (desiredVector.dx !== 0 || desiredVector.dy !== 0) {
-            this._isMoving = true;
+    private vectorChanged(vector: { dx: number; dy: number }): boolean {
+        return vector.dx !== this._currentMovementVector.dx || vector.dy !== this._currentMovementVector.dy;
+    }
 
-            // Always update movement vector
-            this._currentMovementVector = desiredVector;
+    private queueInput(vector: { dx: number; dy: number }): void {
+        this._currentMovementVector = vector;
+        this._inputSequence = (this._inputSequence + 1) >>> 0;
 
-            // Check if we're attacking - if so, block ALL movement (local and server)
-            if (this._animationController && this._animationController.playerState === PlayerState.ATTACKING) {
-                // During attack, send stop command only once and don't apply any movement
-                if (!this._attackStopSent) {
-                    this._inputSequence++;
-                    this._pendingInputs.push({
-                        sequence: this._inputSequence,
-                        dx: 0,
-                        dy: 0,
-                        timestamp: Date.now()
-                    });
-
-                    if (this._pendingInputs.length > MAX_PENDING_INPUTS) {
-                        this._pendingInputs.shift();
-                    }
-
-                    this.sendMovementToServer(0, 0, this._inputSequence);
-                    this._attackStopSent = true;
-                }
-                // Block both local movement and server communication during attack
-                return true; // Still return true to indicate movement keys are pressed
-            } else {
-                // Normal movement - apply locally and send to server
-                this.applyMovement(this._currentMovementVector.dx, this._currentMovementVector.dy);
-
-                const now = Date.now();
-                this._inputSequence++;
-
-                this._pendingInputs.push({
-                    sequence: this._inputSequence,
-                    dx: desiredVector.dx,
-                    dy: desiredVector.dy,
-                    timestamp: now
-                });
-
-                if (this._pendingInputs.length > MAX_PENDING_INPUTS) {
-                    this._pendingInputs.shift();
-                }
-
-                this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
-            }
-
-            return true;
-        } else {
-            this._isMoving = false;
-
-            // Send stop command only if not during attack
-            if (this.vectorChanged(desiredVector) &&
-                !(this._animationController && this._animationController.playerState === PlayerState.ATTACKING)) {
-
-                this._currentMovementVector = desiredVector;
-                this._inputSequence++;
-
-                this._pendingInputs.push({
-                    sequence: this._inputSequence,
-                    dx: desiredVector.dx,
-                    dy: desiredVector.dy,
-                    timestamp: Date.now()
-                });
-
-                this.sendMovementToServer(desiredVector.dx, desiredVector.dy, this._inputSequence);
-            }
-
-            return false;
+        const transition: InputTransition = {
+            sequence: this._inputSequence,
+            dx: vector.dx,
+            dy: vector.dy,
+        };
+        this._pendingInputs.push(transition);
+        if (this._pendingInputs.length > MAX_PENDING_INPUTS) {
+            this._pendingInputs.shift();
         }
+        this.sendMovementToServer(
+            transition.dx,
+            transition.dy,
+            transition.sequence,
+        );
+    }
+
+    private suspendInput(): void {
+        if (this._suspended) return;
+        this._suspended = true;
+
+        if (this._currentMovementVector.dx !== 0 || this._currentMovementVector.dy !== 0) {
+            // Send STOP synchronously before requestAnimationFrame is throttled.
+            this.queueInput({ dx: 0, dy: 0 });
+        }
+        this._isMoving = false;
+    }
+
+    private resumeInput(): void {
+        if (!this._suspended) return;
+
+        this._suspended = false;
     }
 
     /**
@@ -278,11 +264,6 @@ export class MovementController {
     /**
      * Проверить, изменился ли вектор движения
      */
-    private vectorChanged(newVector: { dx: number; dy: number }): boolean {
-        return newVector.dx !== this._currentMovementVector.dx ||
-               newVector.dy !== this._currentMovementVector.dy;
-    }
-
     private isSequenceNewer(next: number, current: number): boolean {
         const delta = (next - current) >>> 0;
         return delta !== 0 && delta < 0x80000000;
@@ -309,6 +290,10 @@ export class MovementController {
         this._pendingInputs = [];
         this._currentMovementVector = { dx: 0, dy: 0 };
         this._isMoving = false;
+        this._inputSequence = 0;
+        this._lastAckSequence = 0;
+        this._hasAck = false;
+        this._suspended = document.visibilityState === "hidden";
 
         if (this._coordinateConverter) {
             const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);

@@ -16,6 +16,7 @@ for (let i = 0; i < SECONDS * 20; i++) {
     mover.move(1, 0);
     await sleep(1000 / 20);
 }
+mover.move(0, 0);
 await sleep(600);
 
 const intervals = watcher.arrivalIntervals().map((v) => Math.round(v));

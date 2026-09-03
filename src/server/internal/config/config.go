@@ -24,7 +24,6 @@ type ServerConfig struct {
 type GameConfig struct {
 	TickRate           int
 	SyncInterval       time.Duration
-	BatchInterval      time.Duration
 	PlayerSpeedPerTick int
 	AttackDuration     time.Duration
 }
@@ -73,9 +72,8 @@ type NetworkConfig struct {
 // Only game-rule values live here; server infrastructure is configured via .env.
 type JSONConfig struct {
 	Network struct {
-		TickRate        int `json:"tickRate"`
-		SyncInterval    int `json:"syncInterval"`
-		BatchIntervalMs int `json:"batchIntervalMs"`
+		TickRate     int `json:"tickRate"`
+		SyncInterval int `json:"syncInterval"`
 	} `json:"network"`
 	Movement struct {
 		PlayerSpeedPerTick int `json:"playerSpeedPerTick"`
@@ -137,7 +135,6 @@ func Load() *Config {
 		Game: GameConfig{
 			TickRate:           getEnvInt("TICK_RATE", jsonConfig.Network.TickRate),
 			SyncInterval:       time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
-			BatchInterval:      time.Duration(getEnvInt("BATCH_INTERVAL_MS", jsonConfig.Network.BatchIntervalMs)) * time.Millisecond,
 			PlayerSpeedPerTick: getEnvInt("PLAYER_SPEED", jsonConfig.Movement.PlayerSpeedPerTick),
 			AttackDuration:     time.Duration(getEnvInt("ATTACK_DURATION_MS", jsonConfig.Player.AttackDurationMs)) * time.Millisecond,
 		},
@@ -163,7 +160,7 @@ func Load() *Config {
 			IPConnBurst:                    getEnvInt("IP_CONN_BURST", 20),
 			FanoutMaxBroadcastBytesPerTick: getEnvInt("FANOUT_MAX_BROADCAST_BYTES_PER_TICK", 0),
 			VelocityReplication:            getEnvBool("VELOCITY_REPLICATION", true),
-			KeyframeDivisor:                getEnvInt("KEYFRAME_DIVISOR", 50),
+			KeyframeDivisor:                getEnvInt("KEYFRAME_DIVISOR", 100),
 			FanoutQueueShedDepth:           getEnvInt("FANOUT_QUEUE_SHED_DEPTH", 6),
 			FanoutDropStreak:               getEnvInt("FANOUT_DROP_STREAK", 120),
 			WriteBatchSize:                 getEnvInt("WRITE_BATCH_SIZE", 8),

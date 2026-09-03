@@ -1,8 +1,7 @@
 {
   "network": {
     "tickRate": 20,
-    "syncInterval": 30000,
-    "batchIntervalMs": 100
+    "syncInterval": 30000
   },
   "movement": {
     "playerSpeedPerTick": 4

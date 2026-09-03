@@ -92,9 +92,6 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     // Initialize FPS display with network manager
     const fpsDisplay = new FpsDisplay(app, networkManager);
 
-    // Connect FPS display to network manager for ping tracking
-    networkManager.setFpsDisplay(fpsDisplay);
-
     // Set up F3 key to toggle detailed stats
     input.setF3Callback(() => {
         fpsDisplay.toggleDetailedStats();
@@ -218,7 +215,7 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     });
 
     // Fixed timestep for physics updates
-    const fixedTimeStep = 1 / TICK_RATE;
+    const nominalFixedTimeStep = 1 / TICK_RATE;
     let accumulator = 0;
 
     // Game loop
@@ -227,6 +224,13 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
         const deltaTime = time.deltaTime / 60; // Convert to seconds
         // Update FPS display
         fpsDisplay.update();
+
+        // Time dilation (EVE-style TiDi): when the server slows its own tick rate
+        // under pressure, it tells every client via dilationPct on each state frame.
+        // Stretching the local fixed step by the same factor keeps prediction in
+        // lockstep instead of running ahead of a server that is deliberately slower.
+        const dilationPct = Math.max(networkManager.getDilationPct(), 1);
+        const fixedTimeStep = nominalFixedTimeStep * (100 / dilationPct);
 
         // Do not replay seconds of stale input after a suspended/background tab.
         // Client and server both advance through explicit input steps, so dropping
