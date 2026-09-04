@@ -34,21 +34,31 @@ config:
     #   name: "500 clients sustained test"
 
 
-    # # Test 2400 clients
-    - duration: 60
-      arrivalRate: 10
-      name: "Ramp to 1200 clients"
-    - duration: 60
-      arrivalRate: 10
-      name: "1200 clients sustained test"
+    # # Test 1200 clients
+    # - duration: 60
+    #   arrivalRate: 10
+    #   name: "Ramp to 1200 clients"
+    # - duration: 60
+    #   arrivalRate: 10
+    #   name: "1200 clients sustained test"
 
-    #Test 2400 clients
+    # # Test 2400 clients — softcapped after observing shared-host CPU/loopback
+    # # contention with Artillery itself pushing fanout p99 to 100+ms above ~2000
+    # # concurrent connections on a 4-core dev box. See docs/pixi_node_game_rag.md.
     # - duration: 60
     #   arrivalRate: 20
     #   name: "Ramp to 2400 clients"
     # - duration: 60
     #   arrivalRate: 20
     #   name: "2400 clients sustained test"
+
+    # Test 1700 clients (current softcap)
+    - duration: 60
+      arrivalRate: 20
+      name: "Ramp to 1700 clients"
+    - duration: 25
+      arrivalRate: 20
+      name: "1700 clients sustained test"
 
     # # Test 5000 clients
     # - duration: 180
