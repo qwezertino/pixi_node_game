@@ -11,6 +11,7 @@ import (
 
 	"github.com/gobwas/ws"
 
+	"pixi_game_server/internal/clock"
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/types"
@@ -141,12 +142,21 @@ const (
 	directWriteTimeout = 30 * time.Millisecond
 
 	// Time dilation bounds (EVE-style TiDi), in basis points: 10000 = 100% (nominal
-	// tick rate), floor at 1000 = 10%, matching EVE's own floor. Below this the
-	// simulation would be too slow to be meaningfully playable — a real overload
-	// past this point needs a different fix (fewer players, more instances), not a
-	// deeper time slowdown.
+	// tick rate). Floor raised from EVE's own 10% to 30% after a 1700-client load
+	// test floored the simulation to 2Hz for ~90s off tail-latency noise, not a
+	// true sustained overload — below this the game reads as "stopped" rather than
+	// "slow," which is worse than the alternative (staying at 30% and letting a
+	// real overload show up as sustained drops/errors instead).
 	dilationBpsFull = 10000
-	minDilationBps  = 1000
+	minDilationBps  = 3000
+
+	// Debounce: a step-down requires this many *consecutive* ticks at the given
+	// severity before it takes effect, so a single scheduler-jitter/GC-pause tick
+	// (observed alongside go_sched_latencies p99 spikes under host contention)
+	// can't ratchet dilation down on its own — only sustained pressure can.
+	// Severe trips faster since it's already 2-3x further past nominal budget.
+	dilationDebounceSevereTicks   = 2
+	dilationDebounceModerateTicks = 4
 
 	// maxWriteFailures — consecutive write failures before declaring a connection dead.
 	// With broadcastWriteTimeout=100ms: 150 failures = 15s of sustained
@@ -242,11 +252,12 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 		return true
 	}
 
+	atomic.StoreInt64(&conn.pendingStateNs, stateCreatedNs)
 	select {
 	case conn.writeCh <- writeJob{
 		frame:          frame,
 		stateCreatedNs: stateCreatedNs,
-		enqueuedNs:     time.Now().UnixNano(),
+		enqueuedNs:     clock.Now(),
 		timeout:        broadcastWriteTimeout,
 	}:
 		if atomic.LoadInt32(&conn.fanoutDrops) != 0 {
@@ -254,6 +265,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 		}
 		return true
 	default:
+		atomic.StoreInt64(&conn.pendingStateNs, 0)
 		atomic.StoreInt32(&conn.pendingBroadcast, 0)
 		frame.release()
 		metrics.BroadcastsDropped.Inc()
@@ -318,7 +330,7 @@ func (s *Server) startWriteLoop(c *Connection) {
 
 			writeBatch:
 				writeStart := time.Now()
-				writeStartNs := writeStart.UnixNano()
+				writeStartNs := clock.SinceEpoch(writeStart)
 				for i := 0; i < count; i++ {
 					if jobs[i].stateCreatedNs == 0 {
 						continue
@@ -349,14 +361,15 @@ func (s *Server) startWriteLoop(c *Connection) {
 				metrics.WSWriteBatchDuration.Observe(time.Since(writeStart).Seconds())
 				metrics.WSWriteBatchJobs.Observe(float64(count))
 
-				writeEndNs := time.Now().UnixNano()
+				writeEndNs := clock.Now()
 				for i := 0; i < count; i++ {
 					if jobs[i].stateCreatedNs == 0 {
 						continue
 					}
 					ageNs := writeEndNs - jobs[i].stateCreatedNs
 					metrics.WorldStateAgeAtWriteEnd.Observe(time.Duration(ageNs).Seconds())
-					updateAtomicMax(&s.writePressurePeakNs, ageNs)
+					atomic.StoreInt64(&c.lastWriteAgeNs, ageNs)
+					atomic.StoreInt64(&c.lastWriteObservedNs, writeEndNs)
 				}
 				fatalWriteFailure := false
 				if err != nil {
@@ -377,6 +390,7 @@ func (s *Server) startWriteLoop(c *Connection) {
 
 				for i := 0; i < count; i++ {
 					if jobs[i].frame != nil {
+						atomic.StoreInt64(&c.pendingStateNs, 0)
 						atomic.StoreInt32(&c.pendingBroadcast, 0)
 						jobs[i].frame.release()
 					}
@@ -400,15 +414,6 @@ func (s *Server) startWriteLoop(c *Connection) {
 			}
 		}
 	}()
-}
-
-func updateAtomicMax(target *int64, value int64) {
-	for {
-		current := atomic.LoadInt64(target)
-		if value <= current || atomic.CompareAndSwapInt64(target, current, value) {
-			return
-		}
-	}
 }
 
 // drainWriteCh releases all tickFrame refs currently buffered in ch and discards
@@ -705,7 +710,7 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 		atomic.StoreInt64(&s.fanoutRecipientLimit, int64(next))
 		metrics.FanoutRecipientLimit.Set(float64(next))
 
-		nowNano := time.Now().UnixNano()
+		nowNano := clock.Now()
 		prev := atomic.LoadInt64(&s.lastFanoutTuneLog)
 		if nowNano-prev >= int64(5*time.Second) &&
 			atomic.CompareAndSwapInt64(&s.lastFanoutTuneLog, prev, nowNano) {
@@ -732,11 +737,36 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 // EVE's classic trigger) and write/fanout pressure (this project's actually observed
 // bottleneck) — since either means the zone cannot sustain full-rate simulation right
 // now. Steps down fast, recovers slowly, same hysteresis shape the old batch-interval
-// controller used, floored at 10% (minDilationBps) same as EVE's own floor.
+// controller used, floored at minDilationBps.
+//
+// A step-down only takes effect after dilationDebounceSevereTicks/ModerateTicks
+// *consecutive* ticks at that severity (see the streak counters below) — a lone bad
+// tick (scheduler jitter, a GC pause, one slow syscall) no longer moves the needle;
+// only pressure that holds up over several ticks does.
 func (s *Server) tuneTimeDilation(writePressure, fanoutDur, computeDur time.Duration) {
 	nominal := s.gameWorld.GetNominalTickInterval()
 	if nominal <= 0 {
 		return
+	}
+
+	severe := writePressure > 75*time.Millisecond || fanoutDur > 30*time.Millisecond ||
+		computeDur > nominal+nominal/2
+	moderate := !severe && (writePressure > 30*time.Millisecond || fanoutDur > 15*time.Millisecond ||
+		computeDur > nominal)
+	clear := writePressure < 10*time.Millisecond && fanoutDur < 6*time.Millisecond &&
+		computeDur < nominal/2
+
+	var severeStreak, moderateStreak int64
+	switch {
+	case severe:
+		severeStreak = atomic.AddInt64(&s.dilationSevereStreak, 1)
+		atomic.StoreInt64(&s.dilationModerateStreak, 0)
+	case moderate:
+		moderateStreak = atomic.AddInt64(&s.dilationModerateStreak, 1)
+		atomic.StoreInt64(&s.dilationSevereStreak, 0)
+	default:
+		atomic.StoreInt64(&s.dilationSevereStreak, 0)
+		atomic.StoreInt64(&s.dilationModerateStreak, 0)
 	}
 
 	curr := atomic.LoadInt64(&s.dilationBps)
@@ -746,14 +776,11 @@ func (s *Server) tuneTimeDilation(writePressure, fanoutDur, computeDur time.Dura
 	next := curr
 
 	switch {
-	case writePressure > 75*time.Millisecond || fanoutDur > 30*time.Millisecond ||
-		computeDur > nominal+nominal/2:
+	case severe && severeStreak >= dilationDebounceSevereTicks:
 		next = curr - 1000 // -10%
-	case writePressure > 30*time.Millisecond || fanoutDur > 15*time.Millisecond ||
-		computeDur > nominal:
+	case moderate && moderateStreak >= dilationDebounceModerateTicks:
 		next = curr - 500 // -5%
-	case writePressure < 10*time.Millisecond && fanoutDur < 6*time.Millisecond &&
-		computeDur < nominal/2 && curr < dilationBpsFull:
+	case clear && curr < dilationBpsFull:
 		next = curr + 200 // +2%, slower than the drop — recovery should not overshoot
 	}
 
@@ -768,13 +795,18 @@ func (s *Server) tuneTimeDilation(writePressure, fanoutDur, computeDur time.Dura
 		return
 	}
 	atomic.StoreInt64(&s.dilationBps, next)
+	if next < curr {
+		metrics.TimeDilationChanges.WithLabelValues("down").Inc()
+	} else {
+		metrics.TimeDilationChanges.WithLabelValues("up").Inc()
+	}
 	metrics.TimeDilationPercent.Set(float64(next) / 100)
 
 	newInterval := time.Duration(int64(nominal) * dilationBpsFull / next)
 	s.gameWorld.SetTickInterval(newInterval)
 	metrics.TickIntervalMs.Set(float64(newInterval.Milliseconds()))
 
-	nowNano := time.Now().UnixNano()
+	nowNano := clock.Now()
 	prev := atomic.LoadInt64(&s.lastDilationLog)
 	if nowNano-prev >= int64(5*time.Second) &&
 		atomic.CompareAndSwapInt64(&s.lastDilationLog, prev, nowNano) {
@@ -834,7 +866,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	hasState := shouldEmitFrame(fullSync, len(changed), s.cfg.Net.VelocityReplication)
 
 	t1 := time.Now()
-	sentAtNs := t1.UnixNano()
+	sentAtNs := clock.SinceEpoch(t1)
 	// Snapshot connections under RLock, then release the lock before fanout.
 	// This avoids holding the map lock while enqueueing O(N) jobs.
 	s.connectionsMu.RLock()
@@ -961,6 +993,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	if recipientPtr != nil {
 		releaseRecipientSlice(recipients, recipientPtr)
 	}
+	pressure := populationWritePressure(conns, clock.Now())
 	releaseConnSlice(conns, buf)
 
 	fanoutDur := time.Since(t1)
@@ -968,11 +1001,10 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.TickFanoutDuration.Observe(fanoutDur.Seconds())
 	s.tuneRecipientLimit(n, m, overdue, dropped, fanoutDur)
 
-	pressure := time.Duration(atomic.SwapInt64(&s.writePressurePeakNs, 0))
 	s.tuneTimeDilation(pressure, fanoutDur, s.gameWorld.GetTickDuration())
 
 	if fanoutDur > 20*time.Millisecond {
-		nowNano := time.Now().UnixNano()
+		nowNano := clock.Now()
 		prev := atomic.LoadInt64(&s.lastSlowFanoutLog)
 		if nowNano-prev >= int64(5*time.Second) &&
 			atomic.CompareAndSwapInt64(&s.lastSlowFanoutLog, prev, nowNano) {
@@ -1022,7 +1054,7 @@ func (s *Server) sendInitialState(conn *Connection) {
 	// corrected by the next record or keyframe for that player.
 	worldTick := s.gameWorld.GetTickCount()
 	f.data = s.protocol.AppendGameState(f.data, allPlayers, seq, worldTick, s.currentDilationBps()) // zero-alloc into pool buf
-	frame := wsFrameSlice(f.data)                                           // zero-alloc sub-slice
+	frame := wsFrameSlice(f.data)                                                                   // zero-alloc sub-slice
 
 	// Copy frame bytes before returning pool buffer: write loop reads them later.
 	frameBytes := make([]byte, len(frame))
@@ -1034,7 +1066,7 @@ func (s *Server) sendInitialState(conn *Connection) {
 
 	select {
 	case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
-		atomic.StoreInt64(&conn.lastWorldStateSentNs, time.Now().UnixNano())
+		atomic.StoreInt64(&conn.lastWorldStateSentNs, clock.Now())
 	default:
 		metrics.BroadcastsDropped.Inc()
 	}
@@ -1130,7 +1162,7 @@ func (s *Server) runPingLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			cutoff := time.Now().Add(-90 * time.Second).UnixNano()
+			cutoff := clock.Now() - int64(90*time.Second)
 			s.connectionsMu.RLock()
 			for _, conn := range s.connections {
 				if atomic.LoadInt64(&conn.lastActivity) < cutoff {

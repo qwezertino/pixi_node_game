@@ -9,6 +9,7 @@ CLIENT_BUILD_DIR=dist
 SERVER_BINARY=server
 SERVER_OUTPUT_DIR=$(CLIENT_BUILD_DIR)
 COMPOSE=docker compose -f docker/docker-compose.yml --project-name pixi_game --env-file .env
+ARTILLERY ?= ./node_modules/.bin/artillery
 
 # Install dependencies for both client and server
 install:
@@ -139,7 +140,21 @@ docker-ps:
 # Run server load tests (локально, artillery должен быть установлен)
 load-test:
 	@echo "⚡ Running server load tests..."
-	artillery run utils/testing/artillery/artillery-config.yml
+	@mkdir -p logs
+	$(ARTILLERY) run --output logs/artillery-$$(date -u +%Y%m%dT%H%M%SZ).json utils/testing/artillery/artillery-config.yml
+
+.PHONY: load-test-latency
+load-test-latency:
+	@mkdir -p logs
+	$(ARTILLERY) run --output logs/artillery-latency-$$(date -u +%Y%m%dT%H%M%SZ).json utils/testing/artillery/latency-config.yml
+
+# Run server load tests from Windows (host), so Artillery never shares WSL2's
+# CPU/RAM budget with the server + monitoring stack it's testing against.
+# Requires: artillery installed on Windows (npm i -g artillery / bun install -g artillery),
+# server + monitoring already running in WSL/Docker (make docker-up).
+load-test-win:
+	@echo "⚡ Running server load tests from Windows..."
+	powershell.exe -NoProfile -Command "Set-Location '$$(wslpath -w $(CURDIR)/utils/testing/artillery)'; artillery run artillery-config.yml"
 
 # End-to-end protocol probes: builds the server, bundles the real client decoder,
 # runs every probe against a fresh server. Pass PROBE=<name> to run just one.
@@ -166,6 +181,7 @@ help:
 	@echo "  run             - Run production build"
 	@echo "  clean           - Clean build artifacts"
 	@echo "  load-test       - Run server load tests with Artillery"
+	@echo "  load-test-win   - Run Artillery from Windows host (avoids WSL2 CPU/RAM contention)"
 	@echo "  protocol-test   - Run end-to-end protocol probes (PROBE=<name> for one)"
 	@echo "  protocol-ab     - A/B velocity replication (CLIENTS=, TURNS=, SECONDS=)"
 	@echo "  deps            - Install dependencies"

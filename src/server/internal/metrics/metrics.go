@@ -3,6 +3,8 @@ package metrics
 import (
 	"regexp"
 
+	"pixi_game_server/internal/clock"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -21,6 +23,23 @@ func init() {
 }
 
 var (
+	WallClockOffset = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "game_wall_clock_offset_seconds",
+		Help: "Wall-clock drift/corrections relative to monotonic elapsed time since process start",
+	}, func() float64 { return clock.WallOffset().Seconds() })
+	TimeDilationChanges = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "game_time_dilation_changes_total",
+		Help: "Simulation speed changes, including transitions shorter than a scrape interval",
+	}, []string{"direction"})
+	WritePressureFraction = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "game_write_pressure_fraction",
+		Help: "Fraction of connected recipients with recent or in-flight state age above threshold",
+	}, []string{"threshold"})
+	TickStartDelay = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "game_tick_start_delay_seconds",
+		Help:    "Monotonic delay between scheduled tick and game-loop execution",
+		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 20),
+	})
 	// ── Players ──────────────────────────────────────────────────────────────
 	PlayersConnected = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_players_connected",

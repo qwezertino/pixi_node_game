@@ -1,3 +1,5 @@
+const { performance } = require('node:perf_hooks');
+const { attachLatencyProbe } = require('./latency-probe.cjs');
 // Bandwidth control: set MOVE_SEND_RATE=0.1 to send only 10% of moves.
 // Useful for local → VPS testing to avoid saturating your own upload channel.
 // Default 1.0 = send everything (for VPS → VPS load testing).
@@ -85,12 +87,14 @@ module.exports = {
     context.vars.direction = 1;
     context.vars.attacking = false;
     context.vars.lastAttackTime = 0;
-    context.vars.sessionStart = Date.now();
+    context.vars.sessionStart = performance.now();
     context.vars.messagesSent = 0;
     context.vars.errors = 0;
 
     // Performance tracking
-    context.vars.latencies = [];
+    context.vars.latencyProbe = attachLatencyProbe(context.ws, events, {
+      resync: process.env.PROBE_RESYNC !== '0',
+    });
 
     return done();
   },
@@ -99,7 +103,7 @@ module.exports = {
   generateAndSendMovement: function(context, events, done) {
     // Don't send movement if recently attacked
     let movement;
-    if (context.vars.attacking && Date.now() - context.vars.lastAttackTime < 500) {
+    if (context.vars.attacking && performance.now() - context.vars.lastAttackTime < 500) {
       movement = { dx: 0, dy: 0 };
     } else {
       // Generate realistic movement patterns
@@ -136,6 +140,7 @@ module.exports = {
     context.vars.lastMovement = movement;
     const binaryMessage = encodeMove(movement, context.vars.inputSequence++);
     if (context.ws && context.ws.readyState === 1) { // WebSocket.OPEN
+      context.vars.latencyProbe.trackMove(context.vars.inputSequence - 1);
       context.ws.send(binaryMessage);
       context.vars.messagesSent++;
     }
@@ -165,7 +170,7 @@ module.exports = {
 
   // Maybe attack and send directly
   maybeAttackAndSend: function(context, events, done) {
-    const now = Date.now();
+    const now = performance.now();
 
     // Attack cooldown of 2 seconds minimum
     if (context.vars.attacking || (now - context.vars.lastAttackTime) < 2000) {
@@ -205,7 +210,7 @@ module.exports = {
     }
 
     // End attack after 200-500ms
-    const attackDuration = Date.now() - context.vars.lastAttackTime;
+    const attackDuration = performance.now() - context.vars.lastAttackTime;
     if (attackDuration < 200) {
       return done(); // Skip sending
     }
@@ -225,7 +230,7 @@ module.exports = {
 
   // Log performance metrics on disconnect
   logDisconnect: function(context, events, done) {
-    const sessionDuration = Date.now() - context.vars.sessionStart;
+    const sessionDuration = performance.now() - context.vars.sessionStart;
     const messagesPerSecond = sessionDuration > 0 ? context.vars.messagesSent / (sessionDuration / 1000) : 0;
 
     events.emit('counter', 'game.session.completed', 1);
@@ -239,89 +244,4 @@ module.exports = {
     return done();
   },
 
-  // Enhanced metrics tracking
-  beforeScenario: function(context, events) {
-    context.vars.scenarioStart = Date.now();
-    context.vars.totalMoves = 0;
-    context.vars.totalAttacks = 0;
-    context.vars.totalDirections = 0;
-    context.vars.connectionErrors = 0;
-    context.vars.messageErrors = 0;
-  },
-
-  afterScenario: function(context, events) {
-    const scenarioDuration = Date.now() - context.vars.scenarioStart;
-    const durationSeconds = scenarioDuration / 1000;
-
-    // Emit comprehensive metrics
-    events.emit('counter', 'game.moves.total', context.vars.totalMoves);
-    events.emit('counter', 'game.attacks.total', context.vars.totalAttacks);
-    events.emit('counter', 'game.directions.total', context.vars.totalDirections);
-    events.emit('counter', 'game.errors.connection', context.vars.connectionErrors);
-    events.emit('counter', 'game.errors.message', context.vars.messageErrors);
-
-    if (durationSeconds > 0) {
-      events.emit('rate', 'game.actions.per_second',
-        (context.vars.totalMoves + context.vars.totalAttacks + context.vars.totalDirections) / durationSeconds);
-    }
-
-    // Server performance indicators
-    events.emit('histogram', 'game.scenario.duration_ms', scenarioDuration);
-  },
-
-  // Track message sending with error handling
-  beforeRequest: function(requestParams, context, events) {
-    if (requestParams.data) {
-      try {
-        const message = JSON.parse(requestParams.data);
-        const now = Date.now();
-
-        // Track message types
-        switch(message.type) {
-          case 'move':
-            context.vars.totalMoves++;
-            break;
-          case 'attack':
-            context.vars.totalAttacks++;
-            break;
-          case 'direction':
-            context.vars.totalDirections++;
-            break;
-        }
-
-        // Track message frequency for server load analysis
-        if (context.vars.lastMessageTime) {
-          const interval = now - context.vars.lastMessageTime;
-          events.emit('histogram', 'game.message.interval_ms', interval);
-        }
-        context.vars.lastMessageTime = now;
-
-        // Add latency tracking
-        requestParams.startTime = now;
-
-      } catch (error) {
-        context.vars.messageErrors++;
-        events.emit('counter', 'game.errors.parse', 1);
-      }
-    }
-  },
-
-  afterResponse: function(requestParams, response, context, events) {
-    if (requestParams.startTime) {
-      const latency = Date.now() - requestParams.startTime;
-      events.emit('histogram', 'game.message.latency_ms', latency);
-
-      // Track high latency events
-      if (latency > 100) {
-        events.emit('counter', 'game.latency.high', 1);
-      }
-    }
-  },
-
-  // WebSocket error handling
-  onError: function(error, context, events) {
-    context.vars.connectionErrors++;
-    events.emit('counter', 'game.errors.websocket', 1);
-    console.error('WebSocket error:', error.message);
-  }
 };

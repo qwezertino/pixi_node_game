@@ -16,6 +16,7 @@ import (
 	"github.com/gobwas/ws"
 	"golang.org/x/sys/unix"
 
+	"pixi_game_server/internal/clock"
 	"pixi_game_server/internal/metrics"
 )
 
@@ -248,7 +249,7 @@ func (ep *epollPoller) processRead(c *Connection) {
 	ws.Cipher(payload, hdr.Mask, 0)
 
 	// Update liveness timestamp.
-	atomic.StoreInt64(&c.lastActivity, time.Now().UnixNano())
+	atomic.StoreInt64(&c.lastActivity, clock.Now())
 
 	switch hdr.OpCode {
 	case ws.OpClose:

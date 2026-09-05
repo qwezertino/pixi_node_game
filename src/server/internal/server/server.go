@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 
+	"pixi_game_server/internal/clock"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/game"
 	"pixi_game_server/internal/metrics"
@@ -44,18 +45,19 @@ type Server struct {
 	httpServer *http.Server
 
 	// Throttled diagnostics
-	lastSlowFanoutLog  int64 // atomic UnixNano timestamp
-	lastDilationLog    int64 // atomic UnixNano timestamp
-	lastFrameRejectLog int64 // atomic UnixNano timestamp
+	lastSlowFanoutLog  int64 // atomic monotonic timestamp
+	lastDilationLog    int64 // atomic monotonic timestamp
+	lastFrameRejectLog int64 // atomic monotonic timestamp
 
 	// Time dilation (EVE-style TiDi): replaces the old silent replication-interval
 	// backoff. dilationBps is basis points, 10000 = 100% (nominal), floor at
 	// minDilationBps. When it changes, GameWorld's tick ticker itself is slowed via
 	// SetTickInterval — see world.go — so replication cadence follows the simulation
 	// rate automatically instead of being paced separately.
-	dilationBps         int64 // atomic
-	worldStateSeq       uint32
-	writePressurePeakNs int64 // atomic max queue+write latency observed since last fanout tune
+	dilationBps            int64 // atomic
+	dilationSevereStreak   int64 // atomic consecutive-tick counter, debounces step-downs against single-tick jitter
+	dilationModerateStreak int64 // atomic
+	worldStateSeq          uint32
 
 	// Fanout/write controls
 	fanoutDropLimit                int32
@@ -80,7 +82,7 @@ type Server struct {
 	activeStalenessNs    int64
 	idleStalenessNs      int64
 	activeWindowNs       int64
-	lastFanoutTuneLog    int64 // atomic UnixNano timestamp
+	lastFanoutTuneLog    int64 // atomic monotonic timestamp
 
 	// Performance monitoring
 	startTime time.Time
@@ -101,16 +103,19 @@ type Connection struct {
 	rateLimiter          *rate.Limiter
 	writeCh              chan writeJob // buffered channel drained by startWriteLoop goroutine
 	closeOnce            sync.Once     // ensures cleanupConnection body runs once
-	lastActivity         int64         // UnixNano, updated on each received frame (atomic)
+	lastActivity         int64         // monotonic ns, updated on each received frame (atomic)
 	writeFailures        int32         // consecutive write timeouts/errors (atomic); reset on success
 	fanoutDrops          int32         // consecutive dropped broadcast enqueues (atomic)
 	fanoutFairDebt       int32         // anti-starvation debt for recipient selection fairness (atomic)
 	fanoutDebtEpoch      uint32        // marks whether conn was selected in the current fairness epoch
+	pendingStateNs       int64         // monotonic creation time of queued/in-flight world state (atomic)
+	lastWriteAgeNs       int64         // completed world-state age (atomic)
+	lastWriteObservedNs  int64         // monotonic time of age observation (atomic)
 	pendingBroadcast     int32         // 0/1: whether a world-state broadcast job is already queued/in-flight
 	lastMovementAckSeq   uint32        // latest authoritative input sequence queued to the writer
 	staleInputStreak     int32         // consecutive movement inputs rejected as duplicate/out-of-order
-	lastWorldStateSentNs int64         // UnixNano timestamp of last successfully written world-state frame
-	criticalUntilNs      int64         // UnixNano until which this client receives criticality boost
+	lastWorldStateSentNs int64         // monotonic timestamp of last successfully written world-state frame
+	criticalUntilNs      int64         // monotonic ns until which this client receives criticality boost
 	ctx                  context.Context
 	cancel               context.CancelFunc
 }
@@ -366,7 +371,7 @@ func clientHeaderRejectReason(h ws.Header) string {
 // server. Without it a single misbehaving client would flood the log, and without
 // any logging at all a protocol-level disconnect is undiagnosable in production.
 func (s *Server) logRejectedFrame(c *Connection, hdr ws.Header) {
-	now := time.Now().UnixNano()
+	now := clock.Now()
 	last := atomic.LoadInt64(&s.lastFrameRejectLog)
 	if now-last < int64(time.Second) {
 		return
@@ -460,8 +465,8 @@ func (s *Server) createConnection(player *types.Player, rawConn net.Conn) *Conne
 			rate.Limit(s.cfg.Net.MessageRateLimit),
 			s.cfg.Net.BurstLimit,
 		),
-		lastActivity:         time.Now().UnixNano(),
-		lastWorldStateSentNs: time.Now().UnixNano(),
+		lastActivity:         clock.Now(),
+		lastWorldStateSentNs: clock.Now(),
 		ctx:                  ctx,
 		cancel:               cancel,
 	}
@@ -550,7 +555,7 @@ func (s *Server) markConnectionCritical(conn *Connection) {
 	if s.fanoutCriticalWindowNs <= 0 {
 		return
 	}
-	nowNs := time.Now().UnixNano()
+	nowNs := clock.Now()
 	untilNs := nowNs + s.fanoutCriticalWindowNs
 	for {
 		curr := atomic.LoadInt64(&conn.criticalUntilNs)

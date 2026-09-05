@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"pixi_game_server/internal/clock"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/systems"
@@ -112,8 +113,8 @@ type GameWorld struct {
 	deltaWindowBroadcasts    int64
 
 	// Throttled diagnostics
-	lastSlowTickLog       int64 // atomic UnixNano timestamp
-	lastDeltaCompositeLog int64 // atomic UnixNano timestamp
+	lastSlowTickLog       int64 // atomic monotonic timestamp
+	lastDeltaCompositeLog int64 // atomic monotonic timestamp
 }
 
 // NewGameWorld создает новый игровой мир
@@ -137,7 +138,7 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 		lastFullSync: time.Now(),
 		// Start the window now so the first composition log covers a real interval
 		// rather than the single broadcast that happens to be first.
-		lastDeltaCompositeLog: time.Now().UnixNano(),
+		lastDeltaCompositeLog: clock.Now(),
 		prevStates:            make(map[uint32]types.PlayerState, initialCap),
 		scratchStates:         make([]types.PlayerState, 0, initialCap),
 		scratchChanged:        make([]types.PlayerState, 0, changedCap),
@@ -204,7 +205,7 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 	player.SetY(spawnY)
 	player.SetFacingRight(true)
 	player.SetState(0) // idle state
-	player.SetLastUpdate(time.Now().UnixNano())
+	player.SetLastUpdate(clock.Now())
 
 	gw.playersMu.Lock()
 	gw.playersMap[playerID] = player
@@ -296,8 +297,9 @@ func (gw *GameWorld) gameLoop() {
 
 	for {
 		select {
-		case <-ticker.C:
+		case scheduled := <-ticker.C:
 			start := time.Now()
+			metrics.TickStartDelay.Observe(start.Sub(scheduled).Seconds())
 			gw.tick()
 			duration := time.Since(start)
 			atomic.StoreInt64(&gw.tickDuration, duration.Nanoseconds())
@@ -306,7 +308,7 @@ func (gw *GameWorld) gameLoop() {
 
 			budget := gw.GetTickInterval()
 			if duration > budget {
-				nowNano := time.Now().UnixNano()
+				nowNano := clock.Now()
 				prev := atomic.LoadInt64(&gw.lastSlowTickLog)
 				if nowNano-prev >= int64(5*time.Second) &&
 					atomic.CompareAndSwapInt64(&gw.lastSlowTickLog, prev, nowNano) {
@@ -402,7 +404,7 @@ func (gw *GameWorld) tick() {
 	gw.scratchChanged = gw.scratchChanged[:0]
 	clear(gw.scratchSeenIDs)
 
-	nowNano := time.Now().UnixNano()
+	nowNano := clock.Now()
 
 	worldTick := atomic.AddUint32(&gw.tickCount, 1)
 	// Full sync is controlled by configured SyncInterval (usually tens of seconds),
@@ -411,7 +413,7 @@ func (gw *GameWorld) tick() {
 	fullSync := lastSync == 0 || time.Duration(nowNano-lastSync) >= gw.cfg.Game.SyncInterval
 	if fullSync {
 		atomic.StoreInt64(&gw.lastSyncTime, nowNano)
-		gw.lastFullSync = time.Unix(0, nowNano)
+		gw.lastFullSync = time.Now()
 	}
 
 	t0 := time.Now()
@@ -640,7 +642,7 @@ func (gw *GameWorld) reportDeltaComposition() {
 	gw.deltaWindowKeyframes += int64(gw.deltaKeyframes)
 	gw.deltaWindowBroadcasts++
 
-	nowNano := time.Now().UnixNano()
+	nowNano := clock.Now()
 	prev := atomic.LoadInt64(&gw.lastDeltaCompositeLog)
 	if nowNano-prev < int64(30*time.Second) ||
 		!atomic.CompareAndSwapInt64(&gw.lastDeltaCompositeLog, prev, nowNano) {

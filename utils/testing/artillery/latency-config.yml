@@ -1,0 +1,25 @@
+config:
+  target: 'ws://localhost:8108/ws'
+  processor: './artillery-processor.cjs'
+  phases:
+    - duration: 120
+      arrivalRate: 10
+      name: 'Ramp: 1200 clients at 10/s'
+  ws:
+    timeout: 30
+
+scenarios:
+  - name: 'Movement, application RTT, ACK and state freshness'
+    engine: ws
+    flow:
+      - function: initializeClient
+      # Each session lasts at least 180s: after a 120s ramp, all 1200
+      # connections overlap for about 60s before the gradual disconnect.
+      - loop:
+          - function: generateAndSendMovement
+          - function: maybeChangeAndSendDirection
+          - function: maybeAttackEndAndSend
+          - function: maybeAttackAndSend
+          - think: 0.5
+        count: 360
+      - function: logDisconnect

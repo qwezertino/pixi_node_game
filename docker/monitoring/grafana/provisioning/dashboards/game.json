@@ -208,14 +208,25 @@
     },
     {
       "id": 20,
-      "title": "Adaptive Batch Interval",
-      "description": "Текущий адаптивный batch interval для throttle fanout под всплесками.",
+      "title": "Simulation Tick Interval",
+      "description": "Текущий период симуляции с учётом TiDi; короткие переходы видны в отдельном счётчике.",
       "type": "timeseries",
-      "gridPos": { "x": 18, "y": 25, "w": 6, "h": 5 },
-      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "gridPos": {
+        "x": 18,
+        "y": 25,
+        "w": 6,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
       "targets": [
-        { "expr": "game_adaptive_batch_interval_ms", "legendFormat": "current" },
-        { "expr": "game:adaptive_batch_interval_ms:last_1m", "legendFormat": "1m max" }
+        {
+          "expr": "game_tick_interval_ms",
+          "legendFormat": "Tick interval"
+        }
       ]
     },
     {
@@ -233,12 +244,153 @@
     {
       "id": 22,
       "title": "Delta Ratio",
-      "description": "Доля игроков с изменением стейта (0.0–1.0). 1.0 при fullSync (каждую секунду) или когда все двигаются. Низкое значение = delta frames эффективны.",
+      "description": "Доля игроков с изменениями состояния; full sync временно повышает значение.",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 30, "w": 12, "h": 5 },
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 12,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
       "targets": [
-        { "expr": "game_delta_ratio", "legendFormat": "Delta ratio" }
+        {
+          "expr": "game_delta_ratio",
+          "legendFormat": "Delta ratio"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "World State Delivery p99",
+      "description": "Монотонные серверные интервалы; возраст кадра не включает RTT и рендер браузера.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 12,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(game_world_state_queue_delay_seconds_bucket[1m]))",
+          "legendFormat": "Queue"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(game_world_state_age_at_write_end_seconds_bucket[1m]))",
+          "legendFormat": "Age at write completion"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(game_ws_write_batch_seconds_bucket[1m]))",
+          "legendFormat": "Socket write"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "Tick Start Delay p99",
+      "description": "Опоздание game loop относительно запланированного тика, включая ожидание исполнения.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 12,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(game_tick_start_delay_seconds_bucket[1m]))",
+          "legendFormat": "Scheduled → started"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "Time Dilation Changes",
+      "description": "Все переключения, включая короткие, скрытые между scrape.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(game_time_dilation_changes_total[1m])",
+          "legendFormat": "{{direction}} / minute"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "Slow Recipient Fraction",
+      "description": "Доля соединений с недавней или незавершённой медленной записью; global TiDi требует не менее 10% и двух соединений.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "expr": "game_write_pressure_fraction",
+          "legendFormat": "Age > {{threshold}}"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "title": "Wall Clock Correction",
+      "description": "Wall-clock offset relative to monotonic time; a jump can distort wall-based historical rates.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 12,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "game_wall_clock_offset_seconds",
+          "legendFormat": "Wall minus monotonic"
+        }
       ]
     }
   ]

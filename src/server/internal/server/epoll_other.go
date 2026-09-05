@@ -10,6 +10,7 @@ import (
 
 	"github.com/gobwas/ws"
 
+	"pixi_game_server/internal/clock"
 	"pixi_game_server/internal/metrics"
 )
 
@@ -65,7 +66,7 @@ func (g *goroutineReadHandler) readLoop(svr *Server, c *Connection) {
 		}
 		ws.Cipher(payload, hdr.Mask, 0)
 
-		atomic.StoreInt64(&c.lastActivity, time.Now().UnixNano())
+		atomic.StoreInt64(&c.lastActivity, clock.Now())
 
 		switch hdr.OpCode {
 		case ws.OpClose:

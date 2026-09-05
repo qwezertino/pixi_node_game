@@ -83,16 +83,6 @@ func TestSelectRecipientsFastPathDoesNotBorrowSlice(t *testing.T) {
 	}
 }
 
-func TestUpdateAtomicMax(t *testing.T) {
-	var value int64
-	updateAtomicMax(&value, 20)
-	updateAtomicMax(&value, 10)
-	updateAtomicMax(&value, 30)
-	if got := atomic.LoadInt64(&value); got != 30 {
-		t.Fatalf("max = %d, want 30", got)
-	}
-}
-
 func TestValidClientHeader(t *testing.T) {
 	valid := ws.Header{Masked: true, Fin: true, OpCode: ws.OpBinary, Length: 6}
 	if !validClientHeader(valid) {
@@ -159,6 +149,15 @@ func newDilationTestServer(t *testing.T) *Server {
 func TestTuneTimeDilationStepsDownUnderPressure(t *testing.T) {
 	s := newDilationTestServer(t)
 
+	// A single severe tick must NOT move the needle — debounce requires
+	// dilationDebounceSevereTicks consecutive ticks before a step-down lands.
+	for i := 0; i < dilationDebounceSevereTicks-1; i++ {
+		s.tuneTimeDilation(100*time.Millisecond, 0, 0)
+	}
+	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull {
+		t.Fatalf("dilationBps = %d, want unchanged %d before debounce threshold", got, dilationBpsFull)
+	}
+
 	s.tuneTimeDilation(100*time.Millisecond, 0, 0)
 
 	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull-1000 {
@@ -169,6 +168,27 @@ func TestTuneTimeDilationStepsDownUnderPressure(t *testing.T) {
 	nominal := s.gameWorld.GetNominalTickInterval()
 	if got := s.gameWorld.GetTickInterval(); got <= nominal {
 		t.Fatalf("tick interval = %v, want > nominal %v under severe pressure", got, nominal)
+	}
+}
+
+func TestTuneTimeDilationDebounceResetsOnClearTick(t *testing.T) {
+	s := newDilationTestServer(t)
+
+	// One severe tick short of the debounce threshold...
+	for i := 0; i < dilationDebounceSevereTicks-1; i++ {
+		s.tuneTimeDilation(100*time.Millisecond, 0, 0)
+	}
+	// ...then a clear tick must reset the streak, not merely pause it.
+	s.tuneTimeDilation(0, 0, 0)
+	if got := atomic.LoadInt64(&s.dilationSevereStreak); got != 0 {
+		t.Fatalf("severe streak = %d, want reset to 0 after a clear tick", got)
+	}
+
+	for i := 0; i < dilationDebounceSevereTicks-1; i++ {
+		s.tuneTimeDilation(100*time.Millisecond, 0, 0)
+	}
+	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull {
+		t.Fatalf("dilationBps = %d, want unchanged %d — streak must have restarted from zero", got, dilationBpsFull)
 	}
 }
 
@@ -185,11 +205,13 @@ func TestTuneTimeDilationRecoversSlowlyWhenClear(t *testing.T) {
 	}
 }
 
-func TestTuneTimeDilationFloorsAtTenPercent(t *testing.T) {
+func TestTuneTimeDilationFloorsAtFloor(t *testing.T) {
 	s := newDilationTestServer(t)
 	atomic.StoreInt64(&s.dilationBps, minDilationBps)
 
-	s.tuneTimeDilation(200*time.Millisecond, 0, 0)
+	for i := 0; i < dilationDebounceSevereTicks; i++ {
+		s.tuneTimeDilation(200*time.Millisecond, 0, 0)
+	}
 
 	if got := atomic.LoadInt64(&s.dilationBps); got != minDilationBps {
 		t.Fatalf("dilationBps = %d, want floor %d", got, minDilationBps)
@@ -197,15 +219,36 @@ func TestTuneTimeDilationFloorsAtTenPercent(t *testing.T) {
 }
 
 // No write/fanout pressure at all — only a tick that overran its own budget, EVE's
-// classic trigger — must still step dilation down.
+// classic trigger — must still step dilation down once the debounce threshold is met.
 func TestTuneTimeDilationTriggersOnComputeOverrunAlone(t *testing.T) {
 	s := newDilationTestServer(t)
 	nominal := s.gameWorld.GetNominalTickInterval()
 
-	s.tuneTimeDilation(0, 0, nominal+nominal/2+time.Millisecond)
+	for i := 0; i < dilationDebounceSevereTicks; i++ {
+		s.tuneTimeDilation(0, 0, nominal+nominal/2+time.Millisecond)
+	}
 
 	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull-1000 {
 		t.Fatalf("dilationBps = %d, want %d (compute overrun alone must trigger a severe step)", got, dilationBpsFull-1000)
+	}
+}
+
+// A moderate-severity pressure signal must debounce independently of severe: a burst
+// of moderate ticks alone should not trip the (unrelated) severe streak counter.
+func TestTuneTimeDilationModerateDebounceIsIndependentOfSevere(t *testing.T) {
+	s := newDilationTestServer(t)
+
+	for i := 0; i < dilationDebounceModerateTicks-1; i++ {
+		s.tuneTimeDilation(40*time.Millisecond, 0, 0)
+	}
+	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull {
+		t.Fatalf("dilationBps = %d, want unchanged %d before moderate debounce threshold", got, dilationBpsFull)
+	}
+
+	s.tuneTimeDilation(40*time.Millisecond, 0, 0)
+
+	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull-500 {
+		t.Fatalf("dilationBps = %d, want %d (one moderate step down)", got, dilationBpsFull-500)
 	}
 }
 
