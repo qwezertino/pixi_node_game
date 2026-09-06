@@ -4,7 +4,7 @@
     "syncInterval": 30000
   },
   "movement": {
-    "playerSpeedPerTick": 4
+    "unitsPerMeter": 10
   },
   "world": {
     "virtualSize": {
@@ -25,9 +25,7 @@
     }
   },
   "player": {
-    "baseScale": 2,
-    "animationSpeed": 0.1,
-    "attackDurationMs": 1000
+    "baseScale": 2
   },
   "game": {
     "debugMode": false

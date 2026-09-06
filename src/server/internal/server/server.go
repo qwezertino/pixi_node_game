@@ -422,8 +422,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create player and connection
-	player := s.gameWorld.AddPlayer()
+	// Create player and connection. The requested unit type (?unit=spearman) is
+	// validated against the registry server-side (units.Get falls back to
+	// units.DefaultUnitType for an empty/unrecognized value) — there is no
+	// dedicated JOIN payload in this protocol, so the WS upgrade URL is the only
+	// pre-connection channel available.
+	requestedUnitType := r.URL.Query().Get("unit")
+	player := s.gameWorld.AddPlayer(requestedUnitType)
 	connection := s.createConnection(player, rawConn)
 
 	// Explicit identity must precede all state/event messages for this connection.
@@ -434,6 +439,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// receives. If we add to the map first, a world tick can race here and
 	// enqueue a delta/gamestate frame ahead of the initial state.
 	s.sendInitialState(connection)
+	s.sendUnitRoster(connection)
 
 	s.connectionsMu.Lock()
 	s.connections[player.ID] = connection
@@ -494,6 +500,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			clientMsg.MovementVector.DX,
 			clientMsg.MovementVector.DY,
 			clientMsg.InputSequence,
+			clientMsg.Sprint,
 		)
 		switch result {
 		case types.InputAccepted:
@@ -523,9 +530,9 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		metrics.MessagesReceived.WithLabelValues("direction").Inc()
 		s.markConnectionCritical(connection)
 		s.gameWorld.ProcessEvent(types.GameEvent{
-			PlayerID:    connection.player.ID,
-			Type:        types.EventFace,
-			FacingRight: clientMsg.Direction,
+			PlayerID:  connection.player.ID,
+			Type:      types.EventFace,
+			Direction: clientMsg.Direction,
 		})
 		// Обновление направления разошлётся через tick broadcast.
 
@@ -537,6 +544,17 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 
 	case protocol.MessageAttackEnd:
 		// Ignored: server is authoritative on attack duration.
+
+	case protocol.MessageBlockStart:
+		metrics.MessagesReceived.WithLabelValues("block_start").Inc()
+		s.markConnectionCritical(connection)
+		s.gameWorld.TryBlockStart(connection.player.ID)
+		// State=2 будет разослан всем через tick broadcast.
+
+	case protocol.MessageBlockEnd:
+		metrics.MessagesReceived.WithLabelValues("block_end").Inc()
+		s.markConnectionCritical(connection)
+		s.gameWorld.EndBlock(connection.player.ID)
 
 	case protocol.MessageViewportUpdate:
 		// Silently accepted — viewport-based culling not yet implemented.

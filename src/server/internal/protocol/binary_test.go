@@ -9,9 +9,9 @@ import (
 
 func TestEncodeWelcome(t *testing.T) {
 	bp := &BinaryProtocol{}
-	got := bp.EncodeWelcome(0x12345678, 20)
-	if len(got) != 8 {
-		t.Fatalf("welcome length = %d, want 8", len(got))
+	got := bp.EncodeWelcome(0x12345678, 20, 3)
+	if len(got) != 9 {
+		t.Fatalf("welcome length = %d, want 9", len(got))
 	}
 	if got[0] != MessageWelcome || got[1] != ProtocolVersion {
 		t.Fatalf("unexpected welcome prefix: %v", got[:2])
@@ -21,6 +21,74 @@ func TestEncodeWelcome(t *testing.T) {
 	}
 	if id := binary.LittleEndian.Uint32(got[4:8]); id != 0x12345678 {
 		t.Fatalf("player ID = %#x, want %#x", id, uint32(0x12345678))
+	}
+	if got[8] != 3 {
+		t.Fatalf("unit type = %d, want 3", got[8])
+	}
+}
+
+func TestEncodeUnitRoster(t *testing.T) {
+	bp := &BinaryProtocol{}
+	entries := []types.UnitAssignment{
+		{ID: 9000, UnitType: 5, CurrentHP: 95, CurrentStamina: 10000},
+		{ID: 1, UnitType: 1, CurrentHP: 90, CurrentStamina: 9950},
+		{ID: 2, UnitType: 9, CurrentHP: 180, CurrentStamina: 13000},
+	}
+	got := bp.EncodeUnitRoster(entries)
+	if got[0] != MessageUnitRoster {
+		t.Fatalf("unexpected message type: %d", got[0])
+	}
+
+	offset := 1
+	count, shift := uint32(0), uint(0)
+	for {
+		b := got[offset]
+		offset++
+		count |= uint32(b&0x7f) << shift
+		if b&0x80 == 0 {
+			break
+		}
+		shift += 7
+	}
+	if count != 3 {
+		t.Fatalf("count = %d, want 3", count)
+	}
+
+	want := map[uint32]types.UnitAssignment{
+		1:    {UnitType: 1, CurrentHP: 90, CurrentStamina: 9950},
+		2:    {UnitType: 9, CurrentHP: 180, CurrentStamina: 13000},
+		9000: {UnitType: 5, CurrentHP: 95, CurrentStamina: 10000},
+	}
+	prevID := uint32(0)
+	decoded := map[uint32]types.UnitAssignment{}
+	for i := 0; i < 3; i++ {
+		delta, shift := uint32(0), uint(0)
+		for {
+			b := got[offset]
+			offset++
+			delta |= uint32(b&0x7f) << shift
+			if b&0x80 == 0 {
+				break
+			}
+			shift += 7
+		}
+		id := prevID + delta
+		prevID = id
+		unitType := got[offset]
+		offset++
+		hp := binary.LittleEndian.Uint16(got[offset:])
+		offset += 2
+		stamina := binary.LittleEndian.Uint16(got[offset:])
+		offset += 2
+		decoded[id] = types.UnitAssignment{UnitType: unitType, CurrentHP: hp, CurrentStamina: stamina}
+	}
+	if offset != len(got) {
+		t.Fatalf("roster has %d trailing bytes", len(got)-offset)
+	}
+	for id, want := range want {
+		if decoded[id] != want {
+			t.Fatalf("player %d = %+v, want %+v", id, decoded[id], want)
+		}
 	}
 }
 
@@ -121,13 +189,14 @@ func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, 
 
 		flags := buf[offset+6]
 		players = append(players, types.PlayerState{
-			ID:          id,
-			X:           binary.LittleEndian.Uint16(buf[offset:]),
-			Y:           binary.LittleEndian.Uint16(buf[offset+2:]),
-			VX:          int8(buf[offset+4]),
-			VY:          int8(buf[offset+5]),
-			State:       flags & 0x7f,
-			FacingRight: flags&0x80 != 0,
+			ID:        id,
+			X:         binary.LittleEndian.Uint16(buf[offset:]),
+			Y:         binary.LittleEndian.Uint16(buf[offset+2:]),
+			VX:        int8(buf[offset+4]),
+			VY:        int8(buf[offset+5]),
+			State:     flags & flagsStateMask,
+			Sprinting: flags&flagsSprinting != 0,
+			Direction: (flags >> 6) & 0x03,
 		})
 		offset += recordTail
 	}
@@ -142,9 +211,9 @@ func TestAppendWorldStateRoundTrip(t *testing.T) {
 	// Deliberately unsorted, with a large gap that forces a multi-byte varint.
 	players := []types.PlayerState{
 		{ID: 9000, X: 5, Y: 6, VX: 1, VY: -1, State: 1},
-		{ID: 1, X: 10, Y: 20, VX: -1, VY: 1, FacingRight: true},
+		{ID: 1, X: 10, Y: 20, VX: -1, VY: 1, Direction: DirectionLeft, Sprinting: true},
 		{ID: 2, X: 30, Y: 40},
-		{ID: 65535, X: 6000, Y: 3000, FacingRight: true, State: 2},
+		{ID: 65535, X: 6000, Y: 3000, Direction: DirectionUp, State: 2},
 	}
 	want := map[uint32]types.PlayerState{}
 	for _, p := range players {

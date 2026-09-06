@@ -46,16 +46,16 @@ RANGE_TIER = {
 
 UTILITY_BONUS = {
     "Citizen": 0,
-    "Spearman": 4,       # brace/kneel stance
-    "Archer (Guard)": 0,
-    "Guard Swordsman": 6,   # light block, formation bonus (stamina-only, not scored)
-    "Greatsword (Guard)": 8,  # cleave
-    "Axe Warrior": 6 + 3,     # anti-shield spec + Opportunist Bow
-    "Caped Warrior": 2 + 3 + 6,  # light parry + Opportunist Bow + mobility/raid spec
-    "Rogue": 8 + 3 + 6,          # Quiver+execute + Recon + raid mobility spec
-    "Skullcap Warrior": 6 + 3,   # heavy block + Opportunist Bow
-    "Heavy Knight": 8 + 9,       # cleave + piercing Dash-Thrust
-    "Paladin": 8 + 9,
+    "Spearman": 4 + 1,        # brace/kneel stance + weak melee-only block (25%/0%)
+    "Archer (Guard)": 0 + 1,  # weak melee-only block (15%/0%, mostly symbolic)
+    "Guard Swordsman": 6,     # real shield block, formation bonus (stamina-only, not scored)
+    "Greatsword (Guard)": 8 + 2,  # cleave + decent melee-only parry (30%/0%, two-handed weapon)
+    "Axe Warrior": 8 + 6 + 3,     # anti-shield spec (now also drains blocker stamina) + real shield block (50%/70%) + Opportunist Bow
+    "Caped Warrior": 2 + 3 + 6,   # light parry + Opportunist Bow + mobility/raid spec
+    "Rogue": 8 + 3 + 6 + 1,       # Quiver+execute + Recon + raid mobility spec + weak melee-only block (15%/0%)
+    "Skullcap Warrior": 6 + 3,    # heavy shield block + Opportunist Bow
+    "Heavy Knight": 8 + 9 + 6,    # cleave + piercing Dash-Thrust + real shield block (55%/75%, stacks with passive armor)
+    "Paladin": 8 + 9 + 6,
 }
 
 # Passive DR (always-on armor, baked into EHP) — see UNITS.md section 5, EHP formula.
@@ -66,6 +66,34 @@ PASSIVE_DR = {
     "Paladin": 0.27,
 }
 
+# Block DR (melee, ranged) — active only while holding RMB (frontal arc) AND
+# standing still (GDD p.54), see UNITS.md Unit Stats Table footnotes 1/4. Hand-
+# kept here like PASSIVE_DR; must stay in sync with UNITS.md's DR column.
+# ALL non-Citizen units can block in melee now — the split is:
+#   shield tier (also blocks ranged, rangedDR > meleeDR, low-ish drain/sec):
+BLOCK_DR = {
+    "Guard Swordsman": (0.70, 0.90),
+    "Caped Warrior": (0.35, 0.50),
+    "Skullcap Warrior": (0.60, 0.80),
+    "Axe Warrior": (0.50, 0.70),
+    "Heavy Knight": (0.55, 0.75),   # stacks with PASSIVE_DR (always-on armor)
+    "Paladin": (0.57, 0.77),        # stacks with PASSIVE_DR (always-on armor)
+}
+#   no-shield tier (melee only, arrows fully bypass block, high drain/sec):
+BLOCK_DR_MELEE_ONLY = {
+    "Spearman": 0.25,
+    "Archer (Guard)": 0.15,
+    "Greatsword (Guard)": 0.30,
+    "Rogue": 0.15,
+}
+# Axe Warrior anti-block specialization: ×2 damage vs ANY blocking target
+# (SIEGE_MULTIPLIER-adjacent but vs players — see UNITS.md footnote 2) PLUS an
+# extra flat stamina drain forced onto the blocker per landed hit, on top of
+# their own block_drain/sec — makes sustained turtling against Axe Warrior
+# specifically unsustainable, not just costly.
+AXE_ANTI_BLOCK_DMG_MULT = 2.0
+AXE_ANTI_BLOCK_STAMINA_DRAIN_BONUS = 20
+
 # Resource-equivalent weights (see UNITS.md section 7, Resource Value / IronEq)
 IRON_EQ_WEIGHTS = {"W": 0.4, "St": 0.6, "I": 1.0}
 
@@ -73,7 +101,7 @@ IRON_EQ_WEIGHTS = {"W": 0.4, "St": 0.6, "I": 1.0}
 # tabular either, so kept here alongside UtilityBonus.
 COST = {
     "Spearman": {"W": 2, "I": 3},
-    "Archer (Guard)": {"W": 3},
+    "Archer (Guard)": {"W": 3, "I": 1},
     "Guard Swordsman": {"W": 2, "I": 2},
     "Greatsword (Guard)": {"W": 2, "I": 6},
     "Axe Warrior": {"W": 2, "I": 4},
@@ -146,25 +174,25 @@ def parse_unit_stats_table(md_text: str) -> list[UnitStats]:
 
 
 # --- Stamina (UNITS.md section 8) — prose table, kept here by hand. ---
-# pool, regen/sec. Plus exactly one of:
-#   swing_cost  — flat cost per attack (most melee units)
-#   block_drain — cost/sec while holding block (Guard Swordsman, Caped/Skullcap Warrior)
+# pool, regen/sec, optionally swing_cost (flat cost per attack; None = draw-hold/
+# no flat cost) AND/OR block_drain (cost/sec while holding block — ALL non-
+# Citizen units can block in melee now; see BLOCK_DR / BLOCK_DR_MELEE_ONLY).
 # ASSUMPTION (not yet written down anywhere else): regen is suspended while
 # actively spending stamina (attacking/blocking) — it only ticks while idle.
 # This is what makes "drain 12/sec, regen 14/sec" for Skullcap Warrior mean
 # something (block is NOT nearly free at a net -2/sec) instead of nothing.
 # If that assumption is wrong, cmd_stamina's numbers are wrong along with it.
 STAMINA = {
-    "Spearman": {"pool": 100, "regen": 10, "swing_cost": 15},
-    "Archer (Guard)": {"pool": 70, "regen": 12, "swing_cost": None},  # draw-hold, not a flat cost
+    "Spearman": {"pool": 100, "regen": 10, "swing_cost": 15, "block_drain": 20},
+    "Archer (Guard)": {"pool": 70, "regen": 12, "swing_cost": None, "block_drain": 26},  # draw-hold, not a flat cost
     "Guard Swordsman": {"pool": 100, "regen": 10, "block_drain": 8},
-    "Greatsword (Guard)": {"pool": 110, "regen": 9, "swing_cost": 30},
-    "Axe Warrior": {"pool": 100, "regen": 10, "swing_cost": 18},
+    "Greatsword (Guard)": {"pool": 110, "regen": 9, "swing_cost": 30, "block_drain": 18},
+    "Axe Warrior": {"pool": 100, "regen": 10, "swing_cost": 18, "block_drain": 11},
     "Caped Warrior": {"pool": 90, "regen": 14, "block_drain": 12},
-    "Rogue": {"pool": 95, "regen": 15, "swing_cost": None},
+    "Rogue": {"pool": 95, "regen": 15, "swing_cost": None, "block_drain": 24},
     "Skullcap Warrior": {"pool": 100, "regen": 9, "block_drain": 7},
-    "Heavy Knight": {"pool": 130, "regen": 8, "swing_cost": 25},
-    "Paladin": {"pool": 135, "regen": 8, "swing_cost": 25},
+    "Heavy Knight": {"pool": 130, "regen": 8, "swing_cost": 25, "block_drain": 9},
+    "Paladin": {"pool": 135, "regen": 8, "swing_cost": 25, "block_drain": 9},
 }
 
 # --- Territory passive/building production, GDD p.15-19 (Wood/min etc). ---
@@ -180,15 +208,29 @@ PRODUCTION_PER_MIN = {
 # --- Siege damage multipliers, GDD p.47 (Siege Damage). Everyone not listed
 # does the "minimal/symbolic" 0.1x the doc describes in prose. ---
 SIEGE_MINIMAL = 0.1
+# Stone is deliberately NOT in this table for any regular unit — every player
+# unit does SIEGE_MINIMAL vs Stone. Stone structures require Catapult (below).
+# This is a hard design choice (see conversation): wood falls to enough
+# players + time, stone falls only to a built siege engine.
 SIEGE_MULTIPLIER = {
     "Axe Warrior": {"Wood": 2.0, "Stone": SIEGE_MINIMAL},
-    "Greatsword (Guard)": {"Wood": SIEGE_MINIMAL, "Stone": 1.5},
-    "Heavy Knight": {"Wood": SIEGE_MINIMAL, "Stone": 1.5},
-    "Paladin": {"Wood": SIEGE_MINIMAL, "Stone": 1.5},
 }
 # Fire Arrow isn't in the Unit Stats Table (it's an Archer alt-ammo mode with
 # its own damage) — modeled as a separate pseudo-unit for the siege command.
 FIRE_ARROW = {"dmg": 18, "cycle": None, "wood_mult": 2.0, "stone_mult": SIEGE_MINIMAL}
+
+# Catapult: siege equipment (built via Officer blueprint + Citizen construction,
+# like Battering Ram, GDD p.48), not a combat unit — the ONLY real source of
+# Stone damage. Zero damage vs Wood (not its job) and zero vs players.
+CATAPULT = {"dmg": 800, "reload_s": 10, "wood_mult": 0.0, "stone_mult": 1.0}
+
+# No artificial attacker cap: more players hitting a structure deal
+# proportionally more DPS, full stop (GDD p.47 — deliberately rejected a
+# frontage/ranged cap formula; the only limit on melee crowding is emergent
+# player-hitbox collision on the arena itself, not a game rule). The low-pop
+# "grinding a wall for hours" concern is instead solved by picking sane flat
+# HP numbers (a small dedicated squad already breaches Wood in ~5 min) plus
+# Active Siege Repair (GDD p.46), not by capping attacker count.
 
 # Distances/ranges mentioned in UNITS.md prose (not in the tabular Unit Stats
 # Table), for the "distances" command. Kept here by hand, same caveat as
@@ -317,6 +359,65 @@ def cmd_matchup(args):
     print("UNITS.md, that combination is worth a second look.")
 
 
+def cmd_approach(args):
+    """How much damage a stationary Archer lands on each melee unit while it
+    closes the distance from the Archer's max range to its own melee range —
+    answers 'is the Archer an unkillable kite machine' directly, instead of
+    guessing from DPS/range numbers alone.
+
+    Model: Archer stands still at --archer-range (default: its own Range stat,
+    9.0m) and fires on its normal cycle (first shot lands after Windup, then
+    every cycle_time). The attacker closes at its Move speed until it's within
+    its own melee Range, then the clock stops — no shots land during the swing
+    that kills the Archer, this is purely 'damage taken while closing'.
+
+    DR while closing: only passive armor (Heavy Knight/Paladin) applies. Block
+    (Guard Swordsman/Skullcap Warrior/Caped Warrior) is confirmed GDD p.54 to
+    require standing still — moving drops it instantly — so it CANNOT reduce
+    damage taken while covering ground, only while holding a static position.
+    That's a real, load-bearing rule change (not just a caveat): it means the
+    Counter Matrix's 'Archer weak vs Shield' only holds for a shield-holder
+    already defending a position under fire, not one charging across open
+    ground to close the gap — see UNITS.md DR footnote 1."""
+    text = UNITS_MD.read_text(encoding="utf-8")
+    units = {u.name: u for u in parse_unit_stats_table(text)}
+    archer = resolve_unit(units, "Archer")
+
+    archer_range = args.archer_range if args.archer_range else archer.range_m
+    print(f"Archer (Guard): range {archer_range:.1f}m, dmg {archer.dmg:.0f}/shot, cycle {archer.cycle_time:.2f}s "
+          f"(windup {archer.windup:.2f}s), stationary — no kiting modeled.\n")
+
+    targets = [u for u in units.values() if u.name != archer.name and u.range_type == "Melee"]
+    if args.attacker:
+        targets = [resolve_unit(units, args.attacker)]
+
+    header = f"{'Unit':<20}{'Move':>6}{'MeleeRng':>9}{'Close(m)':>9}{'CloseTime':>10}{'Shots':>7}{'DR':>5}{'DmgTaken':>9}{'HP':>6}{'HP left':>9}{'Survives?':>10}"
+    print(header)
+    for u in targets:
+        close_dist = max(0.0, archer_range - u.range_m)
+        close_time = close_dist / u.move if u.move > 0 else float("inf")
+        if close_time < archer.windup:
+            shots = 0
+        else:
+            shots = int((close_time - archer.windup) // archer.cycle_time) + 1
+
+        dr = PASSIVE_DR.get(u.name, 0.0)  # block DR does NOT apply while moving, GDD p.54
+        dmg_taken = shots * archer.dmg * (1 - dr)
+        hp_left = u.hp - dmg_taken
+        survives = "yes" if hp_left > 0 else "DIES"
+        print(f"{u.name:<20}{u.move:>6.1f}{u.range_m:>9.1f}{close_dist:>9.1f}{close_time:>10.2f}{shots:>7d}"
+              f"{dr*100:>4.0f}%{dmg_taken:>9.1f}{u.hp:>6.0f}{hp_left:>9.1f}{survives:>10}")
+
+    print("\nCaveat: ignores lateral movement/dodging by the attacker, the Archer's own Opportunist")
+    print("Bow (n/a, Archer doesn't have one) and Fire Arrow, retreat/kiting by the Archer once the")
+    print("attacker gets close (a moving Archer buys more shots, this models worst-case-for-Archer:")
+    print("standing ground). Use --archer-range to test shorter effective ranges (obstacles, curved")
+    print("sightlines, etc). ALL units can block now (GDD p.54), including the 4 without a real")
+    print("shield (Spearman/Archer/Greatsword/Rogue — melee-only, see BLOCK_DR_MELEE_ONLY) — but")
+    print("block requires standing still, so nobody gets any DR here while closing distance, shield")
+    print("or not. It only matters once they stop, either at melee range or holding a static position.")
+
+
 def cmd_map(args):
     # Everything here works in real meters first, then converts to server
     # integer units via --units-per-meter — that's the actual design lever
@@ -435,14 +536,14 @@ def cmd_stamina(args):
             refill = pool / regen
             print(f"  max consecutive swings from full: {max_swings}  (cost {cost}/swing)")
             print(f"  full refill after exhausting: {refill:.1f}s")
-        elif s.get("block_drain"):
+        elif "swing_cost" in s:
+            print(f"  (draw-hold / no flat swing cost modeled — see UNITS.md prose)")
+        if s.get("block_drain"):
             drain = s["block_drain"]
             hold_from_full = pool / drain
             duty_cycle = regen / (drain + regen) * 100
-            print(f"  continuous block hold from full: {hold_from_full:.1f}s")
+            print(f"  continuous block hold from full: {hold_from_full:.1f}s  ({drain}/s drain)")
             print(f"  sustainable block duty cycle (alternate hold/release forever): {duty_cycle:.0f}% of time")
-        else:
-            print(f"  (draw-hold / no flat swing cost modeled — see UNITS.md prose)")
         print()
 
 
@@ -490,20 +591,26 @@ def cmd_economy(args):
     print("'can this front indefinitely replace losses of unit X', not 'can I burst 10 right now'.")
 
 
-def cmd_siege(args):
-    text = UNITS_MD.read_text(encoding="utf-8")
-    units = {u.name: u for u in parse_unit_stats_table(text)}
+def parse_attackers(units: dict, attackers_str: str, structure_type: str, scale: float = 1.0):
+    """Returns (total_dps, N_attackers, breakdown_lines) for an attacker mix
+    string like 'Axe Warrior:5,Fire Arrow:2,Catapult:1', with counts multiplied
+    by `scale` and rounded (used by `siege` and `siegescale`).
 
-    structure_type = args.structure_type
-    if structure_type not in ("Wood", "Stone"):
-        raise SystemExit("--structure-type must be 'Wood' or 'Stone'")
+    No attacker cap: more players deal proportionally more DPS, full stop —
+    GDD p.47 deliberately rejects any formula-based crowd limit."""
+    entries = []  # (name, count)
+    for entry in attackers_str.split(","):
+        name, _, count_str = entry.partition(":")
+        base_count = int(count_str) if count_str else 1
+        count = max(0, round(base_count * scale))
+        name = name.strip()
+        entries.append((name, count))
 
     total_dps = 0.0
-    print(f"Attackers vs {structure_type} structure:")
-    for entry in args.attackers.split(","):
-        name, _, count_str = entry.partition(":")
-        count = int(count_str) if count_str else 1
-        name = name.strip()
+    n_total = 0
+    lines = []
+    for name, count in entries:
+        n_total += count
 
         if name.lower() in ("fire arrow", "archer (fire arrow)"):
             archer = resolve_unit(units, "Archer")
@@ -511,6 +618,10 @@ def cmd_siege(args):
             mult = FIRE_ARROW["wood_mult"] if structure_type == "Wood" else FIRE_ARROW["stone_mult"]
             dps = FIRE_ARROW["dmg"] / cycle * mult
             label = "Archer (Fire Arrow)"
+        elif name.lower() == "catapult":
+            mult = CATAPULT["wood_mult"] if structure_type == "Wood" else CATAPULT["stone_mult"]
+            dps = CATAPULT["dmg"] / CATAPULT["reload_s"] * mult
+            label = "Catapult"
         else:
             u = resolve_unit(units, name)
             mult = SIEGE_MULTIPLIER.get(u.name, {}).get(structure_type, SIEGE_MINIMAL)
@@ -519,23 +630,83 @@ def cmd_siege(args):
 
         contribution = dps * count
         total_dps += contribution
-        print(f"  {count}x {label:<24} {dps:.1f} dps each x{mult:.1f} mult = {contribution:.1f} dps total")
+        count_str = f"{count:g}"
+        lines.append(f"  {count_str}x {label:<24} {dps:.1f} dps each x{mult:.1f} mult = {contribution:.1f} dps total")
+    return total_dps, n_total, lines
 
-    print(f"\nTotal siege DPS: {total_dps:.1f}/s")
 
-    if args.hp:
-        breach_time = args.hp / total_dps
-        print(f"Structure HP {args.hp} -> breach in {breach_time:.0f}s ({breach_time/60:.1f} min), uncontested.")
+def cmd_siege(args):
+    text = UNITS_MD.read_text(encoding="utf-8")
+    units = {u.name: u for u in parse_unit_stats_table(text)}
+
+    structure_type = args.structure_type
+    if structure_type not in ("Wood", "Stone"):
+        raise SystemExit("--structure-type must be 'Wood' or 'Stone'")
+
+    hp = args.hp
+    print(f"Attackers vs {structure_type} structure:")
+    total_dps, n_total, lines = parse_attackers(units, args.attackers, structure_type)
+    print("\n".join(lines))
+    print(f"\nTotal siege DPS: {total_dps:.1f}/s  ({n_total:g} attackers, no cap — GDD p.47)")
+
+    if hp:
+        breach_time = hp / total_dps
+        print(f"Structure HP {hp:.0f} -> breach in {breach_time:.0f}s ({breach_time/60:.1f} min), uncontested.")
     if args.breach_seconds:
         required_hp = total_dps * args.breach_seconds
         print(f"To breach in {args.breach_seconds}s uncontested, structure HP should be ~{required_hp:.0f}.")
-    if not args.hp and not args.breach_seconds:
-        print("\nPass --hp to compute breach time, or --breach-seconds to back-solve required HP —")
-        print("neither Wall/Gate/Tower/Fort HP exists in the GDD yet (checked: no numeric value")
-        print("anywhere), so this command is the way to pick one instead of guessing.")
+    if not hp and not args.breach_seconds:
+        print("\nPass --hp to compute breach time, or --breach-seconds to back-solve required HP.")
+        print("GDD p.47 reference values: Wood Gate/Wall 65 000, Stone Wall/Tower 90 000, Fort 150 000.")
 
     print("\nIgnores Active Siege Repair (-75% repair while actively damaged, GDD p.46) and")
     print("Battering Ram (GDD p.48) entirely — uncontested chip-damage baseline only.")
+
+
+def cmd_siegescale(args):
+    """HP that scales with attacker count: HP(N) = HP_ref * (N/N_ref)^exponent.
+    exponent=0 is today's bug (fixed HP, breach time collapses as 1/N).
+    exponent=1 makes breach time constant regardless of siege size (mass never helps).
+    Something in between rewards numbers without trivializing the wall."""
+    text = UNITS_MD.read_text(encoding="utf-8")
+    units = {u.name: u for u in parse_unit_stats_table(text)}
+
+    structure_type = args.structure_type
+    if structure_type not in ("Wood", "Stone"):
+        raise SystemExit("--structure-type must be 'Wood' or 'Stone'")
+
+    dps_ref, n_ref, lines = parse_attackers(units, args.attackers, structure_type)
+    hp_ref = dps_ref * args.breach_seconds
+    print(f"Reference scenario: {n_ref} attackers, {dps_ref:.1f} dps total")
+    print(f"Calibrated so breach takes {args.breach_seconds:.0f}s at this size -> HP_ref = {hp_ref:.0f}\n")
+
+    multipliers = [float(x) for x in args.multipliers.split(",")]
+    exponents = [float(x) for x in args.exponents.split(",")]
+
+    header = f"{'attackers':>10} " + "".join(f"p={p:<4}" .rjust(14) for p in exponents)
+    print(header)
+    for m in multipliers:
+        n = round(n_ref * m)
+        dps_m, _, _ = parse_attackers(units, args.attackers, structure_type, scale=m)
+        row = f"{n:>10} "
+        for p in exponents:
+            hp_m = hp_ref * (m ** p)
+            breach_m = hp_m / dps_m if dps_m > 0 else float("inf")
+            row += f"{breach_m:>13.0f}s"
+        print(row)
+
+    print("\nColumns are candidate exponents p in HP(N) = HP_ref * (N/N_ref)^p.")
+    print("p=0.0 : today — fixed HP, breach time = breach_seconds / m (collapses to near-zero)")
+    print("p=0.5 : sqrt scaling — bigger sieges are meaningfully faster, never trivial")
+    print("p=0.7 : closer to constant, still rewards mass noticeably")
+    print("p=1.0 : breach time constant at every scale — pure 'coordinated effort' model, no reward for zerging")
+    print("\nRecommendation: p=0.5-0.7. p=0 reproduces the '3 min at 5 players -> ~1s at 50' complaint.")
+    print("p=1.0 is defensible too (matches GDD's anti-snowball spirit) but removes any incentive")
+    print("to actually bring more attackers to a siege, which cuts against 'Massive Warfare' (p.2).")
+    print("\nBasis for N: should be the CURRENT attacking force at this structure (or the attacking")
+    print("Kingdom's online count, same pattern as Claim Capacity's `online` variable, GDD p.13) —")
+    print("not a global server population, so a quiet border wall isn't buffed by an unrelated 500-")
+    print("player battle happening elsewhere on the map.")
 
 
 def main():
@@ -563,6 +734,10 @@ def main():
 
     sub.add_parser("matchup", help="All-vs-all raw stand-and-trade TTK grid + dominance ranking")
 
+    p_approach = sub.add_parser("approach", help="Damage a stationary Archer lands on each melee unit while it closes the gap")
+    p_approach.add_argument("--attacker", type=str, default=None, help="only compute for this unit (default: all melee units)")
+    p_approach.add_argument("--archer-range", type=float, default=None, help="override Archer's effective range in meters (default: UNITS.md Range stat)")
+
     sub.add_parser("stamina", help="Block-hold duration / max swings / duty cycle from the Stamina table")
 
     p_econ = sub.add_parser("economy", help="Sustainable units/min from territory income vs unit cost")
@@ -575,10 +750,17 @@ def main():
     p_econ.add_argument("--unit", type=str, default=None, help="show one unit only (default: all)")
 
     p_siege = sub.add_parser("siege", help="Breach-time / required-HP calculator for Wall/Gate/Tower/Fort (GDD p.47)")
-    p_siege.add_argument("--attackers", required=True, help="e.g. 'Axe Warrior:5,Fire Arrow:2'")
+    p_siege.add_argument("--attackers", required=True, help="e.g. 'Axe Warrior:5,Fire Arrow:2,Catapult:1'")
     p_siege.add_argument("--structure-type", required=True, choices=["Wood", "Stone"])
     p_siege.add_argument("--hp", type=float, default=None, help="structure HP -> compute breach time")
     p_siege.add_argument("--breach-seconds", type=float, default=None, help="desired breach time -> back-solve HP")
+
+    p_scale = sub.add_parser("siegescale", help="Compare HP-vs-attacker-count scaling formulas (fixes 'wall dies in 1s at 50 players')")
+    p_scale.add_argument("--attackers", required=True, help="reference-size attacker mix, e.g. 'Axe Warrior:5'")
+    p_scale.add_argument("--structure-type", required=True, choices=["Wood", "Stone"])
+    p_scale.add_argument("--breach-seconds", type=float, required=True, help="target breach time AT the reference attacker count")
+    p_scale.add_argument("--multipliers", type=str, default="1,2,5,10,20", help="attacker-count multipliers to compare, relative to the reference")
+    p_scale.add_argument("--exponents", type=str, default="0,0.5,0.7,1.0", help="candidate exponents p in HP(N)=HP_ref*(N/N_ref)^p")
 
     args = parser.parse_args()
     {
@@ -587,9 +769,11 @@ def main():
         "map": cmd_map,
         "distances": cmd_distances,
         "matchup": cmd_matchup,
+        "approach": cmd_approach,
         "stamina": cmd_stamina,
         "economy": cmd_economy,
         "siege": cmd_siege,
+        "siegescale": cmd_siegescale,
     }[args.cmd](args)
 
 

@@ -4,7 +4,11 @@ export interface GameConfig {
     syncInterval: number;
   };
   movement: {
-    playerSpeedPerTick: number;
+    // GDD §60 World Coordinate Resolution: world units per meter (10 = 1 unit =
+    // 0.1m/decimeter). Per-unit movement speed (units.json moveSpeed, m/s) is
+    // converted through this — see client/utils/movement.ts and, authoritatively,
+    // server world.go moveStat.
+    unitsPerMeter: number;
   };
   world: {
     virtualSize: {
@@ -26,7 +30,6 @@ export interface GameConfig {
   };
   player: {
     baseScale: number;
-    animationSpeed: number;
   };
   game: {
     debugMode: boolean;

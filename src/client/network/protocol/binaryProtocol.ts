@@ -11,8 +11,19 @@ import {
     AttackMessage,
     PlayerAttackMessage,
 } from "./messages";
+import { DIRECTIONS, type Direction } from "../../utils/animationLayout";
+
+// Wire code for Direction is simply its index in DIRECTIONS (right=0, left=1,
+// down=2, up=3) — must match protocol.go's bit-packing on the server exactly.
+function directionFromCode(code: number): Direction {
+    return DIRECTIONS[code] ?? "right";
+}
 
 export class BinaryProtocol {
+    // Bit 4 of the packed movement byte — held-Shift intent, see MoveMessage.sprint.
+    // Must match protocol.MoveSprintBit on the server.
+    private static readonly SPRINT_BIT = 0x10;
+
     // Helper methods for common operations
     private static packMovement(dx: number, dy: number): number {
         let packed = 0;
@@ -42,7 +53,8 @@ export class BinaryProtocol {
 
         const dx = Math.sign(moveMsg.movementVector.dx) || 0;
         const dy = Math.sign(moveMsg.movementVector.dy) || 0;
-        const packed = this.packMovement(dx, dy);
+        let packed = this.packMovement(dx, dy);
+        if (moveMsg.sprint) packed |= this.SPRINT_BIT;
 
         view.setUint8(1, packed);
         view.setUint32(2, moveMsg.inputSequence, true);
@@ -54,7 +66,7 @@ export class BinaryProtocol {
         const buffer = new ArrayBuffer(2);
         const view = new DataView(buffer);
         view.setUint8(0, MessageType.DIRECTION);
-        view.setInt8(1, dirMsg.direction);
+        view.setUint8(1, DIRECTIONS.indexOf(dirMsg.direction));
         return new Uint8Array(buffer);
     }
 
@@ -72,6 +84,14 @@ export class BinaryProtocol {
         const view = new DataView(buffer);
         view.setUint8(0, MessageType.ATTACK_END);
         return new Uint8Array(buffer);
+    }
+
+    static encodeBlockStart(): Uint8Array {
+        return new Uint8Array([MessageType.BLOCK_START]);
+    }
+
+    static encodeBlockEnd(): Uint8Array {
+        return new Uint8Array([MessageType.BLOCK_END]);
     }
 
     static encodeSyncRequest(): Uint8Array {
@@ -104,6 +124,7 @@ export class BinaryProtocol {
             case MessageType.PLAYER_LEFT: return this.decodePlayerLeft(data, view);
             case MessageType.MOVEMENT_ACK: return this.decodeMovementAck(data, view);
             case MessageType.WELCOME: return this.decodeWelcome(data, view);
+            case MessageType.UNIT_ROSTER: return this.decodeUnitRoster(data);
             case MessageType.PONG:
                 if (data.length !== 5) return null;
                 return { type: "pong", nonce: view.getUint32(1, true) };
@@ -147,7 +168,7 @@ export class BinaryProtocol {
             return {
                 type: "playerDirection",
                 playerId,
-                direction: view.getInt8(newOffset) as -1 | 1,
+                direction: directionFromCode(view.getUint8(newOffset)),
             };
         }
 
@@ -243,16 +264,25 @@ export class BinaryProtocol {
             const flags = view.getUint8(offset);
             offset++;
 
-            const direction = (flags & 0x80) ? 1 : -1;
-            const state = flags & 0x7F;
+            // bits 0-1: core state, bit 2: sprinting, bits 3-4: combo step (0-3,
+            // i.e. step 1-4), bits 6-7: direction code (see directionFromCode).
+            // Must match protocol.playerFlags on the server.
+            const direction = directionFromCode((flags >> 6) & 0x03);
+            const state = flags & 0x03;
             const moving = vx !== 0 || vy !== 0;
             const attacking = state === 1; // server: 1=attack
+            const blocking = state === 2; // server: 2=block
+            const sprinting = (flags & 0x04) !== 0;
+            const comboStep = ((flags >> 3) & 0x03) + 1;
 
             players[playerId] = {
                 id: playerId,
                 direction,
                 moving,
                 attacking,
+                blocking,
+                sprinting,
+                comboStep,
                 position: { x, y },
                 vx,
                 vy,
@@ -303,10 +333,13 @@ export class BinaryProtocol {
         offset++;
 
         const flags = view.getUint8(offset);
-        const direction = (flags & 0x80) ? 1 : -1;
-        const state = flags & 0x7F;
+        const direction = directionFromCode((flags >> 6) & 0x03);
+        const state = flags & 0x03;
         const moving = vx !== 0 || vy !== 0;
         const attacking = state === 1; // server: 1=attack
+        const blocking = state === 2; // server: 2=block
+        const sprinting = (flags & 0x04) !== 0;
+        const comboStep = ((flags >> 3) & 0x03) + 1;
 
         return {
             type: 'playerJoined',
@@ -315,6 +348,9 @@ export class BinaryProtocol {
                 direction,
                 moving,
                 attacking,
+                blocking,
+                sprinting,
+                comboStep,
                 position: { x, y },
                 vx,
                 vy,
@@ -345,14 +381,61 @@ export class BinaryProtocol {
     }
 
     private static decodeWelcome(data: Uint8Array, view: DataView) {
-        if (data.length !== 8) return null;
+        if (data.length !== 9) return null;
 
         return {
             type: 'welcome',
             protocolVersion: view.getUint8(1),
             tickRate: view.getUint16(2, true),
             playerId: view.getUint32(4, true).toString(),
+            unitType: view.getUint8(8),
         };
+    }
+
+    // [type:1][count:varint][count * [idDelta:varint][unitType:1][hp:u16][staminaCenti:u16]]
+    // Mirrors protocol.EncodeUnitRoster on the server. IDs are delta-encoded against
+    // the previous entry the same way world-state records are. staminaCenti is
+    // fixed-point x100 ("centi-stamina") — divided back down here so consumers get a
+    // real stamina number.
+    private static decodeUnitRoster(data: Uint8Array) {
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        let offset = 1;
+        let count = 0;
+        let shift = 0;
+        let byte = 0;
+        do {
+            if (offset >= data.length) return { type: "unitRoster", entries: {} };
+            byte = data[offset++];
+            count += (byte & 0x7f) * 2 ** shift;
+            shift += 7;
+        } while (byte & 0x80);
+
+        const entries: Record<string, { unitType: number; hp: number; stamina: number }> = {};
+        let prevId = 0;
+        for (let i = 0; i < count; i++) {
+            let delta = 0;
+            let s = 0;
+            let b = 0;
+            do {
+                if (offset >= data.length) return { type: "unitRoster", entries };
+                b = data[offset++];
+                delta += (b & 0x7f) * 2 ** s;
+                s += 7;
+            } while (b & 0x80);
+
+            if (offset + 5 > data.length) break;
+            const id = (prevId + delta) >>> 0;
+            prevId = id;
+            const unitType = data[offset];
+            offset += 1;
+            const hp = view.getUint16(offset, true);
+            offset += 2;
+            const staminaCenti = view.getUint16(offset, true);
+            offset += 2;
+            entries[id.toString()] = { unitType, hp, stamina: staminaCenti / 100 };
+        }
+
+        return { type: "unitRoster", entries };
     }
 
     // Broadcast message decoders (types 255, 254, 253)
@@ -381,7 +464,7 @@ export class BinaryProtocol {
         const playerId = view.getUint32(offset, true).toString();
         offset += 4;
 
-        const direction = view.getUint8(offset) === 1 ? 1 : -1;
+        const direction = directionFromCode(view.getUint8(offset));
         offset++;
 
         return {

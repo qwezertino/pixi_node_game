@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"pixi_game_server/internal/config"
+	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/systems"
 	"pixi_game_server/internal/types"
 )
@@ -11,9 +12,12 @@ import (
 func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
-			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
+		// — matches the flat test speed these tests were written against before
+		// movement became per-unit (GDD §60 World Coordinate Resolution).
+		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	player := &types.Player{ID: 1, X: 100, Y: 100}
@@ -38,9 +42,12 @@ func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
-			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
+		// — matches the flat test speed these tests were written against before
+		// movement became per-unit (GDD §60 World Coordinate Resolution).
+		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	player := &types.Player{ID: 1, X: 100, Y: 100}
@@ -65,9 +72,12 @@ func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
-			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
+		// — matches the flat test speed these tests were written against before
+		// movement became per-unit (GDD §60 World Coordinate Resolution).
+		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	player := &types.Player{ID: 1, X: 100, Y: 100}
@@ -103,9 +113,12 @@ func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 func TestUpdatePlayerPositionClampsAtWorldBoundary(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
-			Game:  config.GameConfig{PlayerSpeedPerTick: 4},
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
+		// — matches the flat test speed these tests were written against before
+		// movement became per-unit (GDD §60 World Coordinate Resolution).
+		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	player := &types.Player{ID: 1, X: 1000, Y: 100}
@@ -165,7 +178,7 @@ func TestOfferMovementInputRejectsStaleAndGap(t *testing.T) {
 // Attack cooldown is measured in ticks, not wall-clock time, so it dilates along
 // with movement under time dilation instead of ticking at a fixed real-world rate.
 func TestTryAttackCooldownIsTickBasedNotWallClock(t *testing.T) {
-	gw := &GameWorld{attackDurationTicks: 20}
+	gw := &GameWorld{attackDurationTicks: map[uint8]uint32{0: 20}}
 	player := &types.Player{ID: 1}
 	gw.playersMap = map[uint32]*types.Player{1: player}
 
@@ -204,7 +217,7 @@ const (
 
 func TestClassifyDelta(t *testing.T) {
 	// Baseline: moving right at 4 px/tick. After 2 ticks a client predicts X+8.
-	prev := types.PlayerState{ID: 1, X: 100, Y: 100, VX: 1, VY: 0, FacingRight: true}
+	prev := types.PlayerState{ID: 1, X: 100, Y: 100, VX: 1, VY: 0, Direction: protocol.DirectionRight}
 	moved := func(x, y uint16, mut ...func(*types.PlayerState)) types.PlayerState {
 		st := prev
 		st.X, st.Y = x, y
@@ -237,7 +250,7 @@ func TestClassifyDelta(t *testing.T) {
 		},
 		{
 			name: "facing change cannot be predicted",
-			st:   moved(108, 100, func(s *types.PlayerState) { s.FacingRight = false }), exists: true,
+			st:   moved(108, 100, func(s *types.PlayerState) { s.Direction = protocol.DirectionLeft }), exists: true,
 			want: deltaReason{include: true, unpredictable: true},
 		},
 		{
@@ -255,7 +268,7 @@ func TestClassifyDelta(t *testing.T) {
 		},
 		{
 			name:   "idle player contributes nothing",
-			st:     types.PlayerState{ID: 1, X: 100, Y: 100, FacingRight: true, VX: 0},
+			st:     types.PlayerState{ID: 1, X: 100, Y: 100, Direction: protocol.DirectionRight, VX: 0},
 			exists: true,
 			want:   deltaReason{include: true, unpredictable: true, diverged: true},
 		},
@@ -315,7 +328,7 @@ func TestClassifyDeltaBucketsAreExclusive(t *testing.T) {
 		{ID: 1, X: 18, Y: 10, VX: 1},
 		{ID: 1, X: 14, Y: 10, VX: 1},
 		{ID: 1, X: 18, Y: 10, VX: 0},
-		{ID: 1, X: 10, Y: 10, VX: 0, FacingRight: true},
+		{ID: 1, X: 10, Y: 10, VX: 0, Direction: protocol.DirectionRight},
 	} {
 		for _, exists := range []bool{true, false} {
 			for _, mode := range []bool{velocityRepl, legacyRepl} {

@@ -906,6 +906,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	dilationBps := s.currentDilationBps()
 	if fullSync {
 		f.data = s.protocol.AppendGameState(f.data, allPlayers, stateSequence, worldTick, dilationBps)
+		s.broadcastUnitRoster()
 	} else {
 		f.data = s.protocol.AppendDeltaGameState(f.data, changed, stateSequence, worldTick, dilationBps)
 	}
@@ -1118,18 +1119,49 @@ func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) {
 }
 
 func (s *Server) sendWelcome(conn *Connection) {
-	data := s.protocol.EncodeWelcome(conn.player.ID, uint16(s.cfg.Game.TickRate))
+	data := s.protocol.EncodeWelcome(conn.player.ID, uint16(s.cfg.Game.TickRate), conn.player.GetUnitType())
 	s.sendDirect(conn, data)
+}
+
+// sendUnitRoster sends every connected player's unit type (including conn's own) to
+// a single newly connected client. Called once at connect, right after
+// sendInitialState — see broadcastUnitRoster for how later joiners are covered.
+func (s *Server) sendUnitRoster(conn *Connection) {
+	assignments := s.gameWorld.GetAllUnitAssignments()
+	if len(assignments) == 0 {
+		return
+	}
+	data := s.protocol.EncodeUnitRoster(assignments)
+	s.sendDirect(conn, data)
+}
+
+// broadcastUnitRoster resends the full unit-type roster to every connected client.
+// Unit type never changes after spawn and has no other replication channel, so
+// piggybacking on the existing full-sync cadence (see broadcastTick) is enough for
+// already-connected clients to learn about players who joined since their last
+// roster, without a dedicated per-join fanout.
+func (s *Server) broadcastUnitRoster() {
+	assignments := s.gameWorld.GetAllUnitAssignments()
+	if len(assignments) == 0 {
+		return
+	}
+	data := s.protocol.EncodeUnitRoster(assignments)
+	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
+	if err != nil {
+		slog.Error("failed to compile unit roster frame", "error", err)
+		return
+	}
+	s.broadcastEvent(frameBytes)
 }
 
 // notifyPlayerJoined notifies all clients that a new player has joined.
 // The client filters its own join by player ID.
 func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
 	playerState := types.PlayerState{
-		ID:          newPlayer.ID,
-		X:           uint16(newPlayer.GetX()),
-		Y:           uint16(newPlayer.GetY()),
-		FacingRight: true,
+		ID:        newPlayer.ID,
+		X:         uint16(newPlayer.GetX()),
+		Y:         uint16(newPlayer.GetY()),
+		Direction: protocol.DirectionRight,
 	}
 	data := s.protocol.EncodePlayerJoined(playerState)
 	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))

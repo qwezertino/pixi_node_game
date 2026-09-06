@@ -22,10 +22,14 @@ type ServerConfig struct {
 }
 
 type GameConfig struct {
-	TickRate           int
-	SyncInterval       time.Duration
-	PlayerSpeedPerTick int
-	AttackDuration     time.Duration
+	TickRate     int
+	SyncInterval time.Duration
+	// UnitsPerMeter is the world coordinate resolution (GDD §60 World Coordinate
+	// Resolution: 1 world unit = 0.1m at the default 10) — the only genuinely
+	// world-global movement setting. Per-unit movement speed and sprint parameters
+	// (units.Definition.MoveSpeed/SprintSpeedMultiplier/SprintStaminaCostPerSecond)
+	// live on the unit instead — see game/world.go moveStat/staminaStat.
+	UnitsPerMeter float64
 }
 
 type WorldConfig struct {
@@ -76,7 +80,7 @@ type JSONConfig struct {
 		SyncInterval int `json:"syncInterval"`
 	} `json:"network"`
 	Movement struct {
-		PlayerSpeedPerTick int `json:"playerSpeedPerTick"`
+		UnitsPerMeter float64 `json:"unitsPerMeter"`
 	} `json:"movement"`
 	World struct {
 		VirtualSize struct {
@@ -96,11 +100,6 @@ type JSONConfig struct {
 			MaxY int `json:"maxY"`
 		} `json:"boundaries"`
 	} `json:"world"`
-	Player struct {
-		BaseScale        float64 `json:"baseScale"`
-		AnimationSpeed   float64 `json:"animationSpeed"`
-		AttackDurationMs int     `json:"attackDurationMs"`
-	} `json:"player"`
 	Game struct {
 		DebugMode bool `json:"debugMode"`
 	} `json:"game"`
@@ -133,10 +132,9 @@ func Load() *Config {
 		// ── Game rules ────────────────────────────────────────────────────────
 		// Defaults come from embedded gameConfig.json so they always match the client.
 		Game: GameConfig{
-			TickRate:           getEnvInt("TICK_RATE", jsonConfig.Network.TickRate),
-			SyncInterval:       time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
-			PlayerSpeedPerTick: getEnvInt("PLAYER_SPEED", jsonConfig.Movement.PlayerSpeedPerTick),
-			AttackDuration:     time.Duration(getEnvInt("ATTACK_DURATION_MS", jsonConfig.Player.AttackDurationMs)) * time.Millisecond,
+			TickRate:      getEnvInt("TICK_RATE", jsonConfig.Network.TickRate),
+			SyncInterval:  time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
+			UnitsPerMeter: getEnvFloat("UNITS_PER_METER", jsonConfig.Movement.UnitsPerMeter),
 		},
 		World: WorldConfig{
 			Width:     uint16(getEnvInt("WORLD_WIDTH", jsonConfig.World.VirtualSize.Width)),

@@ -7,9 +7,13 @@ import { AnimationController, PlayerState } from "./controllers/animationControl
 import { NetworkManager } from "./network/networkManager";
 import { PlayerManager } from "./game/playerManager";
 import { TICK_RATE } from "./network/protocol/messages";
-import { PLAYER, COLORS } from "../shared/gameConfig";
+import { COLORS } from "../shared/gameConfig";
 import { BinaryProtocol } from "./network/protocol/binaryProtocol";
 import { CoordinateConverter } from "./utils/coordinateConverter";
+import { mountUnitViewerToggle } from "./debug/unitViewerPanel";
+import { showUnitSelectScreen } from "./ui/unitSelectScreen";
+import { StatusBarWidget } from "./ui/statusBar";
+import { StaminaPredictor } from "./utils/staminaPredictor";
 
 (async () => {
     // Check for WebGL support and detect software rendering
@@ -97,6 +101,11 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
         fpsDisplay.toggleDetailedStats();
     });
 
+    // Dev tool: floating button to inspect any unit's spritesheet row layout
+    // (see debug/unitViewerPanel.ts). Not gated behind a debug flag — cheap to
+    // leave on since the panel itself only builds on first click.
+    mountUnitViewerToggle();
+
     // Setup coordinate converter for virtual world coordinates
     // Используем реальные размеры экрана приложения
     const coordinateConverter = new CoordinateConverter(app.screen.width, app.screen.height);
@@ -104,12 +113,22 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     // Setup player manager BEFORE connecting to handle initialState
     const playerManager = new PlayerManager(playerContainer, networkManager, coordinateConverter);
 
-    // Setup player
-    const characterVisual = await SpriteLoader.loadCharacterVisual("/assets/16x16_knight_3_v3.png");
+    // Character select (GDD §54-adjacent UI, no server/network activity yet) — the
+    // server never spawns anything until the player has actually chosen a unit.
+    const localUnit = await showUnitSelectScreen(app);
+    networkManager.connect(localUnit.id);
 
-    const playerSprite = characterVisual.getAnimation("idle")!;
-    playerSprite.scale.set(PLAYER.baseScale); // Используем настройки из gameSettings
-    playerSprite.animationSpeed = PLAYER.animationSpeed; // Используем настройки из gameSettings
+    // The real per-unit spritesheet is tried first (see spriteLoader.ts /
+    // animationLayout.ts); any unit whose sheet doesn't decode cleanly yet falls
+    // back to the placeholder knight rather than staying invisible. Already
+    // resolved and cached from the select screen, so this is instant.
+    const characterVisual = await SpriteLoader.loadUnitCharacterVisual(localUnit).catch(() =>
+        SpriteLoader.loadCharacterVisual("/assets/16x16_knight_3_v3.png")
+    );
+
+    const playerSprite = characterVisual.getAnimation(characterVisual.directional ? "idle_right" : "idle")!;
+    playerSprite.scale.set(characterVisual.scale);
+    playerSprite.animationSpeed = localUnit.animationSpeed;
     playerSprite.play();
 
     // Set initial player position at virtual world center (will be updated when connected to server)
@@ -118,12 +137,28 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     playerSprite.position.set(screenCenter.x, screenCenter.y);
     playerContainer.addChild(playerSprite);
 
-    const animationController = new AnimationController(characterVisual.animations, playerSprite);
+    const localStatusBar = new StatusBarWidget();
+    playerContainer.addChild(localStatusBar.container);
+
+    // Predicts stamina locally every frame (see staminaPredictor.ts) instead of
+    // waiting on the low-frequency UNIT_ROSTER channel — corrected whenever a real
+    // roster value arrives, the same "predict, then correct" shape as movement.
+    const staminaPredictor = new StaminaPredictor(localUnit);
+    networkManager.onUnitRoster((entries) => {
+        const own = entries[networkManager.getPlayerId()];
+        if (own) staminaPredictor.reconcile(own.stamina);
+    });
+
+    const animationController = new AnimationController(characterVisual, playerSprite);
     const movementController = new MovementController(input, playerSprite.position, playerSprite.scale);
+    movementController.setStaminaProvider(() => staminaPredictor.current);
+    movementController.setBlockingProvider(() => networkManager.getPlayers()[networkManager.getPlayerId()]?.blocking ?? false);
+    movementController.setUnit(localUnit);
 
     // Обработчик начала атаки - сообщаем MovementController
     animationController.onAttackStart(() => {
         movementController.setAttackStarted();
+        staminaPredictor.onAttackStart();
     });
 
     // Обработчик окончания атаки - отправляем текущее состояние движения на сервер
@@ -194,9 +229,9 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     });
 
     // Local player attack animation — triggered by server confirmation via gameState
-    networkManager.onPlayerAttack((playerId) => {
+    networkManager.onPlayerAttack((playerId, _position, comboStep) => {
         if (playerId === networkManager.getPlayerId()) {
-            animationController.handleAttack();
+            animationController.handleAttack(comboStep);
         }
     });
 
@@ -204,7 +239,7 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
     app.canvas.addEventListener("mousedown", (e) => {
         if (e.button === 0 && animationController.playerState !== PlayerState.ATTACKING) {
             // Gate: don't spam while animation is still playing locally
-            const position = { x: playerSprite.position.x, y: playerSprite.position.y };
+            const position = movementController.getScreenPosition();
             const attackMsg = {
                 type: 'attack' as const,
                 position
@@ -212,6 +247,34 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
             const binaryData = BinaryProtocol.encodeAttack(attackMsg);
             networkManager.sendAttack(binaryData);
         }
+    });
+
+    // Block handling (RMB, GDD §54) — held state, server-authoritative: it silently
+    // no-ops for units with no block profile and auto-cancels on movement/empty
+    // stamina (see server TryBlockStart/updateBlockDrain), so the client just
+    // forwards press/release intent.
+    app.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+    app.canvas.addEventListener("mousedown", (e) => {
+        if (e.button !== 2) return;
+        // Predict block locally before the BLOCK_START round-trip: otherwise the
+        // client keeps resending the held WASD vector every tick while waiting for
+        // confirmation, which immediately cancels the server's freshly-entered
+        // block state the instant it reasserts non-zero velocity (see world.go
+        // updateBlockDrain) — block would then only ever stick by lucky timing.
+        // Gated on the unit having a block profile at all, same as the server.
+        if (localUnit.block) movementController.requestBlock();
+        networkManager.sendBlockStart();
+    });
+    app.canvas.addEventListener("mouseup", (e) => {
+        if (e.button !== 2) return;
+        movementController.releaseBlock();
+        networkManager.sendBlockEnd();
+    });
+    // A backgrounded tab may never deliver the mouseup — release block so it
+    // doesn't stay stuck server-side (mirrors InputManager's key-state suspend).
+    window.addEventListener("blur", () => {
+        movementController.releaseBlock();
+        networkManager.sendBlockEnd();
     });
 
     // Fixed timestep for physics updates
@@ -241,17 +304,38 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
         while (accumulator >= fixedTimeStep) {
             // Always update movement - let MovementController decide attack behavior
             const isMoving = movementController.update(fixedTimeStep);
-            movementController.updateScale(input.mousePosition.x);
+            movementController.updateFacing(input.mousePosition.x, input.mousePosition.y);
 
-            // Set animation state based on attack state and movement
+            // Set animation state based on attack/block state and movement. Block is
+            // server-authoritative (see BLOCK_START/BLOCK_END handlers above) — the
+            // local player's own gameState record carries it like any other player's.
+            const isBlocking = networkManager.getPlayers()[networkManager.getPlayerId()]?.blocking ?? false;
             if (animationController.playerState !== PlayerState.ATTACKING) {
-                animationController.setState(isMoving ? PlayerState.MOVING : PlayerState.IDLE);
+                if (isBlocking) {
+                    animationController.setState(PlayerState.BLOCKING);
+                } else {
+                    animationController.setState(
+                        isMoving ? PlayerState.MOVING : PlayerState.IDLE,
+                        movementController.isSprinting
+                    );
+                }
             }
             // During attack, keep ATTACKING state and don't change it
+
+            // Predict stamina drain/regen at the same fixed cadence as the rest of
+            // the simulation (see staminaPredictor.ts) — corrected by the roster
+            // reconcile callback above whenever the real value arrives.
+            staminaPredictor.update(fixedTimeStep, { blocking: isBlocking, sprinting: movementController.isSprinting });
 
             // Decrease accumulated time
             accumulator -= fixedTimeStep;
         }
+
+        // Blend the local player's rendered position between the last two ticks —
+        // physics only advances at TICK_RATE, but this callback (and thus the
+        // actual draw) runs at display refresh rate, which is normally higher.
+        // Without this the sprite sits still for several frames then jumps.
+        movementController.render(accumulator / fixedTimeStep);
 
         // Interpolation is a rendering concern and must run on every rendered frame,
         // independently from the fixed-rate local simulation loop.
@@ -259,6 +343,14 @@ import { CoordinateConverter } from "./utils/coordinateConverter";
 
         // Update animation and visual state (can run at variable frame rate)
         animationController.playerRef.scale.copyFrom(movementController.scale);
+
+        localStatusBar.update(
+            networkManager.getHp(),
+            localUnit.hp,
+            staminaPredictor.current,
+            localUnit.stamina
+        );
+        localStatusBar.setPosition(playerSprite.position.x, playerSprite.position.y - playerSprite.height / 2);
     });
     console.log("Game loop started");
 })();

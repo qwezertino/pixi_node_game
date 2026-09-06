@@ -14,11 +14,19 @@ export class InputManager {
     }
 
     private init() {
+        // Keyed by e.code (physical key position), not e.key (the character it
+        // produces) — WASD must stay in the same physical spot regardless of the
+        // user's keyboard layout (Cyrillic, AZERTY, ...). ShiftLeft/ShiftRight are
+        // additionally mirrored onto a synthetic "Shift" so callers don't need to
+        // check both.
         window.addEventListener("keydown", (e) => {
-            this.keysPressed[e.key.toLowerCase()] = true;
+            this.keysPressed[e.code] = true;
+            if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+                this.keysPressed["Shift"] = true;
+            }
 
             // Handle F3 key specifically
-            if (e.key === 'F3' && !this.f3Pressed) {
+            if (e.code === "F3" && !this.f3Pressed) {
                 this.f3Pressed = true;
                 e.preventDefault(); // Prevent browser's default F3 behavior
                 if (this.onF3Callback) {
@@ -28,10 +36,13 @@ export class InputManager {
         });
 
         window.addEventListener("keyup", (e) => {
-            this.keysPressed[e.key.toLowerCase()] = false;
+            this.keysPressed[e.code] = false;
+            if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+                this.keysPressed["Shift"] = !!this.keysPressed["ShiftLeft"] || !!this.keysPressed["ShiftRight"];
+            }
 
             // Reset F3 pressed state
-            if (e.key === 'F3') {
+            if (e.code === "F3") {
                 this.f3Pressed = false;
             }
         });

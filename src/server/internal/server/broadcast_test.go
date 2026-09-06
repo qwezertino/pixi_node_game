@@ -129,7 +129,7 @@ func TestReleaseConnSliceClearsPointers(t *testing.T) {
 func newDilationTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &config.Config{
-		Game: config.GameConfig{TickRate: 20, PlayerSpeedPerTick: 4},
+		Game: config.GameConfig{TickRate: 20},
 		World: config.WorldConfig{
 			Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000,
 		},

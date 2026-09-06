@@ -6,8 +6,12 @@ import {
     AnimationController,
     PlayerState as AnimationPlayerState,
 } from "../controllers/animationController";
-import { MOVEMENT, PLAYER } from "../../shared/gameConfig";
+import { unitsPerTick } from "../utils/movement";
 import { CoordinateConverter } from "../utils/coordinateConverter";
+import { getUnitDefinitionByTypeId, type UnitDefinition } from "../../shared/units";
+import type { Direction } from "../utils/animationLayout";
+import { StatusBarWidget } from "../ui/statusBar";
+import { StaminaPredictor } from "../utils/staminaPredictor";
 //import { LagCompensationSystem } from "../utils/lagCompensation";
 
 // Represents a remote player in the game
@@ -28,9 +32,22 @@ const MAX_SNAPSHOTS = 32;
 class RemotePlayer {
     sprite: AnimatedSprite;
     animationController: AnimationController;
-    direction: -1 | 1 = 1;
+    // Stats/properties for this player's unit (see shared/units.ts).
+    unitDefinition: UnitDefinition;
+    // Current HP (see PlayerAttributes) — undefined until the roster entry for this
+    // player has arrived. Nothing drains HP yet, so in practice it sits at
+    // unitDefinition.hp from spawn onward.
+    currentHp: number | undefined;
+    // Stamina is predicted locally every frame instead (see staminaPredictor.ts) and
+    // corrected whenever a roster entry arrives — the roster's own cadence is too
+    // slow now that sprint/block/attacks actually drain it.
+    readonly staminaPredictor: StaminaPredictor;
+    readonly statusBar = new StatusBarWidget();
+    direction: Direction = "right";
     movementVector: { dx: number; dy: number } = { dx: 0, dy: 0 };
     isMoving: boolean = false;
+    isBlocking: boolean = false;
+    isSprinting: boolean = false;
 
     // Буфер серверных позиций для интерполяции
     private snapshots: PositionSnapshot[] = [];
@@ -50,9 +67,12 @@ class RemotePlayer {
         public id: string,
         public position: Point, // Экранная позиция спрайта
         characterVisual: CharacterVisual,
+        unitDefinition: UnitDefinition,
         coordinateConverter?: CoordinateConverter,
         virtualPosition?: { x: number; y: number } // Позиция в виртуальном мире
     ) {
+        this.unitDefinition = unitDefinition;
+        this.staminaPredictor = new StaminaPredictor(unitDefinition);
         this.coordinateConverter = coordinateConverter || null;
 
         if (virtualPosition) {
@@ -71,7 +91,7 @@ class RemotePlayer {
                 this.virtualPosition.y = Math.round(position.y);
             }
         }
-        this.sprite = characterVisual.getAnimation("idle")!;
+        this.sprite = characterVisual.getAnimation(characterVisual.directional ? "idle_right" : "idle")!;
 
         if (this.coordinateConverter) {
             const screenPos = this.coordinateConverter.virtualToScreen(this.virtualPosition.x, this.virtualPosition.y);
@@ -82,12 +102,12 @@ class RemotePlayer {
             this.sprite.position.copyFrom(position);
         }
 
-        this.sprite.scale.set(PLAYER.baseScale);
-        this.sprite.animationSpeed = PLAYER.animationSpeed;
+        this.sprite.scale.set(characterVisual.scale);
+        this.sprite.animationSpeed = unitDefinition.animationSpeed;
         this.sprite.play();
 
         this.animationController = new AnimationController(
-            characterVisual.animations,
+            characterVisual,
             this.sprite
         );
     }
@@ -119,7 +139,13 @@ class RemotePlayer {
             return;
         }
 
-        const step = MOVEMENT.playerSpeedPerTick * elapsedTicks;
+        let step = unitsPerTick(this.unitDefinition) * elapsedTicks;
+        // Same diagonal-speed correction as movementController.ts/world.go: moving
+        // on both axes at once must not cover sqrt(2)x the distance of a
+        // straight move.
+        if (this.movementVector.dx !== 0 && this.movementVector.dy !== 0) {
+            step = Math.round(step * Math.SQRT1_2);
+        }
         this.pushSnapshot(
             last.x + this.movementVector.dx * step,
             last.y + this.movementVector.dy * step,
@@ -170,10 +196,12 @@ class RemotePlayer {
         }
     }
 
-    update(_deltaTime: number) {
+    update(deltaTime: number) {
         const isAttacking =
             this.animationController.playerState ===
             AnimationPlayerState.ATTACKING;
+
+        this.staminaPredictor.update(deltaTime, { blocking: this.isBlocking, sprinting: this.isSprinting });
 
         // Entity interpolation: рендерим позицию на adaptive delay в прошлом.
         // Это означает что мы всегда имеем два снимка вокруг целевого времени —
@@ -231,14 +259,22 @@ class RemotePlayer {
         // Если снимков нет — не двигаем, ждём первого gameState
 
         // Анимация
+        this.animationController.setDirection(this.direction);
         if (!isAttacking) {
-            this.animationController.setState(
-                this.isMoving ? AnimationPlayerState.MOVING : AnimationPlayerState.IDLE
-            );
+            if (this.isBlocking) {
+                this.animationController.setState(AnimationPlayerState.BLOCKING);
+            } else {
+                this.animationController.setState(
+                    this.isMoving ? AnimationPlayerState.MOVING : AnimationPlayerState.IDLE,
+                    this.isSprinting
+                );
+            }
         }
 
         this.sprite.position.copyFrom(this.position);
-        this.sprite.scale.x = this.direction * Math.abs(this.sprite.scale.x);
+
+        this.statusBar.update(this.currentHp, this.unitDefinition.hp, this.staminaPredictor.current, this.unitDefinition.stamina);
+        this.statusBar.setPosition(this.position.x, this.position.y - this.sprite.height / 2);
     }
 
     setMovementVector(dx: number, dy: number) {
@@ -247,16 +283,16 @@ class RemotePlayer {
         this.isMoving = dx !== 0 || dy !== 0;
     }
 
-    setDirection(direction: -1 | 1) {
+    setDirection(direction: Direction) {
         this.direction = direction;
     }
 
-    performAttack() {
+    performAttack(comboStep: number) {
         this.movementVector.dx = 0;
         this.movementVector.dy = 0;
         this.isMoving = false;
 
-        this.animationController.setState(AnimationPlayerState.ATTACKING);
+        this.animationController.handleAttack(comboStep);
     }
 
     /**
@@ -339,10 +375,26 @@ export class PlayerManager {
             }
         });
 
-        this.networkManager.onPlayerAttack((playerId) => {
+        this.networkManager.onPlayerAttack((playerId, _position, comboStep) => {
             const player = this.remotePlayers.get(playerId);
             if (player) {
-                player.performAttack();
+                player.performAttack(comboStep);
+            }
+        });
+
+        // A remote player can be created before its unit-roster entry arrives (the
+        // roster is a separate, lower-frequency message — see networkManager.ts).
+        // Backfill unitDefinition/HP/stamina once it does, instead of leaving them
+        // stuck at the default fallback for up to one full-sync cycle.
+        this.networkManager.onUnitRoster((entries) => {
+            for (const [playerId, attrs] of Object.entries(entries)) {
+                const player = this.remotePlayers.get(playerId);
+                if (player) {
+                    player.unitDefinition = getUnitDefinitionByTypeId(attrs.unitType);
+                    player.staminaPredictor.setUnit(player.unitDefinition);
+                    player.currentHp = attrs.hp;
+                    player.staminaPredictor.reconcile(attrs.stamina);
+                }
             }
         });
 
@@ -378,6 +430,8 @@ export class PlayerManager {
 
                     existingPlayer.direction = playerState.direction;
                     existingPlayer.isMoving = playerState.moving;
+                    existingPlayer.isBlocking = playerState.blocking ?? false;
+                    existingPlayer.isSprinting = playerState.sprinting ?? false;
                     existingPlayer.setMovementVector(
                         playerState.vx ?? 0,
                         playerState.vy ?? 0
@@ -398,6 +452,18 @@ export class PlayerManager {
         });
     }
 
+    // Real per-unit spritesheets aren't fully verified for every unit yet (see
+    // spriteLoader.ts / animationLayout.ts) — fall back to the placeholder knight
+    // sheet for any unit whose sheet doesn't decode cleanly instead of leaving the
+    // player invisible.
+    private async loadVisualFor(unit: UnitDefinition): Promise<CharacterVisual> {
+        try {
+            return await SpriteLoader.loadUnitCharacterVisual(unit);
+        } catch {
+            return SpriteLoader.loadCharacterVisual("/assets/16x16_knight_2_v3.png");
+        }
+    }
+
     async addRemotePlayer(playerState: PlayerState) {
         if (this.remotePlayers.has(playerState.id)) {
             return;
@@ -415,10 +481,8 @@ export class PlayerManager {
     }
 
     private async createRemotePlayer(playerState: PlayerState): Promise<void> {
-
-        const characterVisual = await SpriteLoader.loadCharacterVisual(
-            "/assets/16x16_knight_2_v3.png"
-        );
+        const unitDefinition = getUnitDefinitionByTypeId(this.networkManager.getUnitType(playerState.id));
+        const characterVisual = await this.loadVisualFor(unitDefinition);
 
         // The player may have left while the shared asset promise was resolving.
         if (this.remotePlayers.has(playerState.id) || !this.networkManager.getPlayers()[playerState.id]) {
@@ -435,12 +499,18 @@ export class PlayerManager {
             playerState.id,
             position,
             characterVisual,
+            unitDefinition,
             this.coordinateConverter,
             playerState.position
         );
 
         remotePlayer.direction = playerState.direction;
         remotePlayer.isMoving = playerState.moving;
+        remotePlayer.isBlocking = playerState.blocking ?? false;
+        remotePlayer.isSprinting = playerState.sprinting ?? false;
+        remotePlayer.currentHp = this.networkManager.getHp(playerState.id);
+        const knownStamina = this.networkManager.getStamina(playerState.id);
+        if (knownStamina !== undefined) remotePlayer.staminaPredictor.reconcile(knownStamina);
 
         if (playerState.movementVector) {
             remotePlayer.setMovementVector(
@@ -450,6 +520,7 @@ export class PlayerManager {
         }
 
         this.playerContainer.addChild(remotePlayer.sprite);
+        this.playerContainer.addChild(remotePlayer.statusBar.container);
 
         this.remotePlayers.set(playerState.id, remotePlayer);
     }
@@ -463,9 +534,7 @@ export class PlayerManager {
      */
     updateAllPlayerPositions(): void {
         if (this.movementController) {
-            const currentVirtualPos = this.movementController.getVirtualPosition();
-            const newScreenPos = this.coordinateConverter.virtualToScreen(currentVirtualPos.x, currentVirtualPos.y);
-            this.movementController.position.set(newScreenPos.x, newScreenPos.y);
+            this.movementController.refreshScreenPositionFromVirtual();
         }
 
         for (const [, remotePlayer] of this.remotePlayers.entries()) {
@@ -484,9 +553,11 @@ export class PlayerManager {
 
         if (player) {
             this.playerContainer.removeChild(player.sprite);
+            this.playerContainer.removeChild(player.statusBar.container);
             this.remotePlayers.delete(playerId);
             player.sprite.stop();
             player.sprite.destroy();
+            player.statusBar.destroy();
         }
     }
 

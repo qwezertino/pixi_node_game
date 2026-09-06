@@ -17,6 +17,8 @@ const (
 	MessageAttack         = 5  // ATTACK
 	MessageAttackEnd      = 6  // ATTACK_END
 	MessageViewportUpdate = 13 // Custom viewport (separate from attack)
+	MessageBlockStart     = 20 // BLOCK_START (RMB pressed)
+	MessageBlockEnd       = 21 // BLOCK_END (RMB released)
 
 	// Server -> Client messages
 	MessageGameState      = 7  // GAME_STATE (full)
@@ -28,9 +30,81 @@ const (
 	MessageSyncRequest    = 16 // SYNC_REQUEST (client detected a delta sequence gap)
 	MessagePing           = 17 // PING (application RTT nonce)
 	MessagePong           = 18 // PONG (echoes application RTT nonce)
+	MessageUnitRoster     = 19 // UNIT_ROSTER (playerID -> unit type, sent on connect and once per full-sync)
 )
 
-// ProtocolVersion 6 adds a time-dilation factor to every world-state frame (EVE-style
+// Direction wire codes for MessageDirection and the per-player flags byte (see
+// appendWorldState) — must match DIRECTIONS order in the client's animationLayout.ts.
+const (
+	DirectionRight uint8 = 0
+	DirectionLeft  uint8 = 1
+	DirectionDown  uint8 = 2
+	DirectionUp    uint8 = 3
+)
+
+// Per-player flags byte layout (see appendWorldState/EncodePlayerJoined):
+// bits 0-1 core state (types.StateIdle/Attacking/Blocking), bit 2 sprinting
+// (PlayerState.Sprinting — GDD §54 walk-vs-run), bits 3-4 combo step (0-3, i.e.
+// step 1-4 — PlayerState.ComboStep, see version 12 below), bit 5 reserved, bits
+// 6-7 direction code (DirectionRight etc.).
+const (
+	flagsStateMask      uint8 = 0x03
+	flagsSprinting      uint8 = 0x04
+	flagsComboStepMask  uint8 = 0x18
+	flagsComboStepShift       = 3
+	// maxWireComboStep is the largest step flagsComboStepMask can carry (2 bits).
+	// A unit whose comboSteps ever exceeds this needs another protocol bump.
+	maxWireComboStep uint8 = 4
+)
+
+// playerFlags packs one player's state/sprint/comboStep/direction into the wire
+// flags byte. comboStep is 1-indexed (0 or 1 both mean "step 1" on the wire —
+// 0 is never sent by the server, ComboStep starts at 1 on the first swing).
+func playerFlags(state uint8, sprinting bool, comboStep uint8, direction uint8) uint8 {
+	if comboStep == 0 {
+		comboStep = 1
+	}
+	if comboStep > maxWireComboStep {
+		comboStep = maxWireComboStep
+	}
+	flags := state&flagsStateMask | (direction&0x03)<<6
+	flags |= (comboStep - 1) << flagsComboStepShift & flagsComboStepMask
+	if sprinting {
+		flags |= flagsSprinting
+	}
+	return flags
+}
+
+// ProtocolVersion 12 replicates which step of its combo chain an attack is
+// (GDD §54-adjacent combo system) — repurposes 2 of the 3 previously-reserved
+// bits in the per-player flags byte (bits 3-4, up to 4 steps without another
+// version bump). The client uses this instead of randomly picking attack1/attack2
+// on every swing (see AnimationController.startAttackAnimation).
+// Version 11 replicates whether a player is actually sprinting this tick
+// (GDD §54: walk and run are distinct animations, sprint should visibly swap one
+// for the other for every client, not just predict it locally) — repurposes 1 of
+// the 4 previously-unused bits in the per-player flags byte's state field: bits
+// 0-1 are now the core state (0/1/2, same values as before), bit 2 is the new
+// "sprinting" flag, bits 3-5 stay reserved. Direction (bits 6-7) is unchanged.
+// Version 10 adds sprint and block (GDD §54/§57): MOVE's packed movement
+// byte gains a third bit (0x10, alongside the existing 2-bit dx/dy fields) carrying
+// the client's held-Shift intent for that sample, and two new zero-payload messages
+// BLOCK_START/BLOCK_END (RMB press/release) drive a new player State value,
+// StateBlocking (2) — State was already 6 bits wide (see version 8 below) with only
+// 0/1 in use, so this needed no wire format change beyond the new value itself.
+// Version 9 adds current HP/stamina to UNIT_ROSTER entries (see
+// types.UnitAssignment) — same low-frequency channel as unit type, not the per-tick
+// world state, since nothing drains either yet so they never change after spawn.
+// Version 8 adds up/down facing: the flags byte in every world-state record
+// now packs a 2-bit direction code (bits 6-7, see DirectionRight etc.) instead of a
+// single facing-right bit, so State only gets 6 bits (0-63) instead of 7 — plenty,
+// since it currently only uses 0/1. MessageDirection's payload changed the same way,
+// from a signed -1/1 byte to an unsigned 0-3 code.
+// Version 7 adds unit type: WELCOME carries the connecting client's assigned
+// unit (units.Definition.TypeID), and a new UNIT_ROSTER message replicates other
+// players' unit types. Unlike position/velocity, unit type never changes after spawn,
+// so it rides its own low-frequency channel instead of every world-state record.
+// Version 6 adds a time-dilation factor to every world-state frame (EVE-style
 // TiDi: the server slows its own tick rate under pressure instead of silently
 // throttling replication, and the client needs the current factor to scale its local
 // prediction step so it doesn't run ahead of a dilated server).
@@ -43,7 +117,7 @@ const (
 // the fanout shed. Version 2 introduced varint-delta player IDs: records are sorted by
 // ID so each delta is positive and, for the dense IDs the server hands out, almost
 // always fits in one byte instead of four.
-const ProtocolVersion = 6
+const ProtocolVersion = 12
 
 // worldStateHeaderSize — type(1) + stateSequence(4) + worldTick(4) + playerCount(4) +
 // dilationBps(2).
@@ -101,11 +175,7 @@ func appendWorldState(dst []byte, messageType uint8, players []types.PlayerState
 		dst = binary.LittleEndian.AppendUint16(dst, player.Y)
 		dst = append(dst, uint8(player.VX), uint8(player.VY))
 
-		flags := uint8(player.State & 0x7F)
-		if player.FacingRight {
-			flags |= 0x80
-		}
-		dst = append(dst, flags)
+		dst = append(dst, playerFlags(player.State, player.Sprinting, player.ComboStep, player.Direction))
 	}
 
 	return dst
@@ -124,10 +194,15 @@ type MovementVector struct {
 type ClientMessage struct {
 	Type           uint8
 	MovementVector MovementVector
-	Direction      bool // FacingRight
+	Sprint         bool  // MOVE only — held-Shift intent, see MoveSprintBit
+	Direction      uint8 // 0-3, see DirectionRight etc.
 	InputSequence  uint32
 	Nonce          uint32
 }
+
+// MoveSprintBit is bit 4 of a MOVE message's packed movement byte (bits 0-3 are
+// dx/dy, see PackMovement) — set when the client is holding Shift for that sample.
+const MoveSprintBit = 0x10
 
 // PackMovement упаковывает движение в один байт (совместимо с artillery-processor.cjs)
 func PackMovement(dx, dy int8) uint8 {
@@ -161,18 +236,19 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (ClientMessage, error
 		if len(data) != 6 {
 			return ClientMessage{}, fmt.Errorf("move message has invalid length")
 		}
-		if data[1]&0xf0 != 0 || data[1]&0x03 == 0x03 || (data[1]>>2)&0x03 == 0x03 {
+		if data[1]&0xe0 != 0 || data[1]&0x03 == 0x03 || (data[1]>>2)&0x03 == 0x03 {
 			return ClientMessage{}, fmt.Errorf("move message has invalid vector")
 		}
 		movement := UnpackMovement(data[1])
 		msg.MovementVector = movement
+		msg.Sprint = data[1]&MoveSprintBit != 0
 		msg.InputSequence = binary.LittleEndian.Uint32(data[2:6])
 
 	case MessageDirection:
-		if len(data) != 2 || (data[1] != 1 && data[1] != 0xff) {
+		if len(data) != 2 || data[1] > DirectionUp {
 			return ClientMessage{}, fmt.Errorf("direction message is invalid")
 		}
-		msg.Direction = data[1] == 1
+		msg.Direction = data[1]
 
 	case MessageAttack:
 		if len(data) != 9 {
@@ -182,6 +258,16 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (ClientMessage, error
 	case MessageAttackEnd:
 		if len(data) != 1 {
 			return ClientMessage{}, fmt.Errorf("attack-end message has invalid length")
+		}
+
+	case MessageBlockStart:
+		if len(data) != 1 {
+			return ClientMessage{}, fmt.Errorf("block-start message has invalid length")
+		}
+
+	case MessageBlockEnd:
+		if len(data) != 1 {
+			return ClientMessage{}, fmt.Errorf("block-end message has invalid length")
 		}
 
 	case MessageSyncRequest:
@@ -252,11 +338,7 @@ func (bp *BinaryProtocol) EncodePlayerJoined(player types.PlayerState) []byte {
 	buffer[offset] = uint8(player.VY)
 	offset++
 
-	flags := uint8(player.State & 0x7F)
-	if player.FacingRight {
-		flags |= 0x80
-	}
-	buffer[offset] = flags
+	buffer[offset] = playerFlags(player.State, player.Sprinting, player.ComboStep, player.Direction)
 
 	return buffer
 }
@@ -299,12 +381,49 @@ func (bp *BinaryProtocol) EncodeMovementAck(playerID uint32, x, y uint16, inputS
 
 // EncodeWelcome identifies the connection explicitly. Inferring the local player from
 // map/order state is racy when multiple clients connect at the same time.
-// Format: type(1) + protocolVersion(1) + tickRateHz(2) + playerID(4) = 8 bytes.
-func (bp *BinaryProtocol) EncodeWelcome(playerID uint32, tickRate uint16) []byte {
-	buffer := make([]byte, 8)
+// Format: type(1) + protocolVersion(1) + tickRateHz(2) + playerID(4) + unitType(1) = 9 bytes.
+func (bp *BinaryProtocol) EncodeWelcome(playerID uint32, tickRate uint16, unitType uint8) []byte {
+	buffer := make([]byte, 9)
 	buffer[0] = MessageWelcome
 	buffer[1] = ProtocolVersion
 	binary.LittleEndian.PutUint16(buffer[2:], tickRate)
 	binary.LittleEndian.PutUint32(buffer[4:], playerID)
+	buffer[8] = unitType
 	return buffer
+}
+
+// EncodeUnitRoster encodes a batch of unit assignments (type + current HP/stamina).
+// Sent once to a newly connected client (covering every player already in the
+// world) and rebroadcast to everyone once per full-sync cycle, so clients that
+// joined since the last roster learn about them without a dedicated per-join
+// fanout (see server.broadcastTick). See types.UnitAssignment for why HP/stamina
+// are safe to replicate at this cadence today.
+// Format: type(1) + count(varint) + count * [idDelta(varint) + unitType(1) + hp(u16) + staminaCenti(u16)].
+// IDs are delta-encoded against the previous entry the same way world-state records
+// are — entries are sorted ascending first. hp/staminaCenti are little-endian.
+func (bp *BinaryProtocol) EncodeUnitRoster(entries []types.UnitAssignment) []byte {
+	slices.SortFunc(entries, func(a, b types.UnitAssignment) int {
+		switch {
+		case a.ID < b.ID:
+			return -1
+		case a.ID > b.ID:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	dst := make([]byte, 0, 2+len(entries)*7)
+	dst = append(dst, MessageUnitRoster)
+	dst = appendUvarint(dst, uint32(len(entries)))
+
+	prevID := uint32(0)
+	for _, e := range entries {
+		dst = appendUvarint(dst, e.ID-prevID)
+		prevID = e.ID
+		dst = append(dst, e.UnitType)
+		dst = binary.LittleEndian.AppendUint16(dst, e.CurrentHP)
+		dst = binary.LittleEndian.AppendUint16(dst, e.CurrentStamina)
+	}
+	return dst
 }

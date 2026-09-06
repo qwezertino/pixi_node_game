@@ -14,107 +14,101 @@ import (
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/systems"
 	"pixi_game_server/internal/types"
+	"pixi_game_server/internal/units"
 )
 
-// broadcastFuncHolder оборачивает функцию для хранения в atomic.Value.
 type broadcastFuncHolder struct {
 	fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32) bool
 }
 
-// tickWorkerInput — chunk of player pointers dispatched to a persistent tick worker.
-// Workers do only the CPU-heavy part (position update + attack timeout).
-// State snapshot (ToState + delta) remains sequential in the gameLoop goroutine.
 type tickWorkerInput struct {
-	ptrs                []*types.Player
-	nowNano             int64
-	worldTick           uint32
-	attackDurationTicks uint32
+	ptrs      []*types.Player
+	nowNano   int64
+	worldTick uint32
 }
 
 // GameWorld управляет состоянием игрового мира
 type GameWorld struct {
-	cfg        *config.Config
-	playersMu  sync.RWMutex
-	playersMap map[uint32]*types.Player
-
-	// Tick-driven broadcast: вызывается раз в тик с текущим состоянием всех игроков.
-	// Хранится в atomic.Value — записывается один раз из SetTickBroadcaster,
-	// читается из gameLoop горутины. Прямой вызов из tick() — никаких аллокаций.
-	broadcastFn atomic.Value // stores broadcastFuncHolder
-
-	// High-performance systems
-	visibilityManager *systems.VisibilityManager
-
-	// Delta tracking: previous tick state for each player
-	prevStates map[uint32]types.PlayerState
-	tickCount  uint32 // atomic; simulation tick counter, replicated so clients can dead-reckon
-	// Reusable scratch buffers for tick() — only touched from gameLoop goroutine, no sync needed.
-	scratchStates  []types.PlayerState
-	scratchChanged []types.PlayerState
-	scratchSeenIDs map[uint32]struct{}
-	// scratchPtrs holds a snapshot of player pointers taken under a brief RLock each tick.
-	// Processing (position update + ToState) happens outside the lock since all Player
-	// fields are atomic — the lock only protects the map structure itself.
-	scratchPtrs []*types.Player
-	// Persistent tick worker pool (pattern from nbio/nakama).
-	// Workers are created once in NewGameWorld; each tick dispatches a chunk of players
-	// via a buffered channel. Workers do only the expensive part (updatePlayerPosition +
-	// attack timeout). State collection (ToState + delta) stays in gameLoop goroutine.
-	// Avoids per-tick goroutine spawn overhead (~2µs/goroutine × N workers).
-	nTickWorkers  int
-	tickWorkerChs []chan tickWorkerInput
-	tickWorkerWg  sync.WaitGroup // Performance metrics
-	tickDuration  int64          // atomic
-	lastSyncTime  int64          // atomic
-
-	// Tick management. ticker is an atomic.Pointer because SetTickInterval can be
-	// called from the gameLoop goroutine itself (the normal, production path — tick()
-	// invokes it synchronously) or, in tests exercising the dilation controller in
-	// isolation, from a different goroutine — it must be safe either way.
-	ticker   atomic.Pointer[time.Ticker]
-	stopChan chan struct{}
-	// Time dilation (EVE-style): nominalTickIntervalNs is the configured TickRate
-	// baseline, fixed at startup. currentTickIntervalNs is what the ticker actually
-	// runs at right now — Server slows it under pressure via SetTickInterval so
-	// movement/cooldowns (unchanged in tick-units) take proportionally longer in
-	// wall-clock time, instead of the simulation silently falling behind.
+	cfg                   *config.Config
+	playersMu             sync.RWMutex
+	playersMap            map[uint32]*types.Player
+	broadcastFn           atomic.Value // stores broadcastFuncHolder
+	visibilityManager     *systems.VisibilityManager
+	prevStates            map[uint32]types.PlayerState
+	tickCount             uint32
+	scratchStates         []types.PlayerState
+	scratchChanged        []types.PlayerState
+	scratchSeenIDs        map[uint32]struct{}
+	scratchPtrs           []*types.Player
+	nTickWorkers          int
+	tickWorkerChs         []chan tickWorkerInput
+	tickWorkerWg          sync.WaitGroup // Performance metrics
+	tickDuration          int64          // atomic
+	lastSyncTime          int64          // atomic
+	ticker                atomic.Pointer[time.Ticker]
+	stopChan              chan struct{}
 	nominalTickIntervalNs int64 // atomic
 	currentTickIntervalNs int64 // atomic
-	// AttackDuration converted to a tick count once at startup, so attack cooldown
-	// is measured in ticks (like movement) instead of wall-clock nanoseconds. Under
-	// time dilation the ticker itself slows down, so a fixed tick count takes
-	// proportionally longer in real time — attacks dilate the same way movement does.
-	attackDurationTicks uint32
-
-	// Player ID generation
-	nextPlayerID uint32 // atomic
-
-	// Estimated player count for pre-allocation
-	playerCountEstimate uint32 // atomic
-
-	// State for full sync
-	lastFullSync time.Time
-	// Delta composition for the current tick (gameLoop goroutine only)
-	deltaVectorChanges int
-	deltaPositionOnly  int
-	deltaClamped       int
-	deltaKeyframes     int
-
-	// Baseline bookkeeping for dead-reckoning-aware deltas.
-	prevBaselineTick uint32
-	keyframeCursor   uint32
-
-	// Accumulated since the last composition log — a single tick is too noisy to
-	// judge the payoff of velocity replication from.
+	// attackDurationTicks is per unit type (windup+active+recovery, GDD/UNITS.md),
+	// not one flat cooldown for everyone — see NewGameWorld.
+	attackDurationTicks map[uint8]uint32
+	// comboSteps is how many steps this unit's attack combo chain has (1 = no
+	// combo, just re-attacks) — see units.Definition.ComboSteps.
+	comboSteps map[uint8]uint8
+	// comboWindowTicks is how long past a swing's own duration a new swing still
+	// continues the chain instead of resetting to step 1 — see
+	// units.Definition.ComboWindowSeconds.
+	comboWindowTicks         map[uint8]uint32
+	nextPlayerID             uint32 // atomic
+	playerCountEstimate      uint32 // atomic
+	lastFullSync             time.Time
+	deltaVectorChanges       int
+	deltaPositionOnly        int
+	deltaClamped             int
+	deltaKeyframes           int
+	prevBaselineTick         uint32
+	keyframeCursor           uint32
 	deltaWindowVectorChanges int64
 	deltaWindowPositionOnly  int64
 	deltaWindowClamped       int64
 	deltaWindowKeyframes     int64
 	deltaWindowBroadcasts    int64
+	lastSlowTickLog          int64 // atomic monotonic timestamp
+	lastDeltaCompositeLog    int64 // atomic monotonic timestamp
+	staminaStats             map[uint8]staminaStat
+	moveStats                map[uint8]moveStat
+}
 
-	// Throttled diagnostics
-	lastSlowTickLog       int64 // atomic monotonic timestamp
-	lastDeltaCompositeLog int64 // atomic monotonic timestamp
+// moveStat holds the fixed-point per-unit movement rate (GDD §60 World Coordinate
+// Resolution) for one unit type.
+type moveStat struct {
+	// milliUnitsPerTick is 1/1000 world units per tick — moveSpeed(m/s) *
+	// UnitsPerMeter * 1000 / TickRate. Rarely a whole number; the remainder
+	// accumulates in Player.MoveRemainderMilli and flushes a whole unit at a time
+	// (see updatePlayerPosition), the same fixed-point technique as centi-stamina.
+	milliUnitsPerTick uint32
+	// avgUnitsPerTick is milliUnitsPerTick rounded to the nearest whole unit — used
+	// only by classifyDelta's "is this predictable" bandwidth heuristic, never for
+	// actual movement. Guessing wrong there only costs bandwidth (the record gets
+	// included instead of omitted), never correctness.
+	avgUnitsPerTick int32
+}
+
+type staminaStat struct {
+	maxCenti          uint16
+	regenPerTickCenti uint16
+	// canBlock mirrors whether units.Definition.Block is set — units without a
+	// block profile (e.g. Rogue, Archer, per docs/UNITS.md) never enter StateBlocking.
+	canBlock               bool
+	blockDrainPerTickCenti uint16
+	// attackStaminaCostCenti is 0 for units with no AttackStaminaCost (GDD: a "flat
+	// cost per swing, where the doc specifies one") — indistinguishable from a real
+	// zero-cost swing, which is the desired behavior either way.
+	attackStaminaCostCenti uint16
+	// Sprint (GDD §54/§57) is per-unit, not a global constant — see
+	// units.Definition.SprintSpeedMultiplier/SprintStaminaCostPerSecond.
+	sprintSpeedMultiplier   float64
+	sprintDrainPerTickCenti uint16
 }
 
 // NewGameWorld создает новый игровой мир
@@ -128,6 +122,66 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 	changedCap := initialCap / 8
 	if changedCap < 64 {
 		changedCap = 64
+	}
+
+	// Regen is per-tick, not per-wall-clock-second, so it dilates along with
+	// movement/attacks under time dilation (see SetTickInterval) instead of quietly
+	// running at a different effective rate than the rest of the simulation.
+	staminaStats := make(map[uint8]staminaStat, len(units.All()))
+	for _, def := range units.All() {
+		stat := staminaStat{
+			maxCenti:          uint16(math.Round(def.Stamina * 100)),
+			regenPerTickCenti: uint16(math.Round(def.StaminaRegenPerSecond * 100 / float64(cfg.Game.TickRate))),
+		}
+		if def.Block != nil {
+			stat.canBlock = true
+			stat.blockDrainPerTickCenti = uint16(math.Round(def.Block.DrainPerSecond * 100 / float64(cfg.Game.TickRate)))
+		}
+		if def.AttackStaminaCost != nil {
+			stat.attackStaminaCostCenti = uint16(math.Round(*def.AttackStaminaCost * 100))
+		}
+		stat.sprintSpeedMultiplier = def.SprintSpeedMultiplier
+		stat.sprintDrainPerTickCenti = uint16(math.Round(def.SprintStaminaCostPerSecond * 100 / float64(cfg.Game.TickRate)))
+		staminaStats[def.TypeID] = stat
+	}
+
+	// Per-unit movement rate (GDD §60 World Coordinate Resolution) instead of one
+	// flat server-wide speed — every unit now actually moves at its own moveSpeed.
+	moveStats := make(map[uint8]moveStat, len(units.All()))
+	for _, def := range units.All() {
+		milli := def.MoveSpeed * cfg.Game.UnitsPerMeter * 1000 / float64(cfg.Game.TickRate)
+		moveStats[def.TypeID] = moveStat{
+			milliUnitsPerTick: uint32(math.Round(milli)),
+			avgUnitsPerTick:   int32(math.Round(milli / 1000)),
+		}
+	}
+
+	// Attack cooldown per unit type instead of one flat duration for everyone —
+	// windup+active+recovery are already per-unit in units.json (e.g. Spearman
+	// ~1.02s vs Greatsword ~1.70s), they just weren't wired to the actual cooldown.
+	attackDurationTicks := make(map[uint8]uint32, len(units.All()))
+	for _, def := range units.All() {
+		seconds := def.WindupSeconds + def.ActiveSeconds + def.RecoverySeconds
+		ticks := uint32(math.Round(seconds * float64(cfg.Game.TickRate)))
+		if ticks < 1 {
+			ticks = 1
+		}
+		attackDurationTicks[def.TypeID] = ticks
+	}
+
+	// Combo chain length/window per unit (docs/UNITS.md doesn't have a dedicated
+	// section for this yet) — units with no ComboSteps set (archer, rogue, citizen:
+	// no attack1/attack2 art, see spriteLoader.ts's melee-attack fallback) default
+	// to 1, i.e. every swing just re-attacks with no chain.
+	comboSteps := make(map[uint8]uint8, len(units.All()))
+	comboWindowTicks := make(map[uint8]uint32, len(units.All()))
+	for _, def := range units.All() {
+		steps := def.ComboSteps
+		if steps < 1 {
+			steps = 1
+		}
+		comboSteps[def.TypeID] = uint8(steps)
+		comboWindowTicks[def.TypeID] = uint32(math.Round(def.ComboWindowSeconds * float64(cfg.Game.TickRate)))
 	}
 
 	gw := &GameWorld{
@@ -144,6 +198,11 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 		scratchChanged:        make([]types.PlayerState, 0, changedCap),
 		scratchSeenIDs:        make(map[uint32]struct{}, initialCap),
 		scratchPtrs:           make([]*types.Player, 0, initialCap),
+		staminaStats:          staminaStats,
+		moveStats:             moveStats,
+		attackDurationTicks:   attackDurationTicks,
+		comboSteps:            comboSteps,
+		comboWindowTicks:      comboWindowTicks,
 	}
 
 	// Spawn persistent tick workers — one per logical CPU.
@@ -169,24 +228,20 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 	gw.nominalTickIntervalNs = nominalInterval.Nanoseconds()
 	gw.currentTickIntervalNs = nominalInterval.Nanoseconds()
 
-	gw.attackDurationTicks = uint32((cfg.Game.AttackDuration.Nanoseconds() + nominalInterval.Nanoseconds()/2) / nominalInterval.Nanoseconds())
-	if gw.attackDurationTicks < 1 {
-		gw.attackDurationTicks = 1
-	}
-
 	// Start game loop
 	go gw.gameLoop()
 
 	slog.Info("gameworld initialized",
 		"tick_rate_hz", cfg.Game.TickRate,
-		"tick_interval_ms", nominalInterval.Milliseconds(),
-		"attack_duration_ticks", gw.attackDurationTicks)
+		"tick_interval_ms", nominalInterval.Milliseconds())
 
 	return gw
 }
 
-// AddPlayer добавляет нового игрока (lock-free)
-func (gw *GameWorld) AddPlayer() *types.Player {
+// AddPlayer добавляет нового игрока (lock-free). requestedUnitType is whatever the
+// client asked for at connect time (e.g. the "unit" query param) — unknown or empty
+// values fall back to units.DefaultUnitType, so this never fails.
+func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
 	playerID := atomic.AddUint32(&gw.nextPlayerID, 1)
 
 	// Generate random spawn position within spawn area
@@ -201,10 +256,18 @@ func (gw *GameWorld) AddPlayer() *types.Player {
 		JoinTime: time.Now(),
 	}
 
+	unitDef := units.Get(requestedUnitType)
+
 	player.SetX(spawnX)
 	player.SetY(spawnY)
-	player.SetFacingRight(true)
-	player.SetState(0) // idle state
+	player.SetDirection(0) // 0 = right, see protocol/binary.go direction encoding
+	player.SetState(types.StateIdle)
+	player.SetUnitType(unitDef.TypeID)
+	// Full HP/stamina at spawn. HP still never drains (no damage resolution yet);
+	// stamina now does, via attacks/block/sprint (see TryAttack, updateBlockDrain,
+	// updatePlayerPosition) — see types.UnitAssignment for the replication caveat.
+	player.SetHP(uint16(math.Round(unitDef.HP)))
+	player.SetStaminaCenti(uint16(math.Round(unitDef.Stamina * 100)))
 	player.SetLastUpdate(clock.Now())
 
 	gw.playersMu.Lock()
@@ -238,7 +301,7 @@ func (gw *GameWorld) ProcessEvent(event types.GameEvent) {
 
 // QueueMovementInput stores the newest fixed-rate input sample. Network delivery can
 // coalesce samples before a server tick; old samples never become movement backlog.
-func (gw *GameWorld) QueueMovementInput(playerID uint32, dx, dy int8, sequence uint32) types.InputResult {
+func (gw *GameWorld) QueueMovementInput(playerID uint32, dx, dy int8, sequence uint32, sprint bool) types.InputResult {
 	if abs(int(dx)) > 1 || abs(int(dy)) > 1 {
 		return types.InputInvalid
 	}
@@ -248,7 +311,7 @@ func (gw *GameWorld) QueueMovementInput(playerID uint32, dx, dy int8, sequence u
 	if !exists {
 		return types.InputInvalid
 	}
-	result := player.OfferMovementInput(types.MovementInput{Sequence: sequence, DX: dx, DY: dy})
+	result := player.OfferMovementInput(types.MovementInput{Sequence: sequence, DX: dx, DY: dy, Sprint: sprint})
 	if result == types.InputAccepted {
 		metrics.EventsProcessed.WithLabelValues("move").Inc()
 	}
@@ -270,6 +333,27 @@ func (gw *GameWorld) GetAllPlayers() []types.PlayerState {
 	}
 	gw.playersMu.RUnlock()
 	return allPlayers
+}
+
+// GetAllUnitAssignments returns every connected player's unit type and current
+// HP/stamina. Unlike PlayerState, this is not replicated every tick — it is read
+// only when a client needs the roster (on connect, and once per full-sync cycle so
+// existing clients learn about players who joined since their last roster). See
+// types.UnitAssignment for why that cadence is fine today but won't be once combat
+// can actually change HP/stamina.
+func (gw *GameWorld) GetAllUnitAssignments() []types.UnitAssignment {
+	gw.playersMu.RLock()
+	assignments := make([]types.UnitAssignment, 0, len(gw.playersMap))
+	for _, player := range gw.playersMap {
+		assignments = append(assignments, types.UnitAssignment{
+			ID:             player.ID,
+			UnitType:       player.GetUnitType(),
+			CurrentHP:      player.GetHP(),
+			CurrentStamina: player.GetStaminaCenti(),
+		})
+	}
+	gw.playersMu.RUnlock()
+	return assignments
 }
 
 // GetPlayerCount возвращает количество подключенных игроков
@@ -379,20 +463,144 @@ func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
 		return 0, 0, false
 	}
 
-	currentTick := gw.GetTickCount()
-	start := player.GetAttackStartTick()
-
-	// Reject if still in attack cooldown. Unsigned subtraction wraps correctly for
-	// any realistic elapsed tick count, same convention as movement sequence math.
-	if start > 0 && currentTick-start < gw.attackDurationTicks {
+	// Can't swing while holding a shield up (GDD §54 — block is a stance, not an
+	// interrupt), and stationary since block sets vx/vy to 0 by construction (see
+	// TryBlockStart) is not a concern here.
+	if player.GetState() == types.StateBlocking {
 		return 0, 0, false
 	}
 
-	player.SetState(1)
+	currentTick := gw.GetTickCount()
+	start := player.GetAttackStartTick()
+
+	// Still mid-swing: buffer this press instead of dropping it outright. The
+	// instant the current swing's cooldown ends (see runTickWorker), the buffered
+	// press fires the next combo step automatically — the same result as the
+	// player clicking again at the exact right instant, without requiring
+	// frame-perfect timing. Unsigned subtraction wraps correctly for any
+	// realistic elapsed tick count, same convention as movement sequence math.
+	if start > 0 && currentTick-start < gw.attackDurationTicks[player.GetUnitType()] {
+		player.SetPendingComboInput(true)
+		return 0, 0, false
+	}
+
+	return gw.executeAttack(player, currentTick)
+}
+
+// executeAttack performs one swing: advances the combo chain (GDD §54-adjacent —
+// no doc section of its own yet), spends stamina, and enters StateAttacking. Shared
+// by TryAttack (fresh client input) and the buffered-combo continuation in
+// runTickWorker, so a press queued mid-swing fires identically to a fresh one.
+// Not tied to attack specifically by design — any future action that should chain
+// into the same combo (a different mouse button, a keybound skill) can reuse this
+// once it's wired to call it.
+func (gw *GameWorld) executeAttack(player *types.Player, currentTick uint32) (x, y uint16, accepted bool) {
+	// Continue the chain only if this swing starts within the previous swing's
+	// combo window (see ComboExpireTick in executeAttack's own write below);
+	// otherwise it's a fresh combo starting over at step 1. Wraps back to 1 past
+	// the unit's max step count so the combo can be performed over and over.
+	step := uint8(1)
+	if currentTick <= player.GetComboExpireTick() {
+		step = player.GetComboStep() + 1
+		if step > gw.comboSteps[player.GetUnitType()] {
+			step = 1
+		}
+	}
+
+	// Spam должен наказываться (GDD §57): an attack that can't afford its stamina
+	// cost is rejected outright rather than queued or partially charged. Every
+	// combo step costs the same as a single swing for now — no per-step cost
+	// differentiation yet, matching the unit's one shared attack timing/damage.
+	if stat, ok := gw.staminaStats[player.GetUnitType()]; ok && stat.attackStaminaCostCenti > 0 {
+		if !player.TrySpendStaminaCenti(stat.attackStaminaCostCenti) {
+			player.SetPendingComboInput(false)
+			return 0, 0, false
+		}
+	}
+
+	player.SetComboStep(step)
+	player.SetComboExpireTick(currentTick + gw.attackDurationTicks[player.GetUnitType()] + gw.comboWindowTicks[player.GetUnitType()])
+	player.SetState(types.StateAttacking)
 	player.SetAttackStartTick(currentTick)
+	player.SetPendingComboInput(false)
 	metrics.EventsProcessed.WithLabelValues("attack").Inc()
 
 	return player.GetX(), player.GetY(), true
+}
+
+// TryBlockStart enters StateBlocking (RMB pressed) if the unit has a block profile
+// (docs/UNITS.md — Rogue/Archer etc. have none), isn't mid-swing, and has stamina
+// left. Like attack, it overrides in-progress movement rather than requiring the
+// player already be stationary (see the velocity reset below). Holding block
+// itself is drained/cancelled per tick, see updateBlockDrain.
+func (gw *GameWorld) TryBlockStart(playerID uint32) bool {
+	gw.playersMu.RLock()
+	player, ok := gw.playersMap[playerID]
+	gw.playersMu.RUnlock()
+	if !ok {
+		return false
+	}
+
+	stat, ok := gw.staminaStats[player.GetUnitType()]
+	if !ok || !stat.canBlock {
+		return false
+	}
+	if player.GetState() == types.StateAttacking {
+		return false
+	}
+	if player.GetStaminaCenti() == 0 {
+		return false
+	}
+
+	// Block is a stance (GDD §54), and — same as attack (see TryAttack, which has
+	// no movement precondition either) — pressing it overrides whatever movement
+	// was in progress rather than being silently rejected while moving. Zeroing
+	// velocity here (instead of requiring it already be zero) is what makes RMB
+	// actually stop the player; updateBlockDrain still auto-cancels the stance the
+	// instant a still-held movement key reasserts non-zero velocity next tick.
+	player.SetVX(0)
+	player.SetVY(0)
+	player.SetState(types.StateBlocking)
+	return true
+}
+
+// EndBlock releases StateBlocking (RMB released). A no-op if the player wasn't
+// blocking (e.g. movement already cancelled it — see updateBlockDrain).
+func (gw *GameWorld) EndBlock(playerID uint32) {
+	gw.playersMu.RLock()
+	player, ok := gw.playersMap[playerID]
+	gw.playersMu.RUnlock()
+	if !ok {
+		return
+	}
+	if player.GetState() == types.StateBlocking {
+		player.SetState(types.StateIdle)
+	}
+}
+
+// updateBlockDrain runs once per tick per player. It auto-cancels block the instant
+// movement or an empty stamina bar makes it invalid (GDD §54: "попытка сдвинуться
+// немедленно снимает block"), otherwise applies this tick's stamina drain. Must run
+// after updatePlayerPosition so VX/VY reflect any movement input applied this tick.
+func (gw *GameWorld) updateBlockDrain(player *types.Player) (drained bool) {
+	if player.GetState() != types.StateBlocking {
+		return false
+	}
+	if player.GetVX() != 0 || player.GetVY() != 0 {
+		player.SetState(types.StateIdle)
+		return false
+	}
+	if player.GetStaminaCenti() == 0 {
+		player.SetState(types.StateIdle)
+		return false
+	}
+
+	stat, ok := gw.staminaStats[player.GetUnitType()]
+	if !ok {
+		return false
+	}
+	player.SpendStaminaUpTo(stat.blockDrainPerTickCenti)
+	return true
 }
 
 // tick выполняет один тик игрового цикла.
@@ -453,10 +661,9 @@ func (gw *GameWorld) tick() {
 			}
 			end := min(start+chunkSize, total)
 			ch <- tickWorkerInput{
-				ptrs:                gw.scratchPtrs[start:end],
-				nowNano:             nowNano,
-				worldTick:           worldTick,
-				attackDurationTicks: gw.attackDurationTicks,
+				ptrs:      gw.scratchPtrs[start:end],
+				nowNano:   nowNano,
+				worldTick: worldTick,
 			}
 		}
 		gw.tickWorkerWg.Wait()
@@ -473,7 +680,6 @@ func (gw *GameWorld) tick() {
 	if elapsedTicks < 0 {
 		elapsedTicks = 0
 	}
-	speed := int32(gw.cfg.Game.PlayerSpeedPerTick)
 	velocityReplication := gw.cfg.Net.VelocityReplication
 	keyframeMod := uint32(0)
 	if gw.cfg.Net.KeyframeDivisor > 0 {
@@ -488,6 +694,7 @@ func (gw *GameWorld) tick() {
 		// Delta: compare with the last state accepted by the replication layer.
 		if !fullSync {
 			prev, exists := gw.prevStates[st.ID]
+			speed := gw.moveStats[player.GetUnitType()].avgUnitsPerTick
 			reason := classifyDelta(st, prev, exists, elapsedTicks, speed, velocityReplication)
 
 			// Keyframe rotation refreshes a slice of the world every broadcast so a
@@ -595,8 +802,16 @@ func classifyDelta(st, prev types.PlayerState, exists bool, elapsedTicks, speed 
 		return deltaReason{include: true, unpredictable: true}
 	}
 
+	// ComboStep is checked on its own, not just State: a buffered combo
+	// continuation (see game/world.go executeAttack/runTickWorker) can go
+	// straight from one swing into the next without State ever visibly leaving
+	// Attacking between the two per-tick snapshots this compares, so State alone
+	// wouldn't flag the new swing as unpredictable and the record could get
+	// compressed away — silently dropping the client's cue to replay the attack
+	// animation for the new step.
 	unpredictable := st.VX != prev.VX || st.VY != prev.VY ||
-		st.State != prev.State || st.FacingRight != prev.FacingRight
+		st.State != prev.State || st.Direction != prev.Direction || st.Sprinting != prev.Sprinting ||
+		st.ComboStep != prev.ComboStep
 
 	predictedX := int32(prev.X) + int32(prev.VX)*speed*elapsedTicks
 	predictedY := int32(prev.Y) + int32(prev.VY)*speed*elapsedTicks
@@ -676,22 +891,64 @@ func (gw *GameWorld) reportDeltaComposition() {
 // updatePlayerPosition consumes at most one latest sample and advances exactly one
 // authoritative server step. A burst can change the current vector but cannot add
 // extra distance or leave STOP trapped behind stale MOVE packets.
-func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) {
+// Returns whether this tick's step spent sprint stamina, so the caller can skip
+// passive regen for the same tick (see runTickWorker).
+func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) (sprintDrained bool) {
 	originalX := player.GetX()
 	originalY := player.GetY()
 	input, appliedInput := player.ConsumeLatestMovementInput()
 	if appliedInput {
 		player.SetVX(input.DX)
 		player.SetVY(input.DY)
+		player.SetSprint(input.Sprint)
 	}
 
 	vx, vy := player.GetVX(), player.GetVY()
+	sprinting := false
 	if vx != 0 || vy != 0 {
-		newX, newY := gw.integrateMovement(originalX, originalY, vx, vy, 1)
+		stat := gw.staminaStats[player.GetUnitType()]
+		// Sprint (GDD §54/§57): only takes effect while actually moving and only
+		// while stamina remains — the instant it hits zero, movement silently falls
+		// back to normal speed rather than the request being denied outright.
+		sprinting = player.GetSprint() && player.GetStaminaCenti() > 0
+		if sprinting {
+			player.SpendStaminaUpTo(stat.sprintDrainPerTickCenti)
+			sprintDrained = true
+		}
+
+		// Fixed-point per-unit movement (GDD §60 World Coordinate Resolution): the
+		// unit's own rate rarely lands on a whole world-unit-per-tick step, so the
+		// fractional part accumulates in MoveRemainderMilli and flushes a whole unit
+		// once it crosses 1000 — same technique as centi-stamina, just for distance.
+		milliRate := gw.moveStats[player.GetUnitType()].milliUnitsPerTick
+		rateMultiplier := 1.0
+		if sprinting {
+			rateMultiplier *= stat.sprintSpeedMultiplier
+		}
+		// Moving on both axes at once (vx and vy both nonzero) would otherwise cover
+		// sqrt(2) times the distance of an axis-aligned move per tick — the classic
+		// diagonal-speed bug. Scale by 1/sqrt(2) so diagonal speed matches straight
+		// speed. Folded into one multiplier/one rounding step (matched exactly by
+		// the client's movement.ts/movementController.ts) rather than two chained
+		// roundings, so client and server can't drift apart from rounding order.
+		if vx != 0 && vy != 0 {
+			rateMultiplier *= 1 / math.Sqrt2
+		}
+		if rateMultiplier != 1.0 {
+			milliRate = uint32(math.Round(float64(milliRate) * rateMultiplier))
+		}
+		remainder := player.GetMoveRemainderMilli() + milliRate
+		distance := int64(remainder / 1000)
+		player.SetMoveRemainderMilli(remainder % 1000)
+
+		newX, newY := gw.integrateMovement(originalX, originalY, vx, vy, distance)
 		player.SetX(newX)
 		player.SetY(newY)
 		player.SetLastUpdate(nowNano)
 	}
+	// Replicated as PlayerState.Sprinting so remote clients can pick walk vs run
+	// (GDD §54) instead of only the local player's own client-side prediction.
+	player.SetSprintingNow(sprinting)
 
 	finalX, finalY := player.GetX(), player.GetY()
 	if appliedInput {
@@ -700,10 +957,10 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) {
 	if finalX != originalX || finalY != originalY {
 		gw.visibilityManager.MovePlayer(player.ID, finalX, finalY)
 	}
+	return sprintDrained
 }
 
-func (gw *GameWorld) integrateMovement(x, y uint16, vx, vy int8, ticks uint32) (uint16, uint16) {
-	distance := int64(gw.cfg.Game.PlayerSpeedPerTick) * int64(ticks)
+func (gw *GameWorld) integrateMovement(x, y uint16, vx, vy int8, distance int64) (uint16, uint16) {
 	newX := int64(x) + int64(vx)*distance
 	newY := int64(y) + int64(vy)*distance
 	newX = max(int64(gw.cfg.World.MinX), min(newX, int64(gw.cfg.World.MaxX)))
@@ -730,16 +987,16 @@ func (gw *GameWorld) handleEvent(event types.GameEvent) {
 
 	case types.EventFace:
 		metrics.EventsProcessed.WithLabelValues("face").Inc()
-		player.SetFacingRight(event.FacingRight)
+		player.SetDirection(event.Direction)
 
 	case types.EventAttack:
 		metrics.EventsProcessed.WithLabelValues("attack").Inc()
 		// Legacy path (via ProcessEvent queue) - TryAttack is now preferred.
 		// Guard against double-processing if called from old code paths.
-		if player.GetState() == 1 {
+		if player.GetState() == types.StateAttacking {
 			break
 		}
-		player.SetState(1)
+		player.SetState(types.StateAttacking)
 		player.SetAttackStartTick(gw.GetTickCount())
 	}
 }
@@ -772,17 +1029,44 @@ func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
 		for _, player := range input.ptrs {
 			// Server-authoritative attack timeout, measured in ticks so it dilates
 			// with the simulation the same way movement does.
-			if player.GetState() == 1 {
+			if player.GetState() == types.StateAttacking {
 				start := player.GetAttackStartTick()
-				if start > 0 && input.worldTick-start >= input.attackDurationTicks {
-					player.SetState(0)
+				if start > 0 && input.worldTick-start >= gw.attackDurationTicks[player.GetUnitType()] {
+					player.SetState(types.StateIdle)
 					player.SetAttackStartTick(0)
+					// A press buffered mid-swing (see TryAttack) fires the next combo
+					// step immediately — the same result as the player clicking again
+					// at the exact right instant.
+					if player.GetPendingComboInput() {
+						gw.executeAttack(player, input.worldTick)
+					}
 				}
 			}
-			gw.updatePlayerPosition(player, input.nowNano)
+			// updateBlockDrain must run after updatePlayerPosition: it reads this
+			// tick's VX/VY to auto-cancel block the instant the player moves.
+			sprintDrained := gw.updatePlayerPosition(player, input.nowNano)
+			blockDrained := gw.updateBlockDrain(player)
+			// Stamina doesn't regen the same tick it's spent — letting both happen
+			// at once would let a high-regen unit sprint or block for near-free,
+			// undermining the whole point of the cost (GDD §57: "Spam должен
+			// наказываться").
+			if !sprintDrained && !blockDrained {
+				gw.regenStamina(player)
+			}
 		}
 		gw.tickWorkerWg.Done()
 	}
+}
+
+// regenStamina applies one tick of passive stamina regen (GDD §8, Stamina Economy).
+// A no-op once stamina is at max, or on a tick that already spent stamina on
+// something else (see runTickWorker).
+func (gw *GameWorld) regenStamina(player *types.Player) {
+	stat, ok := gw.staminaStats[player.GetUnitType()]
+	if !ok {
+		return
+	}
+	player.RegenStamina(stat.regenPerTickCenti, stat.maxCenti)
 }
 
 // Helper function
