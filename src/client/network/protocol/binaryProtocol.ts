@@ -13,28 +13,24 @@ import {
 } from "./messages";
 import { DIRECTIONS, type Direction } from "../../utils/animationLayout";
 
-// Wire code for Direction is simply its index in DIRECTIONS (right=0, left=1,
-// down=2, up=3) — must match protocol.go's bit-packing on the server exactly.
 function directionFromCode(code: number): Direction {
     return DIRECTIONS[code] ?? "right";
 }
 
 export class BinaryProtocol {
-    // Bit 4 of the packed movement byte — held-Shift intent, see MoveMessage.sprint.
-    // Must match protocol.MoveSprintBit on the server.
+
     private static readonly SPRINT_BIT = 0x10;
 
-    // Helper methods for common operations
     private static packMovement(dx: number, dy: number): number {
         let packed = 0;
-        packed |= (dx + 1) & 0x03; // dx: -1->0, 0->1, 1->2 (2 bits)
-        packed |= ((dy + 1) & 0x03) << 2; // dy: same, shifted 2 bits
+        packed |= (dx + 1) & 0x03;
+        packed |= ((dy + 1) & 0x03) << 2;
         return packed;
     }
 
     private static unpackMovement(packed: number): { dx: number; dy: number } {
-        const dx = (packed & 0x03) - 1; // Extract bits 0-1, convert back to -1,0,1
-        const dy = ((packed >> 2) & 0x03) - 1; // Extract bits 2-3, convert back to -1,0,1
+        const dx = (packed & 0x03) - 1;
+        const dy = ((packed >> 2) & 0x03) - 1;
         return { dx, dy };
     }
 
@@ -45,7 +41,6 @@ export class BinaryProtocol {
         return { playerId, newOffset: offset + 1 + playerIdLength };
     }
 
-    // Encode client messages
     static encodeMove(moveMsg: MoveMessage): Uint8Array {
         const buffer = new ArrayBuffer(6);
         const view = new DataView(buffer);
@@ -106,7 +101,6 @@ export class BinaryProtocol {
         return new Uint8Array(buffer);
     }
 
-    // Decode messages
     static decodeMessage(data: Uint8Array): any {
         if (data.length === 0) return null;
 
@@ -129,7 +123,6 @@ export class BinaryProtocol {
                 if (data.length !== 5) return null;
                 return { type: "pong", nonce: view.getUint32(1, true) };
 
-            // Broadcast message types from server
             case 255: return this.decodePlayerMovementBroadcast(data, view);
             case 254: return this.decodePlayerDirectionBroadcast(data, view);
             case 253: return this.decodePlayerAttackBroadcast(data, view);
@@ -139,13 +132,13 @@ export class BinaryProtocol {
     }
 
     private static decodeMove(data: Uint8Array, view: DataView) {
-        // Check if this is a server message (has playerId) or client message
+
         if (data.length > 6 && data[1] > 0 && data[1] < 256) {
-            // Server message (player movement) - has playerId after message type
+
             const { playerId, newOffset } = this.decodePlayerId(data, 1);
 
             if (data.length === newOffset + 1) {
-                // Optimized server message with packed movement
+
                 const packed = view.getUint8(newOffset);
                 const movement = this.unpackMovement(packed);
                 return {
@@ -156,14 +149,13 @@ export class BinaryProtocol {
             }
         }
 
-        // Client messages - ignore these on client side
         return null;
     }
 
     private static decodeDirection(data: Uint8Array, view: DataView) {
-        // Check if this is a server message (has playerId) or client message
+
         if (data.length > 2 && data[1] > 0 && data[1] < 256) {
-            // Server message (player direction) - has playerId after message type
+
             const { playerId, newOffset } = this.decodePlayerId(data, 1);
             return {
                 type: "playerDirection",
@@ -172,14 +164,13 @@ export class BinaryProtocol {
             };
         }
 
-        // Client message - ignore on client side
         return null;
     }
 
     private static decodeAttack(data: Uint8Array, view: DataView) {
-        // Check if this is a server message (has playerId) or client message
+
         if (data.length > 9 && data[1] > 0 && data[1] < 256) {
-            // Server message (player attack) - has playerId after message type
+
             const { playerId, newOffset } = this.decodePlayerId(data, 1);
             return {
                 type: "playerAttack",
@@ -191,7 +182,6 @@ export class BinaryProtocol {
             };
         }
 
-        // Client message - ignore on client side
         return null;
     }
 
@@ -233,8 +223,7 @@ export class BinaryProtocol {
         let offset = header.offset;
         let prevId = 0;
         for (let i = 0; i < playerCount; i++) {
-            // Player IDs are delta-encoded as LEB128 varints against the previous
-            // record (the server sorts by ID), so the record stride is variable.
+
             let delta = 0;
             let shift = 0;
             let byte = 0;
@@ -264,14 +253,11 @@ export class BinaryProtocol {
             const flags = view.getUint8(offset);
             offset++;
 
-            // bits 0-1: core state, bit 2: sprinting, bits 3-4: combo step (0-3,
-            // i.e. step 1-4), bits 6-7: direction code (see directionFromCode).
-            // Must match protocol.playerFlags on the server.
             const direction = directionFromCode((flags >> 6) & 0x03);
             const state = flags & 0x03;
             const moving = vx !== 0 || vy !== 0;
-            const attacking = state === 1; // server: 1=attack
-            const blocking = state === 2; // server: 2=block
+            const attacking = state === 1;
+            const blocking = state === 2;
             const sprinting = (flags & 0x04) !== 0;
             const comboStep = ((flags >> 3) & 0x03) + 1;
 
@@ -292,17 +278,6 @@ export class BinaryProtocol {
         return { players, stateSequence: header.stateSequence, worldTick: header.worldTick, dilationPct: header.dilationPct };
     }
 
-    // [type:1][stateSequence:4][worldTick:4][playerCount:4][dilationBps:2][players...]
-    // worldTick is the simulation step the records describe; the client needs it to
-    // dead-reckon the players this frame omits. dilationBps is the server's current
-    // time-dilation factor (10000 = 100%, EVE-style TiDi) — when the server slows its
-    // own tick rate under pressure, the client scales its local prediction step by the
-    // same factor (dilationPct/100) so it stays in lockstep instead of running ahead.
-    // Records are variable-length (varint ID delta + 7 fixed bytes), so the header
-    // cannot be validated against a total length — the record loop bounds-checks
-    // instead. The pre-sequence legacy layout is deliberately not accepted: it is
-    // indistinguishable from a valid frame and would decode into wrong player IDs
-    // rather than failing. PROTOCOL_VERSION in WELCOME is what guards compatibility.
     private static decodeWorldStateHeader(data: Uint8Array, view: DataView): { stateSequence?: number; worldTick: number; playerCount: number; dilationPct: number; offset: number } {
         if (data.length < 15) {
             return { worldTick: 0, playerCount: 0, dilationPct: 100, offset: data.length };
@@ -336,8 +311,8 @@ export class BinaryProtocol {
         const direction = directionFromCode((flags >> 6) & 0x03);
         const state = flags & 0x03;
         const moving = vx !== 0 || vy !== 0;
-        const attacking = state === 1; // server: 1=attack
-        const blocking = state === 2; // server: 2=block
+        const attacking = state === 1;
+        const blocking = state === 2;
         const sprinting = (flags & 0x04) !== 0;
         const comboStep = ((flags >> 3) & 0x03) + 1;
 
@@ -392,11 +367,6 @@ export class BinaryProtocol {
         };
     }
 
-    // [type:1][count:varint][count * [idDelta:varint][unitType:1][hp:u16][staminaCenti:u16]]
-    // Mirrors protocol.EncodeUnitRoster on the server. IDs are delta-encoded against
-    // the previous entry the same way world-state records are. staminaCenti is
-    // fixed-point x100 ("centi-stamina") — divided back down here so consumers get a
-    // real stamina number.
     private static decodeUnitRoster(data: Uint8Array) {
         const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
         let offset = 1;
@@ -438,9 +408,8 @@ export class BinaryProtocol {
         return { type: "unitRoster", entries };
     }
 
-    // Broadcast message decoders (types 255, 254, 253)
     private static decodePlayerMovementBroadcast(_data: Uint8Array, view: DataView): PlayerMovementMessage {
-        let offset = 1; // Skip message type
+        let offset = 1;
 
         const playerId = view.getUint32(offset, true).toString();
         offset += 4;
@@ -459,7 +428,7 @@ export class BinaryProtocol {
     }
 
     private static decodePlayerDirectionBroadcast(_data: Uint8Array, view: DataView): PlayerDirectionMessage {
-        let offset = 1; // Skip message type
+        let offset = 1;
 
         const playerId = view.getUint32(offset, true).toString();
         offset += 4;
@@ -475,7 +444,7 @@ export class BinaryProtocol {
     }
 
     private static decodePlayerAttackBroadcast(_data: Uint8Array, view: DataView): PlayerAttackMessage {
-        let offset = 1; // Skip message type
+        let offset = 1;
 
         const playerId = view.getUint32(offset, true).toString();
         offset += 4;

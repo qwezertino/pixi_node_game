@@ -1,4 +1,3 @@
-// Web Worker for handling WebSocket to avoid blocking main thread
 
 interface WorkerMessage {
     type: 'connect' | 'send' | 'disconnect';
@@ -46,9 +45,7 @@ self.onmessage = (e: MessageEvent<WorkerMessage>) => {
 };
 
 function connect(url: string) {
-    // A reconnect must not leave the previous socket delivering events: its
-    // handlers would keep posting messages for a session the main thread has
-    // already reset.
+
     if (socket) {
         socket.onopen = null;
         socket.onmessage = null;
@@ -71,7 +68,6 @@ function connect(url: string) {
     socket.onmessage = async (event) => {
         let data = event.data;
 
-        // Handle Blob data (convert to ArrayBuffer for consistency)
         if (data instanceof Blob) {
             data = await data.arrayBuffer();
         }

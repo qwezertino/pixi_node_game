@@ -11,9 +11,7 @@ import (
 )
 
 func init() {
-	// Дефолтный GoCollector вызывает runtime.ReadMemStats() — это Stop-The-World.
-	// При scrape_interval=5s это даёт спайки p99 10-50ms в game loop.
-	// Заменяем на STW-free коллектор через runtime/metrics API (Go 1.17+).
+
 	prometheus.Unregister(collectors.NewGoCollector())
 	prometheus.MustRegister(collectors.NewGoCollector(
 		collectors.WithGoCollectorRuntimeMetrics(
@@ -40,7 +38,7 @@ var (
 		Help:    "Monotonic delay between scheduled tick and game-loop execution",
 		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 20),
 	})
-	// ── Players ──────────────────────────────────────────────────────────────
+
 	PlayersConnected = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_players_connected",
 		Help: "Current number of connected players",
@@ -62,7 +60,6 @@ var (
 		Buckets: []float64{5, 30, 60, 300, 600, 1800, 3600},
 	})
 
-	// ── Game loop ─────────────────────────────────────────────────────────────
 	TickDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "game_tick_duration_seconds",
 		Help:    "Time spent processing a single game tick",
@@ -74,13 +71,11 @@ var (
 		Help: "Total number of game ticks processed",
 	})
 
-	// ── Events ───────────────────────────────────────────────────────────────
 	EventsProcessed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "game_events_processed_total",
 		Help: "Total game events processed, by type",
 	}, []string{"type"})
 
-	// ── Messages ─────────────────────────────────────────────────────────────
 	MessagesReceived = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "game_messages_received_total",
 		Help: "Total messages received from clients, by type",
@@ -123,7 +118,6 @@ var (
 		Help: "Total bytes received from clients",
 	})
 
-	// ── Broadcast ─────────────────────────────────────────────────────────────
 	BroadcastsDropped = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_broadcasts_dropped_total",
 		Help: "Total broadcast messages dropped (send channel full)",
@@ -189,7 +183,6 @@ var (
 		Help: "Current adaptive recipient limit for world-state fanout per tick (0 means unlimited)",
 	})
 
-	// ── WebSocket errors ──────────────────────────────────────────────────────
 	WSUpgradeErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_ws_upgrade_errors_total",
 		Help: "Total WebSocket upgrade failures",
@@ -205,17 +198,11 @@ var (
 		Help: "Total WebSocket write errors",
 	})
 
-	// ── Connection rate limiting ───────────────────────────────────────────────
 	IPRateLimited = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_ip_rate_limited_total",
 		Help: "Total connection attempts rejected by IP rate limiter",
 	})
 
-	// ── Tick phase breakdown ──────────────────────────────────────────────────
-	// Labels: "world_step" (snapshot + movement update + state build),
-	//         "range" (legacy alias), "delta" (prevStates diff),
-	//         "encode" (binary state encoding), "fanout_send" (broadcast enqueue).
-	// Sum of all four ≈ total tick duration.
 	TickPhaseDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "game_tick_phase_seconds",
 		Help:    "Time spent in each phase of the game tick",
@@ -292,28 +279,17 @@ var (
 		Help: "Current (possibly dilated) simulation tick period in milliseconds",
 	})
 
-	// ── Delta tracking ────────────────────────────────────────────────────────
-	// How many players actually had state changes this tick.
-	// If this equals PlayersConnected every tick — delta optimisation does nothing.
 	DeltaPlayersCount = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "game_delta_players_count",
 		Help:    "Number of players with changed state per tick",
 		Buckets: []float64{0, 10, 50, 100, 250, 500, 1000, 2000, 5000},
 	})
 
-	// Fraction of players that changed state (0.0–1.0).
-	// 1.0 on a fullSync tick or when everyone is moving.
 	DeltaRatio = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_delta_ratio",
 		Help: "Fraction of players with changed state in the last tick (0.0–1.0)",
 	})
 
-	// The three metrics below size the payoff of velocity replication before it is
-	// built. Position is a deterministic function of velocity on both sides, so a
-	// client could dead-reckon every record counted by DeltaPositionOnly instead of
-	// receiving it. DeltaVectorChanges plus DeltaClampedPlayers is the traffic that
-	// would remain: input the client cannot predict, and boundary clamps that break
-	// the prediction.
 	DeltaVectorChanges = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "game_delta_vector_changes",
 		Help:    "Broadcast records a dead-reckoning client could not predict (velocity/state/facing changed)",

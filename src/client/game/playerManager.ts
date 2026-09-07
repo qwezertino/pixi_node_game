@@ -12,18 +12,13 @@ import { getUnitDefinitionByTypeId, type UnitDefinition } from "../../shared/uni
 import type { Direction } from "../utils/animationLayout";
 import { StatusBarWidget } from "../ui/statusBar";
 import { StaminaPredictor } from "../utils/staminaPredictor";
-//import { LagCompensationSystem } from "../utils/lagCompensation";
 
-// Represents a remote player in the game
-// Снимок состояния для entity interpolation
 interface PositionSnapshot {
-    time: number; // performance.now() момент получения от сервера
+    time: number;
     x: number;
     y: number;
 }
 
-// Replication is 20 Hz by default. One-frame interpolation hides ordinary jitter
-// without keeping remote players hundreds of milliseconds in the past.
 const MIN_INTERPOLATION_DELAY_MS = 50;
 const MAX_INTERPOLATION_DELAY_MS = 150;
 const SNAPSHOT_EWMA_ALPHA = 0.15;
@@ -32,15 +27,11 @@ const MAX_SNAPSHOTS = 32;
 class RemotePlayer {
     sprite: AnimatedSprite;
     animationController: AnimationController;
-    // Stats/properties for this player's unit (see shared/units.ts).
+
     unitDefinition: UnitDefinition;
-    // Current HP (see PlayerAttributes) — undefined until the roster entry for this
-    // player has arrived. Nothing drains HP yet, so in practice it sits at
-    // unitDefinition.hp from spawn onward.
+
     currentHp: number | undefined;
-    // Stamina is predicted locally every frame instead (see staminaPredictor.ts) and
-    // corrected whenever a roster entry arrives — the roster's own cadence is too
-    // slow now that sprint/block/attacks actually drain it.
+
     readonly staminaPredictor: StaminaPredictor;
     readonly statusBar = new StatusBarWidget();
     direction: Direction = "right";
@@ -49,7 +40,6 @@ class RemotePlayer {
     isBlocking: boolean = false;
     isSprinting: boolean = false;
 
-    // Буфер серверных позиций для интерполяции
     private snapshots: PositionSnapshot[] = [];
     private interpolationDelayMs = 75;
     private interArrivalEwmaMs = 1000 / Math.max(TICK_RATE, 1);
@@ -57,19 +47,16 @@ class RemotePlayer {
     private lastSnapshotTimeMs = 0;
     private lastSnapshotSequence = 0;
 
-    // Текущая рендер-позиция (интерполированная)
     public virtualPosition = { x: 0, y: 0 };
     private coordinateConverter: CoordinateConverter | null = null;
 
-
-
     constructor(
         public id: string,
-        public position: Point, // Экранная позиция спрайта
+        public position: Point,
         characterVisual: CharacterVisual,
         unitDefinition: UnitDefinition,
         coordinateConverter?: CoordinateConverter,
-        virtualPosition?: { x: number; y: number } // Позиция в виртуальном мире
+        virtualPosition?: { x: number; y: number }
     ) {
         this.unitDefinition = unitDefinition;
         this.staminaPredictor = new StaminaPredictor(unitDefinition);
@@ -132,17 +119,13 @@ class RemotePlayer {
         if (!last) return;
 
         if (this.movementVector.dx === 0 && this.movementVector.dy === 0) {
-            // A stationary player produces the same position every frame. Still push a
-            // snapshot: the interpolator needs a steady arrival cadence, and its
-            // adaptive delay is driven by that cadence.
+
             this.pushSnapshot(last.x, last.y, stateSequence);
             return;
         }
 
         let step = unitsPerTick(this.unitDefinition) * elapsedTicks;
-        // Same diagonal-speed correction as movementController.ts/world.go: moving
-        // on both axes at once must not cover sqrt(2)x the distance of a
-        // straight move.
+
         if (this.movementVector.dx !== 0 && this.movementVector.dy !== 0) {
             step = Math.round(step * Math.SQRT1_2);
         }
@@ -153,7 +136,6 @@ class RemotePlayer {
         );
     }
 
-    // Добавить серверный снимок позиции в буфер
     pushSnapshot(x: number, y: number, stateSequence?: number) {
         if (typeof stateSequence === "number") {
             const seq = stateSequence >>> 0;
@@ -190,7 +172,7 @@ class RemotePlayer {
         this.lastSnapshotTimeMs = now;
 
         this.snapshots.push({ time: now, x, y });
-        // Удаляем старые снимки — держим только MAX_SNAPSHOTS
+
         if (this.snapshots.length > MAX_SNAPSHOTS) {
             this.snapshots.shift();
         }
@@ -203,9 +185,6 @@ class RemotePlayer {
 
         this.staminaPredictor.update(deltaTime, { blocking: this.isBlocking, sprinting: this.isSprinting });
 
-        // Entity interpolation: рендерим позицию на adaptive delay в прошлом.
-        // Это означает что мы всегда имеем два снимка вокруг целевого времени —
-        // никаких экстраполяций и телепортов.
         const renderTime = performance.now() - this.interpolationDelayMs;
         const snaps = this.snapshots;
 
@@ -213,7 +192,7 @@ class RemotePlayer {
             const newest = snaps[snaps.length - 1];
 
             if (renderTime <= newest.time) {
-                // Нормальная интерполяция: ищем пару снимков вокруг renderTime
+
                 let newer = newest;
                 let older = snaps[snaps.length - 2];
 
@@ -230,9 +209,7 @@ class RemotePlayer {
                 this.virtualPosition.x = older.x + (newer.x - older.x) * t;
                 this.virtualPosition.y = older.y + (newer.y - older.y) * t;
             } else {
-                // If jitter exhausts the adaptive buffer, hold the newest position.
-                // The normal 20 Hz path targets roughly 60–75 ms of history.
-                // никакой экстраполяции → никакого телепорта-назад при получении снимка.
+
                 this.virtualPosition.x = newest.x;
                 this.virtualPosition.y = newest.y;
             }
@@ -245,7 +222,7 @@ class RemotePlayer {
                 this.position.y = screenPos.y;
             }
         } else if (snaps.length === 1) {
-            // Только один снимок — просто применяем его
+
             this.virtualPosition.x = snaps[0].x;
             this.virtualPosition.y = snaps[0].y;
             if (this.coordinateConverter) {
@@ -256,9 +233,7 @@ class RemotePlayer {
                 this.position.y = screenPos.y;
             }
         }
-        // Если снимков нет — не двигаем, ждём первого gameState
 
-        // Анимация
         this.animationController.setDirection(this.direction);
         if (!isAttacking) {
             if (this.isBlocking) {
@@ -311,8 +286,6 @@ class RemotePlayer {
 
         this.sprite.position.copyFrom(this.position);
 
-        // Заполняем буфер снимков начальной позицией чтобы интерполяция
-        // сразу имела данные и игрок был виден
         const now = performance.now();
         this.snapshots = [
             { time: now - this.interpolationDelayMs - 50, x: virtualX, y: virtualY },
@@ -382,10 +355,6 @@ export class PlayerManager {
             }
         });
 
-        // A remote player can be created before its unit-roster entry arrives (the
-        // roster is a separate, lower-frequency message — see networkManager.ts).
-        // Backfill unitDefinition/HP/stamina once it does, instead of leaving them
-        // stuck at the default fallback for up to one full-sync cycle.
         this.networkManager.onUnitRoster((entries) => {
             for (const [playerId, attrs] of Object.entries(entries)) {
                 const player = this.remotePlayers.get(playerId);
@@ -401,9 +370,6 @@ export class PlayerManager {
         this.networkManager.onGameState((players, stateSequence, fullState, elapsedTicks) => {
             const currentPlayerId = this.networkManager.getPlayerId();
 
-            // Players the frame omits did not stand still — the server withheld them
-            // because their movement was predictable. Reproduce it before applying the
-            // records, so both paths land in the buffer with the same arrival time.
             if (!fullState && elapsedTicks > 0) {
                 for (const [playerId, remote] of this.remotePlayers) {
                     if (playerId !== currentPlayerId && !players[playerId]) {
@@ -415,17 +381,14 @@ export class PlayerManager {
             for (const [playerId, playerState] of Object.entries(players)) {
 
                 if (playerId === currentPlayerId) {
-                    // Local player position is managed exclusively by client-side prediction
-                    // and ACK-based reconciliation. Do NOT overwrite it from gameState —
-                    // server position lags 1+ tick behind and causes jitter.
+
                     continue;
                 }
 
                 const existingPlayer = this.remotePlayers.get(playerId);
 
                 if (existingPlayer) {
-                    // Entity interpolation: добавляем снимок в буфер,
-                    // позиция будет плавно интерполирована в update()
+
                     existingPlayer.pushSnapshot(playerState.position.x, playerState.position.y, stateSequence);
 
                     existingPlayer.direction = playerState.direction;
@@ -441,7 +404,6 @@ export class PlayerManager {
                 }
             }
 
-            // A delta contains only changed players. Absence means removal only in a full snapshot.
             if (fullState) {
                 for (const playerId of this.remotePlayers.keys()) {
                     if (playerId !== currentPlayerId && !players[playerId]) {
@@ -452,10 +414,6 @@ export class PlayerManager {
         });
     }
 
-    // Real per-unit spritesheets aren't fully verified for every unit yet (see
-    // spriteLoader.ts / animationLayout.ts) — fall back to the placeholder knight
-    // sheet for any unit whose sheet doesn't decode cleanly instead of leaving the
-    // player invisible.
     private async loadVisualFor(unit: UnitDefinition): Promise<CharacterVisual> {
         try {
             return await SpriteLoader.loadUnitCharacterVisual(unit);
@@ -484,7 +442,6 @@ export class PlayerManager {
         const unitDefinition = getUnitDefinitionByTypeId(this.networkManager.getUnitType(playerState.id));
         const characterVisual = await this.loadVisualFor(unitDefinition);
 
-        // The player may have left while the shared asset promise was resolving.
         if (this.remotePlayers.has(playerState.id) || !this.networkManager.getPlayers()[playerState.id]) {
             return;
         }

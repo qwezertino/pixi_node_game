@@ -24,11 +24,7 @@ type ServerConfig struct {
 type GameConfig struct {
 	TickRate     int
 	SyncInterval time.Duration
-	// UnitsPerMeter is the world coordinate resolution (GDD §60 World Coordinate
-	// Resolution: 1 world unit = 0.1m at the default 10) — the only genuinely
-	// world-global movement setting. Per-unit movement speed and sprint parameters
-	// (units.Definition.MoveSpeed/SprintSpeedMultiplier/SprintStaminaCostPerSecond)
-	// live on the unit instead — see game/world.go moveStat/staminaStat.
+
 	UnitsPerMeter float64
 }
 
@@ -49,11 +45,11 @@ type NetworkConfig struct {
 	MaxConnections                 int
 	MessageRateLimit               int
 	BurstLimit                     int
-	IPConnRate                     float64 // connections/sec per IP; 0 = disabled
+	IPConnRate                     float64
 	IPConnBurst                    int
-	FanoutMaxBroadcastBytesPerTick int  // 0 = unlimited
-	VelocityReplication            bool // omit records a client can dead-reckon
-	KeyframeDivisor                int  // 1/N of players refreshed per broadcast; 0 = off
+	FanoutMaxBroadcastBytesPerTick int
+	VelocityReplication            bool
+	KeyframeDivisor                int
 	FanoutQueueShedDepth           int
 	FanoutDropStreak               int
 	WriteBatchSize                 int
@@ -65,15 +61,13 @@ type NetworkConfig struct {
 	FanoutCriticalWindow           time.Duration
 	FanoutCriticalBoostNs          int64
 	FanoutMinRecipientsPerTick     int
-	FanoutMaxRecipientsPerTick     int // 0 = unlimited (all connections)
+	FanoutMaxRecipientsPerTick     int
 	FanoutTargetMs                 int
 	WorldStateActiveStaleness      time.Duration
 	WorldStateIdleStaleness        time.Duration
 	WorldStateActiveWindow         time.Duration
 }
 
-// JSONConfig mirrors the structure of gameConfig.json (shared with the TypeScript client).
-// Only game-rule values live here; server infrastructure is configured via .env.
 type JSONConfig struct {
 	Network struct {
 		TickRate     int `json:"tickRate"`
@@ -105,12 +99,6 @@ type JSONConfig struct {
 	} `json:"game"`
 }
 
-// Load builds the server Config.
-//
-// Priority order (highest to lowest):
-//  1. Environment variables (from .env or system)
-//  2. Embedded gameConfig.json (game-rule defaults, shared with client)
-//  3. Hardcoded fallbacks for server-only infrastructure values
 func Load() *Config {
 	jsonConfig, err := loadEmbeddedConfig()
 	if err != nil {
@@ -121,16 +109,14 @@ func Load() *Config {
 	syncIntervalSec := jsonConfig.Network.SyncInterval / 1000
 
 	return &Config{
-		// ── Server infrastructure ─────────────────────────────────────────────
-		// Defaults are hardcoded here; override via .env for deployment tuning.
+
 		Server: ServerConfig{
 			Port:      getEnvInt("PORT", 8108),
 			Host:      getEnvString("HOST", "0.0.0.0"),
 			Workers:   getEnvInt("WORKERS", 0),
 			StaticDir: getEnvString("STATIC_DIR", "../dist"),
 		},
-		// ── Game rules ────────────────────────────────────────────────────────
-		// Defaults come from embedded gameConfig.json so they always match the client.
+
 		Game: GameConfig{
 			TickRate:      getEnvInt("TICK_RATE", jsonConfig.Network.TickRate),
 			SyncInterval:  time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
@@ -148,8 +134,7 @@ func Load() *Config {
 			MinY:      0,
 			MaxY:      uint16(getEnvInt("WORLD_HEIGHT", jsonConfig.World.VirtualSize.Height)),
 		},
-		// ── Network infrastructure ────────────────────────────────────────────
-		// All configurable via .env; hardcoded values are production-tested defaults.
+
 		Net: NetworkConfig{
 			MaxConnections:                 getEnvInt("MAX_CONNECTIONS", 12000),
 			MessageRateLimit:               getEnvInt("RATE_LIMIT_MSG_SEC", 120),

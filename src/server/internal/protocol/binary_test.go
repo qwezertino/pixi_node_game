@@ -148,8 +148,6 @@ func TestEncodeMovementAck(t *testing.T) {
 	}
 }
 
-// decodeWorldState mirrors the client decoder (binaryProtocol.ts) so that a change to
-// the wire format has to be made on both sides for this test to stay green.
 func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, []types.PlayerState) {
 	t.Helper()
 	if len(buf) < worldStateHeaderSize {
@@ -179,7 +177,7 @@ func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, 
 			}
 			shift += 7
 		}
-		// X(2) + Y(2) + VX(1) + VY(1) + flags(1)
+
 		const recordTail = 7
 		if offset+recordTail > len(buf) {
 			t.Fatal("truncated player record")
@@ -208,7 +206,7 @@ func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, 
 
 func TestAppendWorldStateRoundTrip(t *testing.T) {
 	bp := &BinaryProtocol{}
-	// Deliberately unsorted, with a large gap that forces a multi-byte varint.
+
 	players := []types.PlayerState{
 		{ID: 9000, X: 5, Y: 6, VX: 1, VY: -1, State: 1},
 		{ID: 1, X: 10, Y: 20, VX: -1, VY: 1, Direction: DirectionLeft, Sprinting: true},
@@ -242,7 +240,7 @@ func TestAppendWorldStateRoundTrip(t *testing.T) {
 
 func TestAppendWorldStatePreservesFramePrefix(t *testing.T) {
 	bp := &BinaryProtocol{}
-	prefix := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0} // reserved WS header bytes
+	prefix := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	players := []types.PlayerState{{ID: 1, X: 1, Y: 2}, {ID: 2, X: 3, Y: 4}}
 
 	got := bp.AppendDeltaGameState(append([]byte(nil), prefix...), players, 7, 99, 10000)
@@ -254,8 +252,6 @@ func TestAppendWorldStatePreservesFramePrefix(t *testing.T) {
 		t.Fatalf("type=%d seq=%d tick=%d dilation=%d players=%d", msgType, sequence, worldTick, dilationBps, len(decoded))
 	}
 
-	// Dense consecutive IDs are the case varint encoding exists for: 8 bytes per
-	// record (1-byte ID delta + 7) instead of the 11 a fixed uint32 ID would cost.
 	const denseRecordSize = 8
 	if size := len(got) - len(prefix); size != worldStateHeaderSize+2*denseRecordSize {
 		t.Fatalf("dense-ID frame = %d bytes, want %d", size, worldStateHeaderSize+2*denseRecordSize)

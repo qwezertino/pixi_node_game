@@ -1,10 +1,3 @@
-// Shared implementation behind both unit-viewer.html (standalone page) and the
-// in-game "Units" debug button (see main.ts). Builds its own DOM instead of relying
-// on a static template so it can be mounted anywhere without id collisions with the
-// rest of the page. Lets you pick any unit + any animation + any direction and see
-// exactly which row animationLayout.ts resolves it to, both as a highlighted
-// rectangle on the real spritesheet and as a looping animated preview — built to
-// verify the row math against the actual art instead of guessing.
 
 import { Application, AnimatedSprite, Assets, Texture, Rectangle } from "pixi.js";
 import { UNITS } from "../../shared/units";
@@ -65,7 +58,7 @@ const HTML = `
 `;
 
 const DISPLAY_TARGET_WIDTH = 260;
-const PREVIEW_TARGET_SIZE = 200; // px, before pixel-snapping the scale factor
+const PREVIEW_TARGET_SIZE = 200;
 
 function imageSize(path: string): Promise<{ width: number; height: number }> {
     return new Promise((resolve, reject) => {
@@ -129,9 +122,6 @@ export function createUnitViewerPanel(container: HTMLElement): void {
         return { unit, sheet, path: sheet === "movement" ? unit.assetPath : unit.combatAssetPath };
     }
 
-    // Rebuilds the animation <select> options for the current unit/sheet — only
-    // called when the unit or sheet changes, never on animation/direction change, so
-    // picking an animation doesn't get wiped out by the list resetting itself.
     async function refreshAnimationOptions() {
         const current = currentPath();
         if (!current || !current.path) {
@@ -159,7 +149,6 @@ export function createUnitViewerPanel(container: HTMLElement): void {
         void renderSelection();
     }
 
-    // Renders whatever is currently selected — never touches the <select> option lists.
     async function renderSelection() {
         const current = currentPath();
         if (!current) {
@@ -215,7 +204,6 @@ export function createUnitViewerPanel(container: HTMLElement): void {
         }
         warning.textContent = "";
 
-        // Bounding box over every frame's cell — attack spans 2 rows, everything else 1.
         const bounds = boundingBox(rects);
         highlight.hidden = false;
         highlight.style.left = `${bounds.x * scale}px`;
@@ -225,7 +213,7 @@ export function createUnitViewerPanel(container: HTMLElement): void {
 
         await ensureApp();
         const texture = await Assets.load(url);
-        texture.source.scaleMode = "nearest"; // pixel art — no blur on upscale
+        texture.source.scaleMode = "nearest";
         const frames = rects.map((r) => new Texture({ source: texture.source, frame: new Rectangle(r.x, r.y, r.width, r.height) }));
 
         if (previewSprite) {
@@ -235,7 +223,7 @@ export function createUnitViewerPanel(container: HTMLElement): void {
         previewSprite = new AnimatedSprite(frames);
         previewSprite.anchor.set(0.5);
         previewSprite.position.set(128, 128);
-        // Snap to an integer multiple so pixel edges stay crisp instead of shimmering.
+
         previewSprite.scale.set(Math.max(1, Math.round(PREVIEW_TARGET_SIZE / grid.cellSize)));
         previewSprite.animationSpeed = 0.12;
         previewSprite.play();
@@ -269,11 +257,6 @@ export function mountUnitViewerToggle(): void {
         background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer;
     `;
 
-    // Dimmed backdrop — the game underneath stays visible, same as a normal modal.
-    // Visibility is toggled via style.display directly (not the `hidden` attribute):
-    // an inline `display` set here would otherwise outrank the UA stylesheet's
-    // `[hidden] { display: none }` rule, leaving the backdrop visible regardless of
-    // `hidden` and unable to ever be closed.
     const backdrop = document.createElement("div");
     backdrop.style.cssText = `
         position: fixed; inset: 0; z-index: 9999; background: rgba(0, 0, 0, 0.6);
@@ -319,7 +302,7 @@ export function mountUnitViewerToggle(): void {
 
     button.addEventListener("click", open);
     closeButton.addEventListener("click", close);
-    // Click outside the dialog closes it, same as a standard modal.
+
     backdrop.addEventListener("click", (e) => {
         if (e.target === backdrop) close();
     });

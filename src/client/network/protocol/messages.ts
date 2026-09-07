@@ -19,8 +19,7 @@ export interface PlayerState {
     attacking?: boolean;
     blocking?: boolean;
     sprinting?: boolean;
-    // Which step (1-indexed) of its combo chain the current/most recent attack is
-    // — see AnimationController.startAttackAnimation, world.go executeAttack.
+
     comboStep?: number;
     vx?: number;
     vy?: number;
@@ -43,8 +42,7 @@ export interface MoveMessage extends ClientMessage {
         dy: number;
     };
     inputSequence: number;
-    // Held-Shift intent (GDD §54 sprint) — only takes effect server-side while
-    // moving and while stamina remains, see server world.go updatePlayerPosition.
+
     sprint: boolean;
 }
 
@@ -70,7 +68,6 @@ export interface BlockEndMessage extends ClientMessage {
     type: 'blockEnd';
 }
 
-// Server to Client messages
 export interface ServerMessage {
     type: string;
 }
@@ -118,12 +115,9 @@ export interface GameStateMessage extends ServerMessage {
     players: Record<string, PlayerState>;
     timestamp: number;
     stateSequence?: number;
-    // Simulation tick the records describe. Players absent from a delta are
-    // dead-reckoned forward by the tick difference since the previous frame.
+
     worldTick: number;
-    // Server's current time-dilation factor as a percentage (100 = nominal tick
-    // rate, EVE-style TiDi). Scale local prediction step by dilationPct/100 to stay
-    // in lockstep with a dilated server instead of running ahead of it.
+
     dilationPct: number;
 }
 
@@ -145,18 +139,12 @@ export interface WelcomeMessage extends ServerMessage {
     protocolVersion: number;
     tickRate: number;
     playerId: string;
-    // units.Definition.typeId assigned by the server (see shared/units.ts) — the
-    // server validates/falls back the client's requested unit, so this is the
-    // authoritative value even when it doesn't match what was requested.
+
     unitType: number;
 }
 
-// entries maps playerId -> unit type + current HP/stamina. None of these change
-// after spawn today (nothing drains HP or stamina yet — see server types.go
-// UnitAssignment doc), so they're replicated on this low-frequency channel instead
-// of every world-state record — see server broadcast.go sendUnitRoster.
 export interface PlayerAttributes {
-    unitType: number; // units.Definition.typeId, see shared/units.ts
+    unitType: number;
     hp: number;
     stamina: number;
 }
@@ -166,9 +154,6 @@ export interface UnitRosterMessage extends ServerMessage {
     entries: Record<string, PlayerAttributes>;
 }
 
-// Must match protocol.ProtocolVersion on the server. The wire format carries no
-// per-record framing, so a mismatched decoder does not fail — it silently yields
-// wrong player IDs. Checking the version turns that into a visible error.
 export const PROTOCOL_VERSION = 12;
 
 export enum MessageType {

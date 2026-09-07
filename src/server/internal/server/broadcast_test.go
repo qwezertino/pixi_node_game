@@ -115,7 +115,7 @@ func TestReleaseConnSliceClearsPointers(t *testing.T) {
 	if len(*buf) != 0 {
 		t.Fatalf("released slice len = %d, want 0", len(*buf))
 	}
-	// A pooled slice that still holds pointers keeps closed connections alive.
+
 	full := (*buf)[:2]
 	for i, conn := range full {
 		if conn != nil {
@@ -124,8 +124,6 @@ func TestReleaseConnSliceClearsPointers(t *testing.T) {
 	}
 }
 
-// tuneTimeDilation reads/writes GameWorld's real ticker via SetTickInterval, so these
-// tests exercise it through a live GameWorld rather than a bare Server struct.
 func newDilationTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &config.Config{
@@ -137,11 +135,7 @@ func newDilationTestServer(t *testing.T) *Server {
 	}
 	gw := game.NewGameWorld(cfg)
 	t.Cleanup(gw.Stop)
-	// gameLoop() creates the actual *time.Ticker in its own goroutine; SetTickInterval
-	// silently no-ops until it exists. In production this can never race —
-	// SetTickInterval is only ever called from inside tick(), which only runs after
-	// the ticker already exists — but this test calls it immediately after
-	// construction, so give the goroutine a moment to reach that line.
+
 	time.Sleep(10 * time.Millisecond)
 	return &Server{cfg: cfg, gameWorld: gw, dilationBps: dilationBpsFull}
 }
@@ -149,8 +143,6 @@ func newDilationTestServer(t *testing.T) *Server {
 func TestTuneTimeDilationStepsDownUnderPressure(t *testing.T) {
 	s := newDilationTestServer(t)
 
-	// A single severe tick must NOT move the needle — debounce requires
-	// dilationDebounceSevereTicks consecutive ticks before a step-down lands.
 	for i := 0; i < dilationDebounceSevereTicks-1; i++ {
 		s.tuneTimeDilation(100*time.Millisecond, 0, 0)
 	}
@@ -163,8 +155,7 @@ func TestTuneTimeDilationStepsDownUnderPressure(t *testing.T) {
 	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull-1000 {
 		t.Fatalf("dilationBps = %d, want %d (one severe step down)", got, dilationBpsFull-1000)
 	}
-	// The tick interval must have actually grown — this is what distinguishes time
-	// dilation from the old batch-interval backoff, which never touched the tick rate.
+
 	nominal := s.gameWorld.GetNominalTickInterval()
 	if got := s.gameWorld.GetTickInterval(); got <= nominal {
 		t.Fatalf("tick interval = %v, want > nominal %v under severe pressure", got, nominal)
@@ -174,11 +165,10 @@ func TestTuneTimeDilationStepsDownUnderPressure(t *testing.T) {
 func TestTuneTimeDilationDebounceResetsOnClearTick(t *testing.T) {
 	s := newDilationTestServer(t)
 
-	// One severe tick short of the debounce threshold...
 	for i := 0; i < dilationDebounceSevereTicks-1; i++ {
 		s.tuneTimeDilation(100*time.Millisecond, 0, 0)
 	}
-	// ...then a clear tick must reset the streak, not merely pause it.
+
 	s.tuneTimeDilation(0, 0, 0)
 	if got := atomic.LoadInt64(&s.dilationSevereStreak); got != 0 {
 		t.Fatalf("severe streak = %d, want reset to 0 after a clear tick", got)
@@ -218,8 +208,6 @@ func TestTuneTimeDilationFloorsAtFloor(t *testing.T) {
 	}
 }
 
-// No write/fanout pressure at all — only a tick that overran its own budget, EVE's
-// classic trigger — must still step dilation down once the debounce threshold is met.
 func TestTuneTimeDilationTriggersOnComputeOverrunAlone(t *testing.T) {
 	s := newDilationTestServer(t)
 	nominal := s.gameWorld.GetNominalTickInterval()
@@ -233,8 +221,6 @@ func TestTuneTimeDilationTriggersOnComputeOverrunAlone(t *testing.T) {
 	}
 }
 
-// A moderate-severity pressure signal must debounce independently of severe: a burst
-// of moderate ticks alone should not trip the (unrelated) severe streak counter.
 func TestTuneTimeDilationModerateDebounceIsIndependentOfSevere(t *testing.T) {
 	s := newDilationTestServer(t)
 
@@ -263,8 +249,7 @@ func TestShouldEmitFrame(t *testing.T) {
 		{"full sync always ships", true, 0, false, true},
 		{"legacy suppresses an empty delta", false, 0, false, false},
 		{"legacy ships a non-empty delta", false, 3, false, true},
-		// The heartbeat: without it the client never learns the tick advanced and
-		// every dead-reckoned player freezes until someone changes direction.
+
 		{"velocity replication ships an empty delta as a heartbeat", false, 0, true, true},
 		{"velocity replication ships records too", false, 3, true, true},
 	}

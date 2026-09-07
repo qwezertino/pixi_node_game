@@ -1,6 +1,5 @@
 import { WORLD } from "../../shared/gameConfig";
 
-
 export class CoordinateConverter {
     private scaleX: number = 1;
     private scaleY: number = 1;
@@ -18,11 +17,10 @@ export class CoordinateConverter {
      * Используем подход "fill screen" - растягиваем виртуальный мир на весь экран
      */
     private calculateScales(): void {
-        // Рассчитываем коэффициенты так, чтобы виртуальный мир заполнял весь экран
+
         const virtualWidth = WORLD.virtualSize.width;
         const virtualHeight = WORLD.virtualSize.height;
 
-        // Рассчитываем коэффициенты для заполнения экрана
         this.scaleX = this.screenWidth / virtualWidth;
         this.scaleY = this.screenHeight / virtualHeight;
     }
@@ -116,12 +114,5 @@ export class CoordinateConverter {
             height: this.screenHeight
         };
     }
-
-
-
-
-
-
-
 
 }

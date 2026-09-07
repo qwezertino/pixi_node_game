@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	_ "net/http/pprof" // registers /debug/pprof/* handlers on DefaultServeMux
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"sync"
@@ -25,41 +25,30 @@ import (
 	"pixi_game_server/internal/types"
 )
 
-// Server основной сервер игры
 type Server struct {
 	cfg       *config.Config
 	gameWorld *game.GameWorld
 	protocol  *protocol.BinaryProtocol
 
-	// Connection management
 	connectionsMu sync.RWMutex
-	connections   map[uint32]*Connection // playerID → *Connection
-	rh            readHandler            // epoll (Linux) or goroutine-per-conn (other) read strategy
+	connections   map[uint32]*Connection
+	rh            readHandler
 
-	// Rate limiting
-	rateLimiters sync.Map // map[string]*rate.Limiter
+	rateLimiters sync.Map
 
-	// Server state
 	ctx        context.Context
 	cancel     context.CancelFunc
 	httpServer *http.Server
 
-	// Throttled diagnostics
-	lastSlowFanoutLog  int64 // atomic monotonic timestamp
-	lastDilationLog    int64 // atomic monotonic timestamp
-	lastFrameRejectLog int64 // atomic monotonic timestamp
+	lastSlowFanoutLog  int64
+	lastDilationLog    int64
+	lastFrameRejectLog int64
 
-	// Time dilation (EVE-style TiDi): replaces the old silent replication-interval
-	// backoff. dilationBps is basis points, 10000 = 100% (nominal), floor at
-	// minDilationBps. When it changes, GameWorld's tick ticker itself is slowed via
-	// SetTickInterval — see world.go — so replication cadence follows the simulation
-	// rate automatically instead of being paced separately.
-	dilationBps            int64 // atomic
-	dilationSevereStreak   int64 // atomic consecutive-tick counter, debounces step-downs against single-tick jitter
-	dilationModerateStreak int64 // atomic
+	dilationBps            int64
+	dilationSevereStreak   int64
+	dilationModerateStreak int64
 	worldStateSeq          uint32
 
-	// Fanout/write controls
 	fanoutDropLimit                int32
 	writeBatchSize                 int
 	fanoutMaxBroadcastBytesPerTick int
@@ -71,60 +60,48 @@ type Server struct {
 	fanoutRoundRobinWeightNs       int64
 	fanoutCriticalWindowNs         int64
 	fanoutCriticalBoostNs          int64
-	fanoutRoundRobinEpoch          int64 // atomic cursor for tie-breaking fairness
+	fanoutRoundRobinEpoch          int64
 	fanoutDebtEpoch                uint32
 
-	// Adaptive recipient fanout scheduling
 	fanoutMinRecipients  int
 	fanoutMaxRecipients  int
 	fanoutTarget         time.Duration
-	fanoutRecipientLimit int64 // atomic
+	fanoutRecipientLimit int64
 	activeStalenessNs    int64
 	idleStalenessNs      int64
 	activeWindowNs       int64
-	lastFanoutTuneLog    int64 // atomic monotonic timestamp
+	lastFanoutTuneLog    int64
 
-	// Performance monitoring
 	startTime time.Time
 }
 
-// Connection represents a WebSocket client connection.
-// rawConn is the hijacked net.Conn returned by gobwas/ws after the HTTP upgrade.
-//
-// Write path: all writes are sent to writeCh and processed by a single persistent
-// write-loop goroutine (startWriteLoop). Because only one goroutine writes to rawConn,
-// no write mutex is needed.
-//
-// Lifecycle: cleanupConnection is guaranteed to run exactly once via closeOnce.
 type Connection struct {
 	player               *types.Player
 	rawConn              net.Conn
-	fd                   int // OS file descriptor (used by epoll remove)
+	fd                   int
 	rateLimiter          *rate.Limiter
-	writeCh              chan writeJob // buffered channel drained by startWriteLoop goroutine
-	closeOnce            sync.Once     // ensures cleanupConnection body runs once
-	lastActivity         int64         // monotonic ns, updated on each received frame (atomic)
-	writeFailures        int32         // consecutive write timeouts/errors (atomic); reset on success
-	fanoutDrops          int32         // consecutive dropped broadcast enqueues (atomic)
-	fanoutFairDebt       int32         // anti-starvation debt for recipient selection fairness (atomic)
-	fanoutDebtEpoch      uint32        // marks whether conn was selected in the current fairness epoch
-	pendingStateNs       int64         // monotonic creation time of queued/in-flight world state (atomic)
-	lastWriteAgeNs       int64         // completed world-state age (atomic)
-	lastWriteObservedNs  int64         // monotonic time of age observation (atomic)
-	pendingBroadcast     int32         // 0/1: whether a world-state broadcast job is already queued/in-flight
-	lastMovementAckSeq   uint32        // latest authoritative input sequence queued to the writer
-	staleInputStreak     int32         // consecutive movement inputs rejected as duplicate/out-of-order
-	lastWorldStateSentNs int64         // monotonic timestamp of last successfully written world-state frame
-	criticalUntilNs      int64         // monotonic ns until which this client receives criticality boost
+	writeCh              chan writeJob
+	closeOnce            sync.Once
+	lastActivity         int64
+	writeFailures        int32
+	fanoutDrops          int32
+	fanoutFairDebt       int32
+	fanoutDebtEpoch      uint32
+	pendingStateNs       int64
+	lastWriteAgeNs       int64
+	lastWriteObservedNs  int64
+	pendingBroadcast     int32
+	lastMovementAckSeq   uint32
+	staleInputStreak     int32
+	lastWorldStateSentNs int64
+	criticalUntilNs      int64
 	ctx                  context.Context
 	cancel               context.CancelFunc
 }
 
-// New создает новый сервер
 func New(cfg *config.Config) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Auto-detect worker count
 	if cfg.Server.Workers == 0 {
 		cfg.Server.Workers = runtime.NumCPU()
 	}
@@ -219,45 +196,33 @@ func New(cfg *config.Config) *Server {
 		metrics.FanoutRecipientLimit.Set(0)
 	}
 
-	// Start ping/keepalive loop (replaces per-shard ping ticker).
 	go server.runPingLoop()
 
-	// Инициализируем read-хендлер (epoll на Linux, goroutine на других платформах).
 	server.rh = newReadHandler(server)
 
-	// Регистрируем tick-driven broadcast: состояние кодируется один раз в тик, разосылается всем.
 	server.gameWorld.SetTickBroadcaster(server.broadcastTick)
 
-	// Start performance monitoring
 	go server.performanceMonitor()
 
 	return server
 }
 
-// Start запускает сервер
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
-	// WebSocket endpoint
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
-	// Static files
 	mux.Handle("/", http.FileServer(http.Dir(s.cfg.Server.StaticDir)))
 
-	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// Metrics endpoint (Prometheus format)
 	mux.Handle("/metrics", promhttp.Handler())
 
-	// Legacy JSON metrics for backwards compat
 	mux.HandleFunc("/metrics/json", s.handleMetricsJSON)
 
-	// pprof endpoints — /debug/pprof/, /debug/pprof/trace, /debug/pprof/block etc.
-	// Block/mutex profiling enabled only when PPROF_BLOCK_RATE=1 (adds 10-30% CPU overhead).
 	if os.Getenv("PPROF_BLOCK_RATE") == "1" {
-		runtime.SetBlockProfileRate(1)     // record every blocking event
-		runtime.SetMutexProfileFraction(1) // record every mutex contention event
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
 	}
 	mux.Handle("/debug/pprof/", http.DefaultServeMux)
 	mux.Handle("/debug/pprof/cmdline", http.DefaultServeMux)
@@ -265,7 +230,6 @@ func (s *Server) Start() error {
 	mux.Handle("/debug/pprof/symbol", http.DefaultServeMux)
 	mux.Handle("/debug/pprof/trace", http.DefaultServeMux)
 
-	// Periodically purge stale per-IP rate limiters to prevent unbounded memory growth.
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -300,17 +264,12 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Shutdown stops accepting new connections, drains in-flight HTTP requests, then
-// stops the simulation. Order matters: the world must outlive the listener so that
-// a tick already in flight still finds a coherent connection map.
 func (s *Server) Shutdown(ctx context.Context) error {
 	var err error
 	if s.httpServer != nil {
 		err = s.httpServer.Shutdown(ctx)
 	}
 
-	// Cancel per-connection contexts so write loops exit instead of blocking on a
-	// receive, then stop the tick loop and its workers.
 	s.connectionsMu.RLock()
 	conns := make([]*Connection, 0, len(s.connections))
 	for _, conn := range s.connections {
@@ -330,14 +289,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 const (
 	maxClientFramePayload int64 = 125
 
-	// maxStaleInputStreak — consecutive duplicate/old transitions tolerated before the
-	// connection is considered non-conforming.
 	maxStaleInputStreak int32 = 120
 )
 
-// validClientHeader enforces the subset of RFC 6455 used by the game protocol.
-// Fragmented messages and text frames are deliberately unsupported: every client
-// command is a single, small binary frame.
 func validClientHeader(h ws.Header) bool {
 	if !h.Masked || !h.Fin || h.Rsv != 0 || h.Length < 0 || h.Length > maxClientFramePayload {
 		return false
@@ -350,8 +304,6 @@ func validClientHeader(h ws.Header) bool {
 	}
 }
 
-// clientHeaderRejectReason explains a validClientHeader failure. Cold path only —
-// callers must gate it behind the boolean check so the hot path stays branch-free.
 func clientHeaderRejectReason(h ws.Header) string {
 	switch {
 	case !h.Masked:
@@ -367,9 +319,6 @@ func clientHeaderRejectReason(h ws.Header) string {
 	}
 }
 
-// logRejectedFrame reports at most one rejected frame per second across the whole
-// server. Without it a single misbehaving client would flood the log, and without
-// any logging at all a protocol-level disconnect is undiagnosable in production.
 func (s *Server) logRejectedFrame(c *Connection, hdr ws.Header) {
 	now := clock.Now()
 	last := atomic.LoadInt64(&s.lastFrameRejectLog)
@@ -388,9 +337,8 @@ func (s *Server) logRejectedFrame(c *Connection, hdr ws.Header) {
 		"fin", hdr.Fin)
 }
 
-// handleWebSocket обрабатывает WebSocket соединения
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Check connection limit before doing anything else.
+
 	s.connectionsMu.RLock()
 	connCount := len(s.connections)
 	s.connectionsMu.RUnlock()
@@ -399,10 +347,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rate limiting by IP (RemoteAddr includes port — extract host only).
 	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		clientIP = r.RemoteAddr // fallback for unix sockets / tests
+		clientIP = r.RemoteAddr
 	}
 	limiter := s.getOrCreateRateLimiter(clientIP)
 
@@ -412,9 +359,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upgrade to WebSocket via gobwas/ws (hijacks the HTTP conn; no per-conn goroutine spawned).
-	// ws.UpgradeHTTP performs the Upgrade handshake and returns the hijacked net.Conn.
-	// Any origin is accepted (development / same-origin proxied).
 	rawConn, _, _, err := ws.UpgradeHTTP(r, w)
 	if err != nil {
 		slog.Error("websocket upgrade failed", "error", err, "remote_addr", r.RemoteAddr)
@@ -422,22 +366,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create player and connection. The requested unit type (?unit=spearman) is
-	// validated against the registry server-side (units.Get falls back to
-	// units.DefaultUnitType for an empty/unrecognized value) — there is no
-	// dedicated JOIN payload in this protocol, so the WS upgrade URL is the only
-	// pre-connection channel available.
 	requestedUnitType := r.URL.Query().Get("unit")
 	player := s.gameWorld.AddPlayer(requestedUnitType)
 	connection := s.createConnection(player, rawConn)
 
-	// Explicit identity must precede all state/event messages for this connection.
 	s.sendWelcome(connection)
 
-	// Send initial state BEFORE adding to s.connections so that the write loop
-	// delivers the full world snapshot as the very first message the client
-	// receives. If we add to the map first, a world tick can race here and
-	// enqueue a delta/gamestate frame ahead of the initial state.
 	s.sendInitialState(connection)
 	s.sendUnitRoster(connection)
 
@@ -445,21 +379,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.connections[player.ID] = connection
 	s.connectionsMu.Unlock()
 
-	// Existing clients discover the new player in the next world-state delta.
-	// A separate PLAYER_JOINED broadcast duplicates that information and creates
-	// O(N²) control messages during a connection ramp, delaying state frames.
-
-	// Update metrics
 	metrics.ConnectionsTotal.Inc()
 	metrics.PlayersConnected.Inc()
 
-	// Register with the read handler (epoll on Linux; goroutine on other platforms).
-	// No handleConnection goroutine is spawned here — this is the key change that
-	// reduces goroutine count from 2400 to ~2×GOMAXPROCS at 2400 clients.
 	s.rh.register(s, connection)
 }
 
-// createConnection creates a new connection and starts its write-loop goroutine.
 func (s *Server) createConnection(player *types.Player, rawConn net.Conn) *Connection {
 	ctx, cancel := context.WithCancel(s.ctx)
 
@@ -480,7 +405,6 @@ func (s *Server) createConnection(player *types.Player, rawConn net.Conn) *Conne
 	return conn
 }
 
-// processMessage обрабатывает сообщение от клиента
 func (s *Server) processMessage(connection *Connection, message []byte) {
 	clientMsg, err := s.protocol.DecodeClientMessage(message)
 	if err != nil {
@@ -507,8 +431,7 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			atomic.StoreInt32(&connection.staleInputStreak, 0)
 
 		case types.InputStale:
-			// Idempotently ignore a duplicate/old transition. WebSocket preserves
-			// order, so a long stale streak indicates a non-conforming sender.
+
 			metrics.MovementInputsRejected.Inc()
 			slog.Warn("movement input rejected", "player_id", connection.player.ID, "reason", result.String(), "sequence", clientMsg.InputSequence)
 			if atomic.AddInt32(&connection.staleInputStreak, 1) >= maxStaleInputStreak {
@@ -517,14 +440,12 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			return
 
 		default:
-			// A sequence gap or invalid sample indicates a broken client stream.
+
 			metrics.MovementInputsRejected.Inc()
 			slog.Warn("movement input rejected", "player_id", connection.player.ID, "reason", result.String(), "sequence", clientMsg.InputSequence)
 			go s.cleanupConnection(connection)
 			return
 		}
-
-		// ACK is emitted after the world worker has reconstructed the segment boundary.
 
 	case protocol.MessageDirection:
 		metrics.MessagesReceived.WithLabelValues("direction").Inc()
@@ -534,22 +455,18 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 			Type:      types.EventFace,
 			Direction: clientMsg.Direction,
 		})
-		// Обновление направления разошлётся через tick broadcast.
 
 	case protocol.MessageAttack:
 		metrics.MessagesReceived.WithLabelValues("attack").Inc()
 		s.markConnectionCritical(connection)
 		s.gameWorld.TryAttack(connection.player.ID)
-		// State=1 будет разослан всем через tick broadcast.
 
 	case protocol.MessageAttackEnd:
-		// Ignored: server is authoritative on attack duration.
 
 	case protocol.MessageBlockStart:
 		metrics.MessagesReceived.WithLabelValues("block_start").Inc()
 		s.markConnectionCritical(connection)
 		s.gameWorld.TryBlockStart(connection.player.ID)
-		// State=2 будет разослан всем через tick broadcast.
 
 	case protocol.MessageBlockEnd:
 		metrics.MessagesReceived.WithLabelValues("block_end").Inc()
@@ -557,7 +474,6 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 		s.gameWorld.EndBlock(connection.player.ID)
 
 	case protocol.MessageViewportUpdate:
-		// Silently accepted — viewport-based culling not yet implemented.
 
 	case protocol.MessageSyncRequest:
 		metrics.MessagesReceived.WithLabelValues("sync_request").Inc()
@@ -586,7 +502,6 @@ func (s *Server) markConnectionCritical(conn *Connection) {
 	}
 }
 
-// cleanupConnection очищает соединение. Guaranteed idempotent via closeOnce.
 func (s *Server) cleanupConnection(c *Connection) {
 	c.closeOnce.Do(func() {
 		playerID := c.player.ID
@@ -595,38 +510,23 @@ func (s *Server) cleanupConnection(c *Connection) {
 		metrics.PlayersConnected.Dec()
 		metrics.SessionDuration.Observe(time.Since(c.player.JoinTime).Seconds())
 
-		// Stop epoll watching (must happen before rawConn.Close).
 		s.rh.remove(c)
 
-		// Remove from connections map BEFORE cancelling ctx so that broadcastTick
-		// cannot enqueue a new writeJob after the write loop exits (which would
-		// leave a tickFrame ref unreleased or panic on a send to a closed channel).
 		s.connectionsMu.Lock()
 		delete(s.connections, playerID)
 		s.connectionsMu.Unlock()
 
-		// Notify other players that this player left (after map removal so the
-		// departing connection does not receive its own leave notification).
 		s.notifyPlayerLeft(playerID)
 
-		// Cancel ctx → if the write-loop goroutine is still running, it will
-		// receive ctx.Done() and call drainWriteCh before exiting.
-		// If the write loop already exited (maxWriteFailures path), cancel is a
-		// no-op for the goroutine, but we still drain here to release any tickFrame
-		// refs that arrived in writeCh after the write loop drained and before
-		// the map removal above completed (a narrow race window).
 		c.cancel()
 		drainWriteCh(c.writeCh)
-		// Close the raw connection so any in-progress Write returns immediately.
+
 		c.rawConn.Close()
 
 		s.gameWorld.RemovePlayer(playerID)
 	})
 }
 
-// getOrCreateRateLimiter получает или создает rate limiter для IP.
-// Uses LoadOrStore to avoid the Load+Store TOCTOU race under concurrent connections.
-// If cfg.Net.IPConnRate == 0, rate limiting is disabled (returns an infinite limiter).
 func (s *Server) getOrCreateRateLimiter(ip string) *rate.Limiter {
 	limit := rate.Limit(s.cfg.Net.IPConnRate)
 	burst := s.cfg.Net.IPConnBurst
@@ -641,7 +541,6 @@ func (s *Server) getOrCreateRateLimiter(ip string) *rate.Limiter {
 	return newLimiter
 }
 
-// performanceMonitor мониторит производительность
 func (s *Server) performanceMonitor() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -657,12 +556,10 @@ func (s *Server) performanceMonitor() {
 	}
 }
 
-// logPerformanceStats логирует статистику производительности
 func (s *Server) logPerformanceStats() {
-	// Metrics are exposed via /metrics (Prometheus). Periodic log removed.
+
 }
 
-// handleHealth обрабатывает health check
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -671,7 +568,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		s.gameWorld.GetPlayerCount())
 }
 
-// handleMetricsJSON обрабатывает запрос метрик в JSON (legacy)
 func (s *Server) handleMetricsJSON(w http.ResponseWriter, r *http.Request) {
 	m := s.gameWorld.GetMetrics()
 

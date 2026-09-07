@@ -55,10 +55,9 @@ export class SpriteLoader {
 
     private static async createCharacterVisual(spritesheetPath: string): Promise<CharacterVisual> {
         const sheetTexture = await Assets.load(spritesheetPath);
-        sheetTexture.source.scaleMode = "nearest"; // pixel art — no blur on upscale
+        sheetTexture.source.scaleMode = "nearest";
         const animations = new Map<string, Texture[]>();
 
-        // Store texture arrays instead of AnimatedSprite instances
         for (const config of ANIMATIONS_CONFIG) {
             animations.set(config.name, this.createFrames(sheetTexture, config.row, config.frames));
         }
@@ -73,9 +72,7 @@ export class SpriteLoader {
                 anim.anchor.set(0.5);
                 return anim;
             },
-            // The placeholder sheet's own frames are already sized to look right at
-            // PLAYER.baseScale (see gameConfig.json) — unrelated to TARGET_ONSCREEN_SIZE,
-            // which only applies to the real per-unit sheets below.
+
             scale: PLAYER.baseScale,
             directional: false,
         };
@@ -95,11 +92,6 @@ export class SpriteLoader {
         return frames;
     }
 
-    // Real per-unit spritesheets (public/assets/actual/) don't share one grid — see
-    // animationLayout.ts for how row/cell geometry is derived per sheet. Only the
-    // animation base names AnimationController actually drives ("idle", "run",
-    // "attack1", "attack2") are populated, each for all 4 directions — no flipping,
-    // unlike the placeholder sheet, since this pack draws distinct art per direction.
     private static readonly unitVisuals = new Map<string, Promise<CharacterVisual>>();
 
     static loadUnitCharacterVisual(unit: UnitDefinition): Promise<CharacterVisual> {
@@ -118,12 +110,9 @@ export class SpriteLoader {
         }
 
         const movementTexture = await Assets.load(`/assets/${unit.assetPath}`);
-        movementTexture.source.scaleMode = "nearest"; // pixel art — no blur on upscale
+        movementTexture.source.scaleMode = "nearest";
         const animations = new Map<string, Texture[]>();
 
-        // "walk" and "run" are distinct rows/animations (normal move vs sprint, GDD
-        // §54) — loaded separately, not merged, so AnimationController can actually
-        // swap between them.
         for (const direction of DIRECTIONS) {
             const idleRects = getNonCombatFrameRects(movementTexture.width, movementTexture.height, "idle", direction);
             const walkRects = getNonCombatFrameRects(movementTexture.width, movementTexture.height, "walk", direction);
@@ -137,7 +126,7 @@ export class SpriteLoader {
         }
         for (const direction of DIRECTIONS) {
             if (!animations.has(`walk_${direction}`)) {
-                // Safety net only — every real sheet checked has a distinct walk row.
+
                 animations.set(`walk_${direction}`, animations.get(`run_${direction}`)!);
             }
         }
@@ -157,11 +146,7 @@ export class SpriteLoader {
         for (const direction of DIRECTIONS) {
             for (const variant of ["attack1", "attack2", "ready"] as const) {
                 if (!animations.has(`${variant}_${direction}`)) {
-                    // Archer/Rogue-only combat sheets have no melee attack or ready
-                    // rows — fall back to idle rather than leave AnimationController
-                    // with a missing key. Units without a block profile (see
-                    // units.json) never actually request "ready" (see server
-                    // TryBlockStart), so that fallback is unreachable for them.
+
                     animations.set(`${variant}_${direction}`, animations.get(`idle_${direction}`)!);
                 }
             }
@@ -178,7 +163,7 @@ export class SpriteLoader {
                 anim.anchor.set(0.5);
                 return anim;
             },
-            scale: recommendedScale(cellSize),
+            scale: recommendedScale(cellSize, unit.id),
             directional: true,
         };
     }

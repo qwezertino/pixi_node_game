@@ -7,10 +7,6 @@ import (
 	"pixi_game_server/internal/metrics"
 )
 
-// populationWritePressure requires at least 10% of recipients (and at least
-// two connections) to be slow before applying global time dilation. A lone
-// stalled socket remains subject to its own pending-state shedding/deadline.
-// Include in-flight age: counting completions alone hides fully blocked writers.
 func populationWritePressure(conns []*Connection, now int64) time.Duration {
 	var warm, moderate, severe int
 	for _, c := range conns {

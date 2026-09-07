@@ -1,13 +1,10 @@
 import { Container, Graphics } from "pixi.js";
 
-// Small HP/stamina bar pair rendered above a unit's head. Values are clamped to
-// [0, max] defensively — until real damage/drain exists these always report full,
-// but the UI itself must stay correct once combat starts writing partial values.
 const BAR_WIDTH = 48;
 const BAR_HEIGHT = 6;
 const BAR_GAP = 2;
 const STACK_HEIGHT = BAR_HEIGHT * 2 + BAR_GAP;
-// Gap between the sprite's visual top and the bottom of the stamina bar.
+
 const VERTICAL_OFFSET = 10;
 
 const HP_COLOR = 0x3ecb3e;
@@ -30,8 +27,7 @@ export class StatusBarWidget {
             .fill(BG_COLOR);
 
         this.container.addChild(hpBg, staminaBg, this.hpFill, this.staminaFill);
-        // Anchor at bottom-center so the stack sits just above the sprite's head
-        // regardless of which bars are currently drawn.
+
         this.container.pivot.set(BAR_WIDTH / 2, STACK_HEIGHT);
     }
 

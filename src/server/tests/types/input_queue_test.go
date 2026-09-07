@@ -21,8 +21,6 @@ func TestMovementInputOfferThenConsume(t *testing.T) {
 	}
 }
 
-// Several samples can arrive before a server tick consumes one; only the newest
-// should survive, since old samples are not a backlog of movement steps.
 func TestMovementInputOfferKeepsOnlyLatestBeforeConsume(t *testing.T) {
 	p := &types.Player{}
 	for sequence := uint32(1); sequence <= 3; sequence++ {
@@ -53,9 +51,6 @@ func TestMovementInputRejectsDuplicateAndOutOfOrder(t *testing.T) {
 	}
 }
 
-// The client sends one fixed-rate sample per tick, so any missing sequence means a
-// dropped/duplicated message or a non-conforming client — treated as fatal rather
-// than silently tolerated, since there is no backlog to replay it from.
 func TestMovementInputRejectsSequenceGap(t *testing.T) {
 	p := &types.Player{}
 	if got := p.OfferMovementInput(types.MovementInput{Sequence: 10}); got != types.InputAccepted {

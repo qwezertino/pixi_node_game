@@ -7,15 +7,14 @@ export class FpsDisplay {
     private background: Graphics;
     private app: Application;
     private networkManager: NetworkManager;
-    private showDetailedStats: boolean = true; // Изначально показываем полные метрики
+    private showDetailedStats: boolean = true;
     private statsUpdateCounter: number = 0;
 
-    // Network stats tracking
     private messagesSent: number = 0;
     private messagesReceived: number = 0;
     private connectionStartTime: number = Date.now();
     private pingHistory: number[] = [];
-    private lastPingTime: number = 0; // Время последнего измерения пинга
+    private lastPingTime: number = 0;
 
     constructor(app: Application, networkManager: NetworkManager) {
         this.app = app;
@@ -23,7 +22,6 @@ export class FpsDisplay {
 
         console.log("Initializing FPS Display...");
 
-        // Create FPS text (always visible)
         this.fpsText = new Text({
             text: "FPS: 0",
             style: {
@@ -36,7 +34,6 @@ export class FpsDisplay {
         this.fpsText.position.set(10, 10);
         app.stage.addChild(this.fpsText);
 
-        // Create detailed stats text (hidden by default)
         this.statsText = new Text({
             text: "",
             style: {
@@ -48,30 +45,26 @@ export class FpsDisplay {
         });
         this.statsText.position.set(10, 35);
 
-        // Create background for stats
         this.background = new Graphics();
         this.background.fill(0x000000);
         this.background.alpha = 0.7;
-        this.background.visible = this.showDetailedStats; // Показываем если включены детальные статистики
+        this.background.visible = this.showDetailedStats;
         app.stage.addChild(this.background);
         app.stage.addChild(this.statsText);
 
-        // Устанавливаем видимость статистики согласно начальному состоянию
         this.statsText.visible = this.showDetailedStats;
 
-        // В детальном режиме скрываем простой FPS
         this.fpsText.visible = !this.showDetailedStats;
 
-        // Track network messages
         this.setupNetworkTracking();
 
     }
 
     private setupNetworkTracking() {
-        // Добавляем задержку, чтобы WebSocket был инициализирован
+
         setTimeout(() => {
             try {
-                // Hook into WebSocket to track messages
+
                 const socket = this.networkManager['socket'];
                 if (socket && socket.send) {
                     const originalSend = socket.send.bind(socket);
@@ -81,7 +74,6 @@ export class FpsDisplay {
                     };
                 }
 
-                // Track received messages through existing handler
                 const originalHandleMessage = this.networkManager['handleServerMessage'];
                 if (originalHandleMessage) {
                     this.networkManager['handleServerMessage'] = (data: string | ArrayBuffer) => {
@@ -101,23 +93,22 @@ export class FpsDisplay {
 
     private addPingMeasurement(ping: number) {
         this.pingHistory.push(ping);
-        this.lastPingTime = Date.now(); // Запоминаем время последнего измерения
-        if (this.pingHistory.length > 20) { // Keep last 20 measurements
+        this.lastPingTime = Date.now();
+        if (this.pingHistory.length > 20) {
             this.pingHistory.shift();
         }
     }
 
     update() {
-        // В минимальном режиме показываем только FPS
+
         if (!this.showDetailedStats) {
             this.fpsText.text = `FPS: ${Math.round(this.app.ticker.FPS)}`;
             this.fpsText.visible = true;
         } else {
-            // В детальном режиме скрываем простой FPS, так как он будет в детальных статистиках
+
             this.fpsText.visible = false;
         }
 
-        // Update detailed stats less frequently (every 10 frames)
         this.statsUpdateCounter++;
         if (this.statsUpdateCounter >= 10) {
             this.statsUpdateCounter = 0;
@@ -133,14 +124,11 @@ export class FpsDisplay {
         const players = this.networkManager.getPlayers();
         const currentPlayerId = this.networkManager.getPlayerId();
 
-        // Count visible players (excluding current player)
         const visiblePlayers = Object.keys(players).filter(id => id !== currentPlayerId).length;
         const totalPlayers = Object.keys(players).length;
 
-        // Calculate ping display
         const pingDisplay = this.getPingDisplayText();
 
-        // Build stats string
         const stats = [
             `=== GAME MONITORING ===`,
             `FPS: ${Math.round(this.app.ticker.FPS)}`,
@@ -171,7 +159,6 @@ export class FpsDisplay {
 
         this.statsText.text = stats.join('\n');
 
-        // Update background size
         this.background.clear();
         this.background.fill(0x000000);
         this.background.alpha = 0.8;
@@ -182,11 +169,9 @@ export class FpsDisplay {
     private calculateAveragePing(): number {
         if (this.pingHistory.length === 0) return 0;
 
-        // Calculate average of recent ping measurements
         const sum = this.pingHistory.reduce((a, b) => a + b, 0);
         const average = sum / this.pingHistory.length;
 
-        // Return rounded average
         return Math.round(average);
     }
 
@@ -198,7 +183,6 @@ export class FpsDisplay {
         const ping = this.calculateAveragePing();
         const timeSinceLastPing = Date.now() - this.lastPingTime;
 
-        // Если последнее измерение было больше 10 секунд назад
         if (timeSinceLastPing > 10000) {
             return `${ping}ms (${Math.floor(timeSinceLastPing / 1000)}s ago)`;
         }
@@ -233,15 +217,13 @@ export class FpsDisplay {
     toggleDetailedStats() {
         this.showDetailedStats = !this.showDetailedStats;
 
-        // Управляем видимостью детальных статистик
         this.statsText.visible = this.showDetailedStats;
         this.background.visible = this.showDetailedStats;
 
-        // Управляем видимостью простого FPS
         this.fpsText.visible = !this.showDetailedStats;
 
         if (this.showDetailedStats) {
-            this.updateDetailedStats(); // Immediate update when shown
+            this.updateDetailedStats();
         }
     }
 
@@ -249,7 +231,6 @@ export class FpsDisplay {
         return this.showDetailedStats;
     }
 
-    // Cleanup method
     destroy() {
     }
 }

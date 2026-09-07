@@ -20,16 +20,8 @@ import (
 	"pixi_game_server/internal/metrics"
 )
 
-// readBufPoolSize is the fixed size of pooled read buffers.
-// All client message types fit within 64 bytes:
-//   - Move:        1 (type) + 1 (vector) + 4 (input_seq) + 4 (client_tick) = 10 bytes
-//   - Direction:   1 + 1 = 2 bytes
-//   - Attack:      1 byte
-//   - ViewportUpdate: up to ~16 bytes
 const readBufPoolSize = 64
 
-// readBufPool pools fixed-size receive buffers for incoming WebSocket frames.
-// Eliminates ~48k/sec make([]byte, N) allocations at 2400 clients × 20Hz input.
 var readBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, readBufPoolSize)
@@ -37,21 +29,12 @@ var readBufPool = sync.Pool{
 	},
 }
 
-// epollPoller is the Linux readHandler implementation.
-// It registers each accepted WebSocket connection's file descriptor with
-// epoll(7) using EPOLLONESHOT, so exactly one worker goroutine handles each
-// read event.  After reading one complete WebSocket frame the worker
-// re-arms the descriptor.
-//
-// Goroutine count: 1 epoll-wait loop + N read workers (N = 2×GOMAXPROCS).
-// At 2 400 clients this reduces goroutines from 2 400 to ~26, cutting GC STW
-// scan time from ~7 ms to < 0.3 ms.
 type epollPoller struct {
-	efd int // epoll file descriptor
+	efd int
 	mu  sync.RWMutex
-	fds map[int]*Connection // fd → connection
+	fds map[int]*Connection
 
-	jobs chan *Connection // ready-to-read connections
+	jobs chan *Connection
 	svr  *Server
 }
 
@@ -78,8 +61,6 @@ func newEpollPoller(svr *Server) *epollPoller {
 	return ep
 }
 
-// connFd extracts the underlying OS file descriptor from a net.Conn.
-// Works with *net.TCPConn (the most common type after http.Hijack).
 func connFd(nc net.Conn) (int, error) {
 	sc, ok := nc.(syscall.Conn)
 	if !ok {
@@ -96,7 +77,6 @@ func connFd(nc net.Conn) (int, error) {
 	return fd, nil
 }
 
-// register implements readHandler.
 func (ep *epollPoller) register(_ *Server, c *Connection) {
 	fd, err := connFd(c.rawConn)
 	if err != nil {
@@ -122,18 +102,14 @@ func (ep *epollPoller) register(_ *Server, c *Connection) {
 	}
 }
 
-// remove implements readHandler.
 func (ep *epollPoller) remove(c *Connection) {
 	ep.mu.Lock()
 	delete(ep.fds, c.fd)
 	ep.mu.Unlock()
-	// EPOLL_CTL_DEL is safe to call even if the fd was already removed (e.g.
-	// after rawConn.Close) — the kernel silently ignores it.
+
 	unix.EpollCtl(ep.efd, unix.EPOLL_CTL_DEL, c.fd, nil)
 }
 
-// rearm re-arms EPOLLONESHOT so a subsequent read event can fire.
-// Must be called after each successful frame read.
 func (ep *epollPoller) rearm(c *Connection) {
 	unix.EpollCtl(ep.efd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLONESHOT,
@@ -141,13 +117,10 @@ func (ep *epollPoller) rearm(c *Connection) {
 	})
 }
 
-// waitLoop runs as a dedicated goroutine and blocks in EpollWait.
-// On each ready event it either triggers cleanup (HUP/ERR) or enqueues
-// the connection into the worker jobs channel.
 func (ep *epollPoller) waitLoop() {
 	events := make([]unix.EpollEvent, 256)
 	for {
-		n, err := unix.EpollWait(ep.efd, events, 100 /* ms timeout */)
+		n, err := unix.EpollWait(ep.efd, events, 100 )
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -173,8 +146,7 @@ func (ep *epollPoller) waitLoop() {
 			}
 
 			if ev.Events&unix.EPOLLIN != 0 {
-				// Non-blocking send; if the jobs channel is full we re-arm
-				// immediately (level-triggered semantics: epoll will fire again).
+
 				select {
 				case ep.jobs <- c:
 				default:
@@ -185,16 +157,12 @@ func (ep *epollPoller) waitLoop() {
 	}
 }
 
-// worker is the read goroutine.  It blocks on the jobs channel and processes
-// one WebSocket frame per wakeup, then re-arms the epoll descriptor.
 func (ep *epollPoller) worker() {
 	for c := range ep.jobs {
 		ep.processRead(c)
 	}
 }
 
-// processRead reads exactly one WebSocket frame from the connection, handles
-// control frames, and dispatches data frames to processMessage.
 func (ep *epollPoller) processRead(c *Connection) {
 	select {
 	case <-c.ctx.Done():
@@ -202,13 +170,12 @@ func (ep *epollPoller) processRead(c *Connection) {
 	default:
 	}
 
-	// Set a short read deadline so a misbehaving client can't park a worker.
 	c.rawConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 
 	hdr, err := ws.ReadHeader(c.rawConn)
 	if err != nil {
 		if err == io.EOF || isClosedErr(err) {
-			// Normal close; cleanupConnection will run via HUP event or here.
+
 		} else {
 			metrics.WSReadErrors.Inc()
 		}
@@ -222,11 +189,6 @@ func (ep *epollPoller) processRead(c *Connection) {
 		return
 	}
 
-	// Read the payload.
-	// readBufPool provides 64-byte buffers covering all client message types.
-	// For payloads > 64 bytes (not expected in normal protocol use) fall back to make.
-	// processMessage is synchronous and never stores the payload slice, so returning
-	// the buffer to the pool after the switch is safe.
 	var payload []byte
 	var poolBuf *[]byte
 	if hdr.Length > 0 {
@@ -248,7 +210,6 @@ func (ep *epollPoller) processRead(c *Connection) {
 
 	ws.Cipher(payload, hdr.Mask, 0)
 
-	// Update liveness timestamp.
 	atomic.StoreInt64(&c.lastActivity, clock.Now())
 
 	switch hdr.OpCode {
@@ -260,8 +221,7 @@ func (ep *epollPoller) processRead(c *Connection) {
 		return
 
 	case ws.OpPing:
-		// ws.NewPongFrame copies payload into the Frame struct before CompileFrame.
-		// Safe to return poolBuf after the pong is compiled.
+
 		pongFrame, compErr := ws.CompileFrame(ws.NewPongFrame(payload))
 		if poolBuf != nil {
 			readBufPool.Put(poolBuf)
@@ -275,14 +235,12 @@ func (ep *epollPoller) processRead(c *Connection) {
 		}
 
 	case ws.OpPong:
-		// Already updated lastActivity above; nothing else needed.
 
 	case ws.OpBinary:
 		metrics.BytesReceived.Add(float64(len(payload)))
 
 		if !c.rateLimiter.Allow() {
-			// Input transitions are an ordered reliable stream. Silently dropping
-			// one would make later acknowledgements describe a state never received.
+
 			metrics.MessagesRateLimited.Inc()
 			if poolBuf != nil {
 				readBufPool.Put(poolBuf)
@@ -291,22 +249,21 @@ func (ep *epollPoller) processRead(c *Connection) {
 			go ep.svr.cleanupConnection(c)
 			return
 		} else {
-			// processMessage is synchronous and does not retain the payload slice.
+
 			ep.svr.processMessage(c, payload)
 		}
 
 	default:
-		// Header validation limits opcodes to the cases above.
+
 	}
 
 	if poolBuf != nil {
 		readBufPool.Put(poolBuf)
 	}
-	// Re-arm so epoll will notify us on the next incoming frame.
+
 	ep.rearm(c)
 }
 
-// isClosedErr reports whether err indicates the connection was closed.
 func isClosedErr(err error) bool {
 	if err == nil {
 		return false

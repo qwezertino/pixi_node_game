@@ -1,6 +1,7 @@
 import { Application, Container, Graphics, Text, AnimatedSprite } from "pixi.js";
 import { UNITS, type UnitDefinition } from "../../shared/units";
 import { SpriteLoader, type CharacterVisual } from "../utils/spriteLoader";
+import { effectiveCellSize } from "../utils/animationLayout";
 
 const COLUMNS = 4;
 const CARD_WIDTH = 180;
@@ -45,9 +46,6 @@ export async function showUnitSelectScreen(app: Application): Promise<UnitDefini
     loadingText.position.set(app.screen.width / 2, app.screen.height / 2);
     overlay.addChild(loadingText);
 
-    // Loaded in parallel, real sheet first — every unit falls back to the same
-    // placeholder main.ts uses if its sheet fails to decode, so a broken asset never
-    // leaves a card blank.
     const visuals = await Promise.all(
         UNITS.map((unit) =>
             SpriteLoader.loadUnitCharacterVisual(unit).catch(() =>
@@ -105,12 +103,13 @@ function buildUnitCard(unit: UnitDefinition, visual: CharacterVisual, onSelect: 
     const sprite = visual.getAnimation(visual.directional ? "idle_right" : "idle") as AnimatedSprite;
     sprite.animationSpeed = unit.animationSpeed;
     sprite.play();
-    // Fit the sprite inside a fixed preview area regardless of the unit's own
-    // in-game scale — a card is a much smaller frame than the game world.
+
     const frame = sprite.texture;
+    const fitCellWidth = effectiveCellSize(frame.width, unit.id);
+    const fitCellHeight = effectiveCellSize(frame.height, unit.id);
     const fitScale = Math.min(
-        (CARD_WIDTH * 0.6) / frame.width,
-        (SPRITE_AREA_HEIGHT * 0.9) / frame.height
+        (CARD_WIDTH * 0.6) / fitCellWidth,
+        (SPRITE_AREA_HEIGHT * 0.9) / fitCellHeight
     );
     sprite.scale.set(fitScale);
     sprite.position.set(CARD_WIDTH / 2, 28 + SPRITE_AREA_HEIGHT / 2);

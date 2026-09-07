@@ -1,9 +1,3 @@
-// Unit stat/property registry — mirrors docs/UNITS.md sections 2, 6, 7, 8.
-// Source of truth is units.json, duplicated verbatim on the server at
-// src/server/internal/config/units.json (same pattern as gameConfig.json).
-// Combat resolution (damage application, block/stamina/dodge/projectiles) is not
-// implemented yet — this module only exposes the data and the wire-stable typeId
-// used to identify a unit's type across the network.
 
 import unitsData from "./units.json";
 
@@ -16,13 +10,6 @@ export interface UnitCost {
     iron: number;
 }
 
-// Presence of `block` on a unit is what gates RMB (see server world.go
-// TryBlockStart/staminaStat.canBlock) — every unit whose combat sheet has a "ready"
-// stance row gets an entry (all melee-capable units; not Archer/Citizen, whose
-// combat sheets have no such row). Only Guard Swordsman/Caped Warrior/Skullcap
-// Warrior have real damage-reduction numbers per the GDD; everyone else gets
-// meleeDR/rangedDR: 0 — a purely cosmetic "ready" stance that still costs stamina
-// (spam should be punished even with no combat payoff), at a flat default drain.
 export interface BlockProfile {
     meleeDR: number;
     rangedDR: number;

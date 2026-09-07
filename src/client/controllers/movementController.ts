@@ -26,45 +26,21 @@ export class MovementController {
 
     private _virtualPosition = { x: 0, y: 0 };
 
-    // Screen-space position is only recomputed once per fixed physics tick (see
-    // update()), but the sprite renders every frame at display refresh rate, which
-    // is normally higher than TICK_RATE — without interpolation the sprite sits
-    // frozen for several frames and then jumps, which reads as jitter/choppiness,
-    // worse the higher moveSpeed is (each tick's jump is proportionally bigger).
-    // _currentScreenPosition/_previousScreenPosition bracket the last tick's step;
-    // render() blends `this.position` (the actual sprite Point) between them using
-    // how far the render loop is into the next not-yet-processed tick.
     private _previousScreenPosition = { x: 0, y: 0 };
     private _currentScreenPosition = { x: 0, y: 0 };
 
     private _currentMovementVector = { dx: 0, dy: 0 };
     private _currentSprint = false;
     private _staminaProvider: (() => number) | null = null;
-    // Server-confirmed blocking flag (see main.ts) — used as a fallback once the
-    // round trip lands (e.g. block requested by something other than the local
-    // RMB handler). Not the primary signal — see _localBlockRequested.
+
     private _blockingProvider: (() => boolean) | null = null;
-    // Local, zero-round-trip block intent (see requestBlock/releaseBlock, wired to
-    // RMB in main.ts). Without this, the client keeps resending the held WASD
-    // vector every tick until the server's BLOCK_START confirmation round-trips
-    // back — during that window the reasserted movement input immediately
-    // cancels the server's freshly-entered block state (see world.go
-    // updateBlockDrain), so block would only ever stick by lucky timing. Setting
-    // this the instant RMB is pressed stops resending movement from the very next
-    // tick, before any round trip is needed.
+
     private _localBlockRequested = false;
-    // This player's own moveSpeed converted to milli-units/tick (GDD §60 World
-    // Coordinate Resolution) — see setUnit(). 0 until set, so a missing call is
-    // visibly "not moving" rather than a wrong fallback speed.
+
     private _milliUnitsPerTick = 0;
-    // This player's own sprint multiplier (GDD §54) — per-unit, see setUnit().
+
     private _sprintSpeedMultiplier = 1;
-    // Fixed-point remainder (1/1000 world units), mirroring the server's
-    // Player.MoveRemainderMilli (world.go updatePlayerPosition) — without this the
-    // client's average predicted speed permanently diverges from the server's
-    // whenever moveSpeed doesn't convert to a whole number of units/tick, and every
-    // ACK visibly snaps the sprite back. Reset to 0 only where a fresh, deterministic
-    // replay starts (reconcilePosition, setInitialPosition).
+
     private _moveRemainderMilli = 0;
 
     private _inputSequence = 0;
@@ -78,9 +54,6 @@ export class MovementController {
         return this._isMoving;
     }
 
-    // Locally predicted sprint state (see update()) — used for the local player's
-    // own walk-vs-run animation pick, with zero round-trip latency. Remote players
-    // instead use the server-replicated PlayerState.sprinting.
     get isSprinting() {
         return this._currentSprint;
     }
@@ -119,42 +92,27 @@ export class MovementController {
         }
     }
 
-    // Local mirror of the server's stamina gate (see world.go updatePlayerPosition):
-    // sprint only speeds prediction up while stamina is known to remain. Reads the
-    // live client-side StaminaPredictor (see staminaPredictor.ts), not the stale
-    // roster-replicated value — any mismatch is corrected by the existing
-    // ACK/reconciliation path like any other divergence.
     private canSprint(): boolean {
         const stamina = this._staminaProvider?.();
         return stamina === undefined || stamina > 0;
     }
 
-    // Wires a live stamina reading (see main.ts's StaminaPredictor) so the local
-    // sprint gate reacts within the same frame instead of waiting on the network.
     setStaminaProvider(provider: () => number): void {
         this._staminaProvider = provider;
     }
 
-    // Wires the server-confirmed blocking flag (see main.ts) so update() can stop
-    // predicting movement the instant RMB is confirmed, the same as attacking.
     setBlockingProvider(provider: () => boolean): void {
         this._blockingProvider = provider;
     }
 
-    // Call on RMB press (see main.ts), before/alongside sending BLOCK_START — see
-    // _localBlockRequested for why this can't wait for the server's confirmation.
     requestBlock(): void {
         this._localBlockRequested = true;
     }
 
-    // Call on RMB release/blur (see main.ts), before/alongside sending BLOCK_END.
     releaseBlock(): void {
         this._localBlockRequested = false;
     }
 
-    // Sets the unit whose moveSpeed drives this player's predicted movement (GDD
-    // §60 World Coordinate Resolution) — call once at spawn and again if the unit
-    // ever changes.
     setUnit(unit: UnitDefinition): void {
         this._milliUnitsPerTick = milliUnitsPerTick(unit);
         this._sprintSpeedMultiplier = unit.sprintSpeedMultiplier;
@@ -169,11 +127,7 @@ export class MovementController {
         let milliRate = this._milliUnitsPerTick;
         let rateMultiplier = 1;
         if (sprint) rateMultiplier *= this._sprintSpeedMultiplier;
-        // Diagonal movement covers sqrt(2)x the distance of an axis-aligned move
-        // per tick unless corrected — mirrors the server's world.go
-        // updatePlayerPosition exactly (single combined multiplier, one rounding
-        // step, same Math.SQRT1_2/1/math.Sqrt2 constant) so client and server never
-        // drift apart from a different rounding order.
+
         if (dx !== 0 && dy !== 0) rateMultiplier *= Math.SQRT1_2;
         if (rateMultiplier !== 1) milliRate = Math.round(milliRate * rateMultiplier);
         const remainder = this._moveRemainderMilli + milliRate;
@@ -218,20 +172,11 @@ export class MovementController {
             y: serverPosition.y,
         };
 
-        // The ACK position already includes the acknowledged server step. Replay
-        // exactly one predicted step for every input the server has not processed.
-        // The remainder restarts from 0 here: the server's actual remainder at the
-        // ACKed position is unknown to the client, but replaying deterministically
-        // from 0 keeps this reproducible and bounds the divergence to under 1 unit,
-        // instead of the old flat-rounded rate's unbounded drift.
         this._moveRemainderMilli = 0;
         for (const input of this._pendingInputs) {
             this.advancePosition(reconciledTarget, input.dx, input.dy, input.sprint);
         }
 
-        // Logical prediction is corrected exactly. In the normal path this is a
-        // no-op because replaying unacknowledged inputs reproduces the current
-        // client position. Any non-zero correction indicates a real divergence.
         this._virtualPosition.x = reconciledTarget.x;
         this._virtualPosition.y = reconciledTarget.y;
 
@@ -244,10 +189,6 @@ export class MovementController {
             this._virtualPosition.y = clampedPos.y;
         }
 
-        // Update screen position after reconciliation. This only moves
-        // _currentScreenPosition (not the rendered this.position directly) — any real
-        // correction is picked up and smoothed by the next render() interpolation
-        // step instead of snapping the sprite instantly.
         if (this._coordinateConverter) {
             const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
             this._currentScreenPosition.x = screenPos.x;
@@ -267,8 +208,6 @@ export class MovementController {
             this._virtualPosition.y = y;
             this._pendingInputs = [];
 
-            // A jump this large is a real desync, not normal prediction noise —
-            // snap instantly instead of letting render() interpolate into it.
             if (this._coordinateConverter) {
                 const screenPos = this._coordinateConverter.virtualToScreen(this._virtualPosition.x, this._virtualPosition.y);
                 this._currentScreenPosition.x = screenPos.x;
@@ -315,27 +254,18 @@ export class MovementController {
     update(_deltaTime: number) {
         if (this._suspended) return false;
 
-        // Snapshot the pre-tick screen position as the interpolation start point —
-        // see render().
         this._previousScreenPosition.x = this._currentScreenPosition.x;
         this._previousScreenPosition.y = this._currentScreenPosition.y;
 
         const keyboardVector = this.getDesiredMovementVector();
         const attacking = this._animationController?.playerState === PlayerState.ATTACKING;
         const blocking = this._localBlockRequested || (this._blockingProvider?.() ?? false);
-        // Block overrides movement the same way attack does (GDD §54: block is a
-        // stance, not something you hold while still moving) — see world.go
-        // TryBlockStart/updateBlockDrain for the server-authoritative side of this.
+
         const desiredVector = (attacking || blocking) ? { dx: 0, dy: 0 } : keyboardVector;
         const moving = desiredVector.dx !== 0 || desiredVector.dy !== 0;
-        // Sprint (GDD §54) only means anything while actually moving — holding
-        // Shift at a standstill requests nothing and costs nothing.
+
         const sprint = moving && this.input.isKeyDown("Shift") && this.canSprint();
 
-        // A held vector must be reaffirmed every tick (dead-man's-switch: the server
-        // keeps integrating the last known velocity, so a broken/frozen client has to
-        // stop sending to be detected). An unchanged zero vector carries nothing new —
-        // the server already holds position, so there is nothing to reaffirm.
         if (moving || this.vectorChanged(desiredVector) || sprint !== this._currentSprint) {
             this.queueInput(desiredVector, sprint);
         }
@@ -390,7 +320,7 @@ export class MovementController {
         this._suspended = true;
 
         if (this._currentMovementVector.dx !== 0 || this._currentMovementVector.dy !== 0) {
-            // Send STOP synchronously before requestAnimationFrame is throttled.
+
             this.queueInput({ dx: 0, dy: 0 }, false);
         }
         this._isMoving = false;
@@ -409,8 +339,6 @@ export class MovementController {
         let dx = 0;
         let dy = 0;
 
-        // Physical WASD position (e.code), not the character it types — see
-        // InputManager. Correct on any keyboard layout, not just QWERTY.
         if (this.input.isKeyDown("KeyW")) dy = -1;
         if (this.input.isKeyDown("KeyS")) dy = 1;
         if (this.input.isKeyDown("KeyA")) dx = -1;
@@ -443,8 +371,6 @@ export class MovementController {
         this._virtualPosition.x = Math.round(x);
         this._virtualPosition.y = Math.round(y);
 
-        // A reconnect spawns a brand-new server-side player, so inputs predicted
-        // against the previous session must not be replayed onto the new spawn.
         this._pendingInputs = [];
         this._currentMovementVector = { dx: 0, dy: 0 };
         this._currentSprint = false;
@@ -490,14 +416,14 @@ export class MovementController {
      * Установить флаг начала атаки (устаревший метод, оставлен для совместимости)
      */
     public setAttackStarted(): void {
-        // No longer needed - attack handling is done in update()
+
     }
 
     /**
      * Обработчик завершения атаки (устаревший метод, оставлен для совместимости)
      */
     public onAttackEnd(): void {
-        // No longer needed - movement resumes automatically after attack
+
     }
 
     /**
@@ -513,10 +439,6 @@ export class MovementController {
     updateFacing(mouseX: number, mouseY: number): void {
         if (this._animationController?.playerState === PlayerState.ATTACKING) return;
 
-        // Uses the authoritative (non-interpolated) screen position: this.position
-        // only catches up to _currentScreenPosition on the next render() call, so
-        // reading it here — mid fixed-tick-loop, before that render happens — would
-        // compute direction against a stale, one-render-frame-behind point.
         const direction = directionFromDelta(mouseX - this._currentScreenPosition.x, mouseY - this._currentScreenPosition.y);
         if (direction === this._direction) return;
 

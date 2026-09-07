@@ -14,21 +14,16 @@ export class InputManager {
     }
 
     private init() {
-        // Keyed by e.code (physical key position), not e.key (the character it
-        // produces) — WASD must stay in the same physical spot regardless of the
-        // user's keyboard layout (Cyrillic, AZERTY, ...). ShiftLeft/ShiftRight are
-        // additionally mirrored onto a synthetic "Shift" so callers don't need to
-        // check both.
+
         window.addEventListener("keydown", (e) => {
             this.keysPressed[e.code] = true;
             if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
                 this.keysPressed["Shift"] = true;
             }
 
-            // Handle F3 key specifically
             if (e.code === "F3" && !this.f3Pressed) {
                 this.f3Pressed = true;
-                e.preventDefault(); // Prevent browser's default F3 behavior
+                e.preventDefault();
                 if (this.onF3Callback) {
                     this.onF3Callback();
                 }
@@ -41,15 +36,11 @@ export class InputManager {
                 this.keysPressed["Shift"] = !!this.keysPressed["ShiftLeft"] || !!this.keysPressed["ShiftRight"];
             }
 
-            // Reset F3 pressed state
             if (e.code === "F3") {
                 this.f3Pressed = false;
             }
         });
 
-        // Browsers throttle requestAnimationFrame/Pixi ticker in a background tab
-        // and may never deliver the keyup that happened while focus was elsewhere.
-        // Clear the sticky key state and let movement emit STOP before throttling.
         window.addEventListener("blur", () => this.suspend());
         window.addEventListener("focus", () => {
             if (document.visibilityState === "visible") this.resume();

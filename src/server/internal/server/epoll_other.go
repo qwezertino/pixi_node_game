@@ -14,9 +14,6 @@ import (
 	"pixi_game_server/internal/metrics"
 )
 
-// goroutineReadHandler is the non-Linux readHandler fallback.
-// It spawns one goroutine per connection (identical to the original design).
-// Goroutine count: one per connected client.
 type goroutineReadHandler struct{}
 
 func newGoroutineReadHandler() *goroutineReadHandler {
@@ -82,7 +79,7 @@ func (g *goroutineReadHandler) readLoop(svr *Server, c *Connection) {
 		case ws.OpBinary:
 			metrics.BytesReceived.Add(float64(len(payload)))
 			if !c.rateLimiter.Allow() {
-				// Never continue an ordered transition stream after dropping a command.
+
 				metrics.MessagesRateLimited.Inc()
 				return
 			}

@@ -20,10 +20,7 @@ export class AnimationController {
     private currentBase: string = "idle";
     private direction: Direction = "right";
     private attackAnimationPlaying = false;
-    // Which combo step to play next (1-indexed) — set by handleAttack right
-    // before setState(ATTACKING), consumed by startAttackAnimation. Server-
-    // authoritative (see PlayerState.comboStep); the client no longer picks
-    // attack1/attack2 randomly.
+
     private attackStep = 1;
     private onAttackEndCallback: (() => void) | null = null;
     private onAttackStartCallback: (() => void) | null = null;
@@ -108,11 +105,6 @@ export class AnimationController {
         const base = this.characterVisual.directional
             ? (this.characterVisual.animations.has(this.resolveKey(variant)) ? variant : "attack1")
             : "attack";
-        // force=true: a combo continuation can arrive while attack1 is still
-        // playing (same PlayerState.ATTACKING throughout, see
-        // networkManager.ts's comboAdvanced check) — it must restart the sprite
-        // on the new step's frames rather than being swallowed by setAnimation's
-        // "already playing this key" guard.
         this.setAnimation(base, true);
 
         this.playerSprite.loop = false;
@@ -134,14 +126,9 @@ export class AnimationController {
         this.onAttackStartCallback = callback;
     }
 
-    // step: 1-indexed combo step (see PlayerState.comboStep) — the server is
-    // authoritative on this, so every call here is a genuinely new swing worth
-    // playing, even if the previous one (same PlayerState.ATTACKING throughout)
-    // hasn't finished its own animation yet (see startAttackAnimation's force).
     handleAttack(step: number) {
         this.attackStep = step;
 
-        // Вызовем callback начала атаки
         if (this.onAttackStartCallback) {
             this.onAttackStartCallback();
         }

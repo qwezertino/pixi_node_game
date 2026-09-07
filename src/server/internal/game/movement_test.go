@@ -14,9 +14,7 @@ func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
-		// — matches the flat test speed these tests were written against before
-		// movement became per-unit (GDD §60 World Coordinate Resolution).
+
 		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
@@ -36,17 +34,12 @@ func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 	}
 }
 
-// Once a sample sets a non-zero vector, the server keeps integrating it on every
-// subsequent tick without requiring a fresh sample — a client resending the same
-// vector every fixed tick is a fail-safe choice, not a correctness requirement.
 func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
-		// — matches the flat test speed these tests were written against before
-		// movement became per-unit (GDD §60 World Coordinate Resolution).
+
 		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
@@ -62,7 +55,7 @@ func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 	if player.GetX() != 112 {
 		t.Fatalf("persisted velocity did not keep integrating: x=%d", player.GetX())
 	}
-	// No new sample was consumed on ticks 2/3, so the ACK boundary stays at tick 1.
+
 	ackX, _ := player.GetMovementAckPosition()
 	if ackX != 104 || player.GetAppliedInputSequence() != 1 {
 		t.Fatalf("ACK boundary moved without a new sample: x=%d seq=%d", ackX, player.GetAppliedInputSequence())
@@ -74,9 +67,7 @@ func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
-		// — matches the flat test speed these tests were written against before
-		// movement became per-unit (GDD §60 World Coordinate Resolution).
+
 		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
@@ -107,17 +98,12 @@ func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 	}
 }
 
-// A held vector continues to integrate at a boundary; its replicated state stays
-// constant (clamped) and contributes nothing to the delta, but the ACK still tracks
-// the latest applied sequence.
 func TestUpdatePlayerPositionClampsAtWorldBoundary(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-		// Unit type 0 (types.Player's zero value) at 4 whole units/tick, no remainder
-		// — matches the flat test speed these tests were written against before
-		// movement became per-unit (GDD §60 World Coordinate Resolution).
+
 		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
@@ -175,8 +161,6 @@ func TestOfferMovementInputRejectsStaleAndGap(t *testing.T) {
 	}
 }
 
-// Attack cooldown is measured in ticks, not wall-clock time, so it dilates along
-// with movement under time dilation instead of ticking at a fixed real-world rate.
 func TestTryAttackCooldownIsTickBasedNotWallClock(t *testing.T) {
 	gw := &GameWorld{attackDurationTicks: map[uint8]uint32{0: 20}}
 	player := &types.Player{ID: 1}
@@ -190,15 +174,11 @@ func TestTryAttackCooldownIsTickBasedNotWallClock(t *testing.T) {
 		t.Fatalf("attack start tick = %d, want 100", start)
 	}
 
-	// Still inside the cooldown window in ticks, no matter how much real time an
-	// external caller might imagine has passed — this function only looks at
-	// gw.tickCount, which nothing here has advanced.
 	gw.tickCount = 119
 	if _, _, accepted := gw.TryAttack(1); accepted {
 		t.Fatal("attack inside the tick-based cooldown must be rejected")
 	}
 
-	// Exactly attackDurationTicks later, cooldown has elapsed.
 	gw.tickCount = 120
 	if _, _, accepted := gw.TryAttack(1); !accepted {
 		t.Fatal("attack should be accepted once attackDurationTicks have elapsed")
@@ -210,13 +190,13 @@ func TestTryAttackCooldownIsTickBasedNotWallClock(t *testing.T) {
 
 const (
 	testSpeed    = int32(4)
-	testElapsed  = int32(2) // two simulation ticks per broadcast at the shipped defaults
+	testElapsed  = int32(2)
 	velocityRepl = true
 	legacyRepl   = false
 )
 
 func TestClassifyDelta(t *testing.T) {
-	// Baseline: moving right at 4 px/tick. After 2 ticks a client predicts X+8.
+
 	prev := types.PlayerState{ID: 1, X: 100, Y: 100, VX: 1, VY: 0, Direction: protocol.DirectionRight}
 	moved := func(x, y uint16, mut ...func(*types.PlayerState)) types.PlayerState {
 		st := prev
@@ -259,8 +239,7 @@ func TestClassifyDelta(t *testing.T) {
 			want: deltaReason{include: true, diverged: true},
 		},
 		{
-			// The case a "did the position change at all" test misses: X is clamped
-			// while Y keeps moving, so the record looks like ordinary movement.
+
 			name:   "diagonal corner clamps one axis only",
 			st:     moved(100, 108, func(s *types.PlayerState) { s.VY = 1 }),
 			exists: true,
@@ -284,12 +263,8 @@ func TestClassifyDelta(t *testing.T) {
 	}
 }
 
-// A diagonal clamp is the regression that motivated predicting per axis instead of
-// asking whether the position changed at all.
 func TestClassifyDeltaCatchesSingleAxisClamp(t *testing.T) {
-	// Predicted X is 5996 + 8 = 6004, past the 6000 world edge, so the server clamps
-	// to 6000 while Y advances the full 8 px. Velocity is unchanged on both axes, so
-	// only a per-axis position check can catch this.
+
 	prev := types.PlayerState{ID: 1, X: 5996, Y: 100, VX: 1, VY: 1}
 	st := types.PlayerState{ID: 1, X: 6000, Y: 108, VX: 1, VY: 1}
 
@@ -302,8 +277,6 @@ func TestClassifyDeltaCatchesSingleAxisClamp(t *testing.T) {
 	}
 }
 
-// Legacy mode must keep shipping every positional change, so the flag is a true
-// kill switch rather than a partial rollback.
 func TestClassifyDeltaLegacyModeShipsPredictableMovement(t *testing.T) {
 	prev := types.PlayerState{ID: 1, X: 100, Y: 100, VX: 1}
 	st := types.PlayerState{ID: 1, X: 108, Y: 100, VX: 1}

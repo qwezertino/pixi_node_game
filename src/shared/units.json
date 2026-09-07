@@ -18,7 +18,9 @@
     "sprintSpeedMultiplier": 1.5,
     "sprintStaminaCostPerSecond": 10,
     "animationSpeed": 0.1,
-    "cost": { "wood": 0, "stone": 0, "iron": 0 }
+    "cost": { "wood": 0, "stone": 0, "iron": 0 },
+    "assetPath": "actual/citizens/Masc.%20Citizens/Artun/Artun.png",
+    "combatAssetPath": "actual/citizens/Masc.%20Citizens/Artun/Artun_Combat.png"
   },
   {
     "typeId": 1,

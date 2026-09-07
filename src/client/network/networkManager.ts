@@ -8,11 +8,8 @@ import {
 import { DEFAULT_UNIT_TYPE, isValidUnitType, type UnitType } from "../../shared/units";
 import type { Direction } from "../utils/animationLayout";
 
-// Beyond this the gap is a stall or a wrap, not a paced frame: extrapolating across it
-// would fling every remote player across the map. Hold position and wait for a record.
 const MAX_DEAD_RECKON_TICKS = 20;
 
-// Callback types
 export type OnPlayerJoinedCallback = (player: PlayerState) => void;
 export type OnPlayerLeftCallback = (playerId: string) => void;
 export type OnPlayerMovementCallback = (
@@ -28,10 +25,9 @@ export type OnGameStateCallback = (
     players: Record<string, PlayerState>,
     stateSequence: number | undefined,
     fullState: boolean,
-    // Simulation ticks elapsed since the previous frame this client received.
-    // Players missing from the frame advanced by exactly this many steps.
+
     elapsedTicks: number,
-    // Server's current time-dilation factor as a percentage (100 = nominal).
+
     dilationPct: number
 ) => void;
 export type OnCorrectionCallback = (position: PlayerPosition) => void;
@@ -43,13 +39,13 @@ export type OnPlayerAttackCallback = (
     position: PlayerPosition,
     comboStep: number
 ) => void;
-// entries maps playerId -> current unit type + HP/stamina (see PlayerAttributes).
+
 export type OnUnitRosterCallback = (entries: Record<string, PlayerAttributes>) => void;
 
 export class NetworkManager {
     private socket: WebSocket | null = null;
     private worker: Worker | null = null;
-    private useWorker: boolean = true; // Use Web Worker for WebSocket to avoid blocking main thread
+    private useWorker: boolean = true;
     private connected = false;
     private playerId: string = "";
     private initialPosition: PlayerPosition = { x: 0, y: 0 };
@@ -61,23 +57,15 @@ export class NetworkManager {
     private receivedInitialPosition = false;
     private lastWorldTick = 0;
     private hasWorldTick = false;
-    // Server's current time-dilation factor (100 = nominal tick rate). main.ts scales
-    // its fixed-timestep accumulator by this so local prediction stays in lockstep
-    // with a server that has slowed its own simulation under pressure.
+
     private dilationPct = 100;
 
-    // Unit type this client requested at connect (see shared/units.ts). The server
-    // validates it and reports the authoritative value back in WELCOME.
     private requestedUnitType: UnitType;
-    // Server-assigned unit type for the local player (units.Definition.typeId).
+
     private myUnitType = 0;
-    // playerId -> current unit type + HP/stamina, for every known player including
-    // ourselves. Populated from the UNIT_ROSTER message (sent on connect and once
-    // per full-sync cycle), never from the per-tick world state — see
-    // PlayerAttributes for why that's fine today (nothing changes these yet).
+
     private playerAttributes: Record<string, PlayerAttributes> = {};
 
-    // Reconnect state
     private wsUrl = "";
     private reconnectTimer: number | null = null;
     private reconnectAttempts = 0;
@@ -87,7 +75,6 @@ export class NetworkManager {
     private directPingNonce = 0;
     private directPendingPings = new Map<number, number>();
 
-    // Callback handlers
     private onSessionStartCallbacks: OnSessionStartCallback[] = [];
     private onPlayerJoinedCallbacks: OnPlayerJoinedCallback[] = [];
     private onPlayerLeftCallbacks: OnPlayerLeftCallback[] = [];
@@ -101,16 +88,10 @@ export class NetworkManager {
     private onUnitRosterCallbacks: OnUnitRosterCallback[] = [];
 
     constructor() {
-        // Placeholder until connect() is called with the unit chosen on the
-        // select screen (see unitSelectScreen.ts) — the socket isn't opened yet,
-        // so the server never spawns anything for this value.
+
         this.requestedUnitType = DEFAULT_UNIT_TYPE;
     }
 
-    // Opens the WebSocket connection, requesting `unitType` (embedded in the
-    // handshake URL — see resolveWsUrl). Call once, after the user has picked a
-    // unit; nothing before this point talks to the server. The server re-validates
-    // and falls back on its own, so an already-invalid unitType here is harmless.
     public connect(unitType: UnitType): void {
         this.requestedUnitType = isValidUnitType(unitType) ? unitType : DEFAULT_UNIT_TYPE;
 
@@ -150,7 +131,7 @@ export class NetworkManager {
 
             this.worker.onerror = (error) => {
                 console.error('Network Worker error:', error);
-                // Fallback to direct socket
+
                 this.worker?.terminate();
                 this.worker = null;
                 this.useWorker = false;
@@ -194,9 +175,6 @@ export class NetworkManager {
         }
         this.resyncRequested = false;
 
-        // The server hands out a fresh player ID on every accept, so a reconnect is a
-        // new session rather than a resumption. Everything keyed to the old identity
-        // must go before the next WELCOME arrives.
         this.playerId = "";
         this.players = {};
         this.lastStateSequence = 0;
@@ -213,8 +191,6 @@ export class NetworkManager {
     private scheduleReconnect() {
         if (this.closedByClient || this.reconnectTimer !== null) return;
 
-        // Exponential backoff with jitter: a server restart would otherwise bring
-        // every client back simultaneously and reproduce the connect storm.
         const base = Math.min(500 * 2 ** this.reconnectAttempts, 8000);
         const delay = base * (0.5 + Math.random() * 0.5);
         this.reconnectAttempts++;
@@ -232,7 +208,7 @@ export class NetworkManager {
     }
 
     private onSocketError() {
-        // Handle connection error
+
         console.error('WebSocket error');
     }
 
@@ -240,7 +216,6 @@ export class NetworkManager {
         if (current === 0) return true;
         if (next === current) return false;
 
-        // Unsigned wrap-aware comparison for uint32 sequence numbers.
         const delta = (next - current) >>> 0;
         return delta < 0x80000000;
     }
@@ -248,15 +223,12 @@ export class NetworkManager {
     private setupSocketEvents() {
         if (!this.socket) return;
 
-        // Connection established
         this.socket.addEventListener("open", () => this.onSocketOpen());
 
-        // Receive messages from server
         this.socket.addEventListener("message", async (event) => {
             try {
                 let processedData = event.data;
 
-                // Handle Blob data
                 if (processedData instanceof Blob) {
                     processedData = await processedData.arrayBuffer();
                 }
@@ -267,10 +239,8 @@ export class NetworkManager {
             }
         });
 
-        // Connection closed
         this.socket.addEventListener("close", () => this.onSocketClose());
 
-        // Connection error
         this.socket.addEventListener("error", () => {
             console.error('WebSocket error');
         });
@@ -278,7 +248,7 @@ export class NetworkManager {
 
     private handleServerMessage(data: string | ArrayBuffer) {
         try {
-            // Handle binary message
+
             if (data instanceof ArrayBuffer) {
                 const message = BinaryProtocol.decodeMessage(
                     new Uint8Array(data)
@@ -314,7 +284,6 @@ export class NetworkManager {
 
                     case "playerMovement":
 
-
                         if (
                             message.movementVector &&
                             message.playerId !== this.playerId
@@ -330,7 +299,7 @@ export class NetworkManager {
                         break;
 
                     case "playerDirection":
-                        // Only process direction updates for other players, not ourselves
+
                         if (message.playerId !== this.playerId) {
                             this.onPlayerDirectionCallbacks.forEach(
                                 (callback) =>
@@ -341,22 +310,6 @@ export class NetworkManager {
                             );
                         }
                         break;
-
-                    // case "initialState":
-                    //     console.log("🌍 Received initialState:", message);
-                    //     this.playerId = message.player.id;
-                    //     this.initialPosition = message.player.position;
-                    //     this.players = message.players;
-
-                    //     console.log("📋 Player ID set to:", this.playerId);
-                    //     console.log("📋 Initial position:", this.initialPosition);
-                    //     console.log("📋 All players:", this.players);
-
-                    //     // Notify about initial game state
-                    //     this.onGameStateCallbacks.forEach((callback) =>
-                    //         callback(message.players)
-                    //     );
-                    //     break;
 
                     case "playerJoined":
                         this.players[message.player.id] = message.player;
@@ -397,7 +350,6 @@ export class NetworkManager {
                             }
                         }
 
-                        // Backward-compatible fallback for servers predating WELCOME.
                         if (!this.playerId && message.players) {
                             const playerIds = Object.keys(message.players);
                             if (playerIds.length > 0) {
@@ -409,9 +361,6 @@ export class NetworkManager {
                             }
                         }
 
-                        // Ticks elapsed since the previous frame *this client saw*, not
-                        // since the previous frame the server sent: a frame the fanout
-                        // shed must still leave dead reckoning on the right step.
                         const worldTick = (message.worldTick ?? 0) >>> 0;
                         let elapsedTicks = 0;
                         if (this.hasWorldTick) {
@@ -427,30 +376,22 @@ export class NetworkManager {
                         if (!this.receivedInitialPosition && this.playerId && incomingPlayers[this.playerId]) {
                             this.initialPosition = incomingPlayers[this.playerId].position;
                             this.receivedInitialPosition = true;
-                            // Fires on the first snapshot of every session, including
-                            // those that follow a reconnect with a new player ID.
+
                             this.onSessionStartCallbacks.forEach((callback) =>
                                 callback(this.initialPosition)
                             );
                         }
 
-                        // Fire animation callbacks based on state changes
                         Object.entries(incomingPlayers).forEach(([id, player]) => {
                             const isLocalPlayer = id === this.playerId;
                             const prev = prevPlayers[id];
 
-                            // Movement: skip local player (handled by MovementController)
                             if (!isLocalPlayer && player.moving !== prev?.moving) {
                                 this.onPlayerMovementCallbacks.forEach((cb) =>
                                     cb(id, player.vx ?? 0, player.vy ?? 0)
                                 );
                             }
-                            // Attack: include local player — server is authoritative, no
-                            // prediction. Also fires on a combo step change while already
-                            // attacking: a buffered combo continuation (see world.go
-                            // executeAttack/runTickWorker) can start the next swing without
-                            // State ever visibly leaving Attacking between two snapshots, so
-                            // the rising-edge check alone would miss it.
+
                             const comboAdvanced = player.attacking && prev?.attacking &&
                                 player.comboStep !== prev?.comboStep;
                             if (player.attacking && (!prev?.attacking || comboAdvanced)) {
@@ -463,8 +404,7 @@ export class NetworkManager {
                         if (fullState) {
                             this.players = incomingPlayers;
                         } else {
-                            // Mutate only changed records. Copying the full 2000-player
-                            // object for every small delta defeats delta compression.
+
                             for (const [id, player] of Object.entries(incomingPlayers)) {
                                 this.players[id] = player;
                             }
@@ -496,18 +436,8 @@ export class NetworkManager {
                         break;
                     }
 
-                    // case "correction":
-                    //     if (message.playerId === this.playerId) {
-                    //         this.onCorrectionCallbacks.forEach((callback) =>
-                    //             callback(message.position)
-                    //         );
-                    //     }
-                    //     break;
-
                     case "playerAttack":
-                        // Dead path today — the server never broadcasts a dedicated
-                        // ATTACK message (see server.go), only the state-flag stream
-                        // above — kept decodable for protocol back-compat.
+
                         this.onPlayerAttackCallbacks.forEach((callback) =>
                             callback(message.playerId, message.position, 1)
                         );
@@ -515,11 +445,10 @@ export class NetworkManager {
                 }
             }
         } catch {
-            // Handle any errors in message processing
+
         }
     }
 
-    // Public methods to register callbacks
     public onPlayerJoined(callback: OnPlayerJoinedCallback): void {
         this.onPlayerJoinedCallbacks.push(callback);
     }
@@ -560,7 +489,6 @@ export class NetworkManager {
         this.onUnitRosterCallbacks.push(callback);
     }
 
-    // Send movement to server
     public sendMovement(dx: number, dy: number, inputSequence: number, sprint: boolean): void {
         const moveMsg = {
             type: "move" as const,
@@ -569,7 +497,6 @@ export class NetworkManager {
             sprint,
         };
 
-        // Use binary protocol for frequent updates
         const binaryData = BinaryProtocol.encodeMove(moveMsg);
 
         if (this.worker) {
@@ -579,14 +506,12 @@ export class NetworkManager {
         }
     }
 
-    // Send direction change to server
     public sendDirection(direction: Direction): void {
         const dirMsg = {
             type: "direction" as const,
             direction,
         };
 
-        // Use binary protocol for frequent updates
         const binaryData = BinaryProtocol.encodeDirection(dirMsg);
 
         if (this.worker) {
@@ -596,7 +521,6 @@ export class NetworkManager {
         }
     }
 
-    // Send attack to server
     public sendAttack(binaryData: Uint8Array): void {
         if (this.worker) {
             this.worker.postMessage({ type: 'send', data: binaryData });
@@ -605,7 +529,6 @@ export class NetworkManager {
         }
     }
 
-    // Send attack end to server
     public sendAttackEnd(): void {
         const binaryData = BinaryProtocol.encodeAttackEnd();
 
@@ -616,7 +539,6 @@ export class NetworkManager {
         }
     }
 
-    // Send block start (RMB pressed) to server
     public sendBlockStart(): void {
         const binaryData = BinaryProtocol.encodeBlockStart();
 
@@ -627,7 +549,6 @@ export class NetworkManager {
         }
     }
 
-    // Send block end (RMB released) to server
     public sendBlockEnd(): void {
         const binaryData = BinaryProtocol.encodeBlockEnd();
 
@@ -648,8 +569,6 @@ export class NetworkManager {
             this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
         }
 
-        // Retry once if no full snapshot arrives. The flag is cleared by the
-        // gameState branch, so a delivered snapshot cancels this path.
         if (this.resyncRetryTimer !== null) {
             window.clearTimeout(this.resyncRetryTimer);
         }
@@ -668,63 +587,46 @@ export class NetworkManager {
         return this.protocolMismatch;
     }
 
-    // Get player ID
     public getPlayerId(): string {
         return this.playerId;
     }
 
-    // Get initial position
     public getInitialPosition(): PlayerPosition {
         return this.initialPosition;
     }
 
-    // Get all players
     public getPlayers(): Record<string, PlayerState> {
         return this.players;
     }
 
-    // units.Definition.typeId assigned to the local player.
     public getMyUnitType(): number {
         return this.myUnitType;
     }
 
-    // Unit type this client requested at connect (see shared/units.ts). Available
-    // synchronously, before WELCOME confirms it server-side — used to pick the local
-    // player's sprite without waiting on a round trip.
     public getRequestedUnitType(): UnitType {
         return this.requestedUnitType;
     }
 
-    // units.Definition.typeId for a given player, or the local player's if omitted.
-    // Falls back to 0 (units.ts's typeId for the default unit) until the roster or
-    // WELCOME for that player has arrived.
     public getUnitType(playerId?: string): number {
         if (playerId === undefined || playerId === this.playerId) return this.myUnitType;
         return this.playerAttributes[playerId]?.unitType ?? 0;
     }
 
-    // Current HP for a given player, or the local player's if omitted. undefined
-    // until that player's UNIT_ROSTER entry has arrived (no WELCOME shortcut for
-    // this one, unlike unit type — see PlayerAttributes for the replication cadence).
     public getHp(playerId?: string): number | undefined {
         return this.playerAttributes[playerId ?? this.playerId]?.hp;
     }
 
-    // Current stamina for a given player, or the local player's if omitted —
-    // same availability caveat as getHp.
     public getStamina(playerId?: string): number | undefined {
         return this.playerAttributes[playerId ?? this.playerId]?.stamina;
     }
 
-    // Server's current time-dilation factor (100 = nominal tick rate).
     public getDilationPct(): number {
         return this.dilationPct;
     }
 
-    // Get connection status
     public getConnectionStatus(): string {
         if (this.worker) {
-            // For worker, we can't directly check socket state, assume connected if worker exists
+
             return 'Connected (Worker)';
         } else if (this.socket) {
             switch (this.socket.readyState) {
@@ -738,7 +640,6 @@ export class NetworkManager {
         return 'Disconnected';
     }
 
-    // Cleanup method
     public disconnect(): void {
         this.closedByClient = true;
         this.stopDirectPings();
