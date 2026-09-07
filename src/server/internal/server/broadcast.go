@@ -184,9 +184,10 @@ func (s *Server) sendPong(conn *Connection, nonce uint32) {
 }
 
 func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCreatedNs int64) bool {
-	if s.fanoutQueueShedDepth > 0 {
+	live := s.live.Load()
+	if live.FanoutQueueShedDepth > 0 {
 		depth := len(conn.writeCh)
-		if depth >= s.fanoutQueueShedDepth {
+		if depth >= live.FanoutQueueShedDepth {
 			metrics.WSWriteQueueDepth.Observe(float64(depth))
 
 			frame.release()
@@ -219,7 +220,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 		atomic.StoreInt32(&conn.pendingBroadcast, 0)
 		frame.release()
 		metrics.BroadcastsDropped.Inc()
-		if atomic.AddInt32(&conn.fanoutDrops, 1) == s.fanoutDropLimit {
+		if atomic.AddInt32(&conn.fanoutDrops, 1) == live.FanoutDropStreak {
 			go s.cleanupConnection(conn)
 		}
 		return false
@@ -228,7 +229,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 
 func (s *Server) startWriteLoop(c *Connection) {
 	go func() {
-		batchSize := s.writeBatchSize
+		batchSize := s.live.Load().WriteBatchSize
 		if batchSize < 1 {
 			batchSize = 1
 		} else if batchSize > maxWriteBatchSizeLimit {
@@ -360,14 +361,16 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64, hardLimit in
 		return conns[:0], 0, nil
 	}
 
+	live := s.live.Load()
+
 	limit := n
-	if s.fanoutMaxRecipients > 0 {
+	if live.FanoutMaxRecipientsPerTick > 0 {
 		curr := int(atomic.LoadInt64(&s.fanoutRecipientLimit))
-		if curr < s.fanoutMinRecipients {
-			curr = s.fanoutMinRecipients
+		if curr < live.FanoutMinRecipientsPerTick {
+			curr = live.FanoutMinRecipientsPerTick
 		}
-		if curr > s.fanoutMaxRecipients {
-			curr = s.fanoutMaxRecipients
+		if curr > live.FanoutMaxRecipientsPerTick {
+			curr = live.FanoutMaxRecipientsPerTick
 		}
 		if curr < limit {
 			limit = curr
@@ -382,9 +385,9 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64, hardLimit in
 		for _, conn := range conns {
 			stalenessNs := nowNs - atomic.LoadInt64(&conn.lastWorldStateSentNs)
 			idleForNs := nowNs - atomic.LoadInt64(&conn.lastActivity)
-			deadlineNs := s.idleStalenessNs
-			if idleForNs <= s.activeWindowNs {
-				deadlineNs = s.activeStalenessNs
+			deadlineNs := live.WorldStateIdleStalenessNs
+			if idleForNs <= live.WorldStateActiveWindowNs {
+				deadlineNs = live.WorldStateActiveStalenessNs
 			}
 			if stalenessNs >= deadlineNs {
 				overdue++
@@ -398,12 +401,12 @@ func (s *Server) selectRecipients(conns []*Connection, nowNs int64, hardLimit in
 	if cap(selected) < limit {
 		selected = make([]*Connection, 0, limit)
 	}
-	activeWindowNs := s.activeWindowNs
-	activeStalenessNs := s.activeStalenessNs
-	idleStalenessNs := s.idleStalenessNs
-	debtWeightNs := s.fanoutFairDebtWeightNs
-	roundRobinWeightNs := s.fanoutRoundRobinWeightNs
-	criticalBoostNs := s.fanoutCriticalBoostNs
+	activeWindowNs := live.WorldStateActiveWindowNs
+	activeStalenessNs := live.WorldStateActiveStalenessNs
+	idleStalenessNs := live.WorldStateIdleStalenessNs
+	debtWeightNs := live.FanoutFairDebtWeightNs
+	roundRobinWeightNs := live.FanoutRoundRobinWeightNs
+	criticalBoostNs := live.FanoutCriticalBoostNs
 	rrEpoch := atomic.AddInt64(&s.fanoutRoundRobinEpoch, 1)
 	modBase := int64(n)
 	if modBase <= 0 {
@@ -518,7 +521,8 @@ func releaseRecipientSlice(recipients []*Connection, recipientPtr *[]*Connection
 }
 
 func (s *Server) updateFairDebt(conns []*Connection, recipients []*Connection) {
-	if s.fanoutFairDebtMax <= 0 || len(conns) == 0 {
+	live := s.live.Load()
+	if live.FanoutFairDebtMax <= 0 || len(conns) == 0 {
 		return
 	}
 	epoch := atomic.AddUint32(&s.fanoutDebtEpoch, 1)
@@ -531,7 +535,7 @@ func (s *Server) updateFairDebt(conns []*Connection, recipients []*Connection) {
 
 	for _, conn := range conns {
 		if atomic.LoadUint32(&conn.fanoutDebtEpoch) == epoch {
-			if s.fanoutFairDebtDec <= 0 {
+			if live.FanoutFairDebtDec <= 0 {
 				atomic.StoreInt32(&conn.fanoutFairDebt, 0)
 				continue
 			}
@@ -540,7 +544,7 @@ func (s *Server) updateFairDebt(conns []*Connection, recipients []*Connection) {
 				if current <= 0 {
 					break
 				}
-				next := current - s.fanoutFairDebtDec
+				next := current - live.FanoutFairDebtDec
 				if next < 0 {
 					next = 0
 				}
@@ -551,17 +555,17 @@ func (s *Server) updateFairDebt(conns []*Connection, recipients []*Connection) {
 			continue
 		}
 
-		if s.fanoutFairDebtInc <= 0 {
+		if live.FanoutFairDebtInc <= 0 {
 			continue
 		}
 		for {
 			current := atomic.LoadInt32(&conn.fanoutFairDebt)
-			if current >= s.fanoutFairDebtMax {
+			if current >= live.FanoutFairDebtMax {
 				break
 			}
-			next := current + s.fanoutFairDebtInc
-			if next > s.fanoutFairDebtMax {
-				next = s.fanoutFairDebtMax
+			next := current + live.FanoutFairDebtInc
+			if next > live.FanoutFairDebtMax {
+				next = live.FanoutFairDebtMax
 			}
 			if atomic.CompareAndSwapInt32(&conn.fanoutFairDebt, current, next) {
 				break
@@ -571,13 +575,14 @@ func (s *Server) updateFairDebt(conns []*Connection, recipients []*Connection) {
 }
 
 func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanoutDur time.Duration) {
-	if s.fanoutMaxRecipients <= 0 {
+	live := s.live.Load()
+	if live.FanoutMaxRecipientsPerTick <= 0 {
 		return
 	}
 
 	rawCurr := int(atomic.LoadInt64(&s.fanoutRecipientLimit))
 	if rawCurr < 1 {
-		rawCurr = min(total, s.fanoutMinRecipients)
+		rawCurr = min(total, live.FanoutMinRecipientsPerTick)
 		if rawCurr < 1 {
 			rawCurr = 1
 		}
@@ -585,37 +590,37 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 	curr := rawCurr
 	next := curr
 
-	if total >= s.fanoutMinRecipients && curr < s.fanoutMinRecipients {
+	if total >= live.FanoutMinRecipientsPerTick && curr < live.FanoutMinRecipientsPerTick {
 
-		next = s.fanoutMinRecipients
+		next = live.FanoutMinRecipientsPerTick
 	}
 
 	if overdue > next {
 		next = overdue
 	}
 
-	if dropped > 0 || fanoutDur > s.fanoutTarget*3/2 {
+	if dropped > 0 || fanoutDur > live.FanoutTarget*3/2 {
 		next = int(float64(next) * 0.9)
-	} else if fanoutDur > s.fanoutTarget {
+	} else if fanoutDur > live.FanoutTarget {
 		next = int(float64(next) * 0.95)
-	} else if fanoutDur < s.fanoutTarget/2 && selected >= curr*9/10 {
+	} else if fanoutDur < live.FanoutTarget/2 && selected >= curr*9/10 {
 		next = int(float64(next) * 1.05)
 		if next == curr {
 			next++
 		}
 	}
 
-	if next < s.fanoutMinRecipients {
-		next = s.fanoutMinRecipients
+	if next < live.FanoutMinRecipientsPerTick {
+		next = live.FanoutMinRecipientsPerTick
 	}
-	if next > s.fanoutMaxRecipients {
-		next = s.fanoutMaxRecipients
+	if next > live.FanoutMaxRecipientsPerTick {
+		next = live.FanoutMaxRecipientsPerTick
 	}
 	if next > total {
 		next = total
 	}
-	if next < s.fanoutMinRecipients && total >= s.fanoutMinRecipients {
-		next = s.fanoutMinRecipients
+	if next < live.FanoutMinRecipientsPerTick && total >= live.FanoutMinRecipientsPerTick {
+		next = live.FanoutMinRecipientsPerTick
 	}
 
 	if next != rawCurr {
@@ -632,7 +637,7 @@ func (s *Server) tuneRecipientLimit(total, selected, overdue, dropped int, fanou
 				"selected", selected,
 				"overdue", overdue,
 				"fanout_ms", fanoutDur.Milliseconds(),
-				"target_ms", s.fanoutTarget.Milliseconds(),
+				"target_ms", live.FanoutTarget.Milliseconds(),
 				"dropped_jobs", dropped)
 		}
 	}
@@ -735,7 +740,8 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		return false
 	}
 
-	hasState := shouldEmitFrame(fullSync, len(changed), s.cfg.Net.VelocityReplication)
+	live := s.live.Load()
+	hasState := shouldEmitFrame(fullSync, len(changed), live.VelocityReplication)
 
 	t1 := time.Now()
 	sentAtNs := clock.SinceEpoch(t1)
@@ -791,13 +797,13 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.TickPhaseDuration.WithLabelValues("encode").Observe(time.Since(t0).Seconds())
 
 	selectionLimit := n
-	if s.fanoutMaxRecipients > 0 {
+	if live.FanoutMaxRecipientsPerTick > 0 {
 		selectionLimit = int(atomic.LoadInt64(&s.fanoutRecipientLimit))
-		if selectionLimit < s.fanoutMinRecipients {
-			selectionLimit = s.fanoutMinRecipients
+		if selectionLimit < live.FanoutMinRecipientsPerTick {
+			selectionLimit = live.FanoutMinRecipientsPerTick
 		}
-		if selectionLimit > s.fanoutMaxRecipients {
-			selectionLimit = s.fanoutMaxRecipients
+		if selectionLimit > live.FanoutMaxRecipientsPerTick {
+			selectionLimit = live.FanoutMaxRecipientsPerTick
 		}
 		if selectionLimit > n {
 			selectionLimit = n
@@ -805,7 +811,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	}
 
 	budgetLimit := 0
-	if budgetBytes := s.fanoutMaxBroadcastBytesPerTick; budgetBytes > 0 {
+	if budgetBytes := live.FanoutMaxBroadcastBytesPerTick; budgetBytes > 0 {
 		frameBytes := len(f.frame)
 		if frameBytes > 0 {
 			budgetRecipients := budgetBytes / frameBytes

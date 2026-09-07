@@ -15,9 +15,9 @@ func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
 
-		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
+	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
 	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
 
@@ -40,9 +40,9 @@ func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
 
-		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
+	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
 	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
 
@@ -68,9 +68,9 @@ func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
 
-		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
+	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
 	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
 
@@ -104,9 +104,9 @@ func TestUpdatePlayerPositionClampsAtWorldBoundary(t *testing.T) {
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
 
-		moveStats:         map[uint8]moveStat{0: {milliUnitsPerTick: 4000}},
 		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
+	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 1000, Y: 100}
 	gw.visibilityManager.AddPlayer(player.ID, 1000, 100)
 
@@ -162,7 +162,8 @@ func TestOfferMovementInputRejectsStaleAndGap(t *testing.T) {
 }
 
 func TestTryAttackCooldownIsTickBasedNotWallClock(t *testing.T) {
-	gw := &GameWorld{attackDurationTicks: map[uint8]uint32{0: 20}}
+	gw := &GameWorld{}
+	gw.unitTablesPtr.Store(&unitTables{attackDurationTicks: map[uint8]uint32{0: 20}})
 	player := &types.Player{ID: 1}
 	gw.playersMap = map[uint32]*types.Player{1: player}
 

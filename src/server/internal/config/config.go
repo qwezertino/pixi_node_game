@@ -1,7 +1,7 @@
 package config
 
 import (
-	"fmt"
+	"encoding/json"
 	"os"
 	"strconv"
 	"time"
@@ -68,7 +68,32 @@ type NetworkConfig struct {
 	WorldStateActiveWindow         time.Duration
 }
 
-type JSONConfig struct {
+// GameSettings mirrors the `game_settings` row in Postgres (see
+// docker/postgres/init/001_init.sql) — the single source for game/world
+// rules that used to live in gameConfig.json. No live-reload: these are
+// baked into precomputed tables and an already-bound listener at startup.
+type GameSettings struct {
+	TickRate        int
+	SyncIntervalSec int
+	UnitsPerMeter   float64
+
+	WorldWidth  int
+	WorldHeight int
+
+	SpawnMinX int
+	SpawnMaxX int
+	SpawnMinY int
+	SpawnMaxY int
+
+	PlayerBaseScale      float64
+	DebugMode            bool
+	WorldBackgroundColor string
+}
+
+// clientConfigView is the exact JSON shape the TS client expects at
+// GET /api/config (see src/shared/gameConfig.ts's GameConfig interface) —
+// what used to be the bundled gameConfig.json.
+type clientConfigView struct {
 	Network struct {
 		TickRate     int `json:"tickRate"`
 		SyncInterval int `json:"syncInterval"`
@@ -94,22 +119,35 @@ type JSONConfig struct {
 			MaxY int `json:"maxY"`
 		} `json:"boundaries"`
 	} `json:"world"`
+	Player struct {
+		BaseScale float64 `json:"baseScale"`
+	} `json:"player"`
 	Game struct {
 		DebugMode bool `json:"debugMode"`
 	} `json:"game"`
+	Colors struct {
+		WorldBackground string `json:"worldBackground"`
+	} `json:"colors"`
 }
 
-func Load() *Config {
-	jsonConfig, err := loadEmbeddedConfig()
-	if err != nil {
-		fmt.Printf("Error: Could not load embedded config: %v\n", err)
-		os.Exit(1)
-	}
+// Build applies .env overrides on top of settings loaded from Postgres and
+// returns both the internal Config the Go server runs on and the exact JSON
+// served to the client at GET /api/config — built from the same effective
+// values, so client and server can never see different tick rate, world
+// size, etc. (the whole reason those were pulled out of two separate bundled
+// files in the first place).
+func Build(gs *GameSettings) (*Config, []byte, error) {
+	tickRate := getEnvInt("TICK_RATE", gs.TickRate)
+	syncIntervalSec := getEnvInt("SYNC_INTERVAL_SEC", gs.SyncIntervalSec)
+	unitsPerMeter := getEnvFloat("UNITS_PER_METER", gs.UnitsPerMeter)
+	worldWidth := getEnvInt("WORLD_WIDTH", gs.WorldWidth)
+	worldHeight := getEnvInt("WORLD_HEIGHT", gs.WorldHeight)
+	spawnMinX := getEnvInt("SPAWN_MIN_X", gs.SpawnMinX)
+	spawnMaxX := getEnvInt("SPAWN_MAX_X", gs.SpawnMaxX)
+	spawnMinY := getEnvInt("SPAWN_MIN_Y", gs.SpawnMinY)
+	spawnMaxY := getEnvInt("SPAWN_MAX_Y", gs.SpawnMaxY)
 
-	syncIntervalSec := jsonConfig.Network.SyncInterval / 1000
-
-	return &Config{
-
+	cfg := &Config{
 		Server: ServerConfig{
 			Port:      getEnvInt("PORT", 8108),
 			Host:      getEnvString("HOST", "0.0.0.0"),
@@ -118,21 +156,21 @@ func Load() *Config {
 		},
 
 		Game: GameConfig{
-			TickRate:      getEnvInt("TICK_RATE", jsonConfig.Network.TickRate),
-			SyncInterval:  time.Duration(getEnvInt("SYNC_INTERVAL_SEC", syncIntervalSec)) * time.Second,
-			UnitsPerMeter: getEnvFloat("UNITS_PER_METER", jsonConfig.Movement.UnitsPerMeter),
+			TickRate:      tickRate,
+			SyncInterval:  time.Duration(syncIntervalSec) * time.Second,
+			UnitsPerMeter: unitsPerMeter,
 		},
 		World: WorldConfig{
-			Width:     uint16(getEnvInt("WORLD_WIDTH", jsonConfig.World.VirtualSize.Width)),
-			Height:    uint16(getEnvInt("WORLD_HEIGHT", jsonConfig.World.VirtualSize.Height)),
-			SpawnMinX: uint16(getEnvInt("SPAWN_MIN_X", jsonConfig.World.SpawnArea.MinX)),
-			SpawnMaxX: uint16(getEnvInt("SPAWN_MAX_X", jsonConfig.World.SpawnArea.MaxX)),
-			SpawnMinY: uint16(getEnvInt("SPAWN_MIN_Y", jsonConfig.World.SpawnArea.MinY)),
-			SpawnMaxY: uint16(getEnvInt("SPAWN_MAX_Y", jsonConfig.World.SpawnArea.MaxY)),
+			Width:     uint16(worldWidth),
+			Height:    uint16(worldHeight),
+			SpawnMinX: uint16(spawnMinX),
+			SpawnMaxX: uint16(spawnMaxX),
+			SpawnMinY: uint16(spawnMinY),
+			SpawnMaxY: uint16(spawnMaxY),
 			MinX:      0,
-			MaxX:      uint16(getEnvInt("WORLD_WIDTH", jsonConfig.World.VirtualSize.Width)),
+			MaxX:      uint16(worldWidth),
 			MinY:      0,
-			MaxY:      uint16(getEnvInt("WORLD_HEIGHT", jsonConfig.World.VirtualSize.Height)),
+			MaxY:      uint16(worldHeight),
 		},
 
 		Net: NetworkConfig{
@@ -162,6 +200,30 @@ func Load() *Config {
 			WorldStateActiveWindow:         time.Duration(getEnvInt("WORLD_STATE_ACTIVE_WINDOW_MS", 1000)) * time.Millisecond,
 		},
 	}
+
+	var client clientConfigView
+	client.Network.TickRate = tickRate
+	client.Network.SyncInterval = syncIntervalSec * 1000
+	client.Movement.UnitsPerMeter = unitsPerMeter
+	client.World.VirtualSize.Width = worldWidth
+	client.World.VirtualSize.Height = worldHeight
+	client.World.SpawnArea.MinX = spawnMinX
+	client.World.SpawnArea.MaxX = spawnMaxX
+	client.World.SpawnArea.MinY = spawnMinY
+	client.World.SpawnArea.MaxY = spawnMaxY
+	client.World.Boundaries.MinX = 0
+	client.World.Boundaries.MaxX = worldWidth
+	client.World.Boundaries.MinY = 0
+	client.World.Boundaries.MaxY = worldHeight
+	client.Player.BaseScale = gs.PlayerBaseScale
+	client.Game.DebugMode = gs.DebugMode
+	client.Colors.WorldBackground = gs.WorldBackgroundColor
+
+	clientJSON, err := json.Marshal(client)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cfg, clientJSON, nil
 }
 
 func getEnvString(key, defaultValue string) string {

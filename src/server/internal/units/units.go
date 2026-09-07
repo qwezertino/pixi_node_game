@@ -1,13 +1,9 @@
 package units
 
 import (
-	_ "embed"
-	"encoding/json"
 	"fmt"
+	"sync/atomic"
 )
-
-//go:embed units.json
-var embeddedUnits []byte
 
 type Cost struct {
 	Wood  int `json:"wood"`
@@ -61,6 +57,10 @@ type DashThrust struct {
 	CooldownSeconds  float64 `json:"cooldownSeconds"`
 }
 
+// Definition is a unit's full stat block. json tags are used both ways: for
+// scanning out of the `units` Postgres table (see internal/liveconfig) and
+// for serving GET /api/units to the TS client, which needs the exact same
+// shape it used to get from the bundled units.json.
 type Definition struct {
 	TypeID      uint8  `json:"typeId"`
 	ID          string `json:"id"`
@@ -110,48 +110,68 @@ type Definition struct {
 	DashAssetPath   string `json:"dashAssetPath,omitempty"`
 }
 
-var (
+const DefaultUnitType = "spearman"
+
+// state bundles the three derived lookups together so a reload can publish
+// them as one atomic pointer swap — readers never see a byID built from one
+// generation of defs paired with a byTypeID from another.
+type state struct {
 	all      []Definition
 	byID     map[string]Definition
 	byTypeID map[uint8]Definition
-)
+}
 
-const DefaultUnitType = "spearman"
+var current atomic.Pointer[state]
 
 func init() {
-	if err := json.Unmarshal(embeddedUnits, &all); err != nil {
-		panic(fmt.Errorf("units: failed to parse embedded units.json: %w", err))
+	// Empty-but-non-nil default so All/Get/GetByTypeID/IsValid are safe to
+	// call before main.go's first LoadDefinitions (e.g. in tests that build
+	// a GameWorld without ever loading real unit data).
+	current.Store(&state{byID: map[string]Definition{}, byTypeID: map[uint8]Definition{}})
+}
+
+// LoadDefinitions replaces the active unit definitions with defs — at
+// startup from main.go, and again any time the dev-only unit admin API
+// changes a row (see internal/liveconfig's unit watcher and
+// internal/server/admin.go). There is no embedded/file fallback: Postgres's
+// `units` table is authoritative. Safe to call concurrently with All/Get/
+// GetByTypeID/IsValid — it's a single atomic pointer swap, not a mutation of
+// shared maps.
+func LoadDefinitions(defs []Definition) error {
+	newByID := make(map[string]Definition, len(defs))
+	newByTypeID := make(map[uint8]Definition, len(defs))
+	for _, u := range defs {
+		newByID[u.ID] = u
+		newByTypeID[u.TypeID] = u
 	}
-	byID = make(map[string]Definition, len(all))
-	byTypeID = make(map[uint8]Definition, len(all))
-	for _, u := range all {
-		byID[u.ID] = u
-		byTypeID[u.TypeID] = u
+	if _, ok := newByID[DefaultUnitType]; !ok {
+		return fmt.Errorf("units: DefaultUnitType %q not found in loaded definitions", DefaultUnitType)
 	}
-	if _, ok := byID[DefaultUnitType]; !ok {
-		panic(fmt.Errorf("units: DefaultUnitType %q not found in units.json", DefaultUnitType))
-	}
+	current.Store(&state{all: defs, byID: newByID, byTypeID: newByTypeID})
+	return nil
 }
 
 func All() []Definition {
-	return all
+	return current.Load().all
 }
 
 func Get(id string) Definition {
-	if u, ok := byID[id]; ok {
+	s := current.Load()
+	if u, ok := s.byID[id]; ok {
 		return u
 	}
-	return byID[DefaultUnitType]
+	return s.byID[DefaultUnitType]
 }
 
 func GetByTypeID(typeID uint8) Definition {
-	if u, ok := byTypeID[typeID]; ok {
+	s := current.Load()
+	if u, ok := s.byTypeID[typeID]; ok {
 		return u
 	}
-	return byID[DefaultUnitType]
+	return s.byID[DefaultUnitType]
 }
 
 func IsValid(id string) bool {
-	_, ok := byID[id]
+	_, ok := current.Load().byID[id]
 	return ok
 }

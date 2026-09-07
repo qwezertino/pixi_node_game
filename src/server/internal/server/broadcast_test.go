@@ -41,12 +41,23 @@ func TestWriteJobFrameEncodesPong(t *testing.T) {
 	}
 }
 
+func testLiveNet(t *testing.T) *config.LiveNet {
+	t.Helper()
+	return config.NewLiveNet(&config.LiveNetConfig{
+		WorldStateActiveStalenessNs: 100,
+		WorldStateIdleStalenessNs:   100,
+		WorldStateActiveWindowNs:    100,
+		FanoutMinRecipientsPerTick:  1,
+		FanoutTarget:                12 * time.Millisecond,
+		SpawnMinX:                   0,
+		SpawnMaxX:                   1,
+		SpawnMinY:                   0,
+		SpawnMaxY:                   1,
+	})
+}
+
 func TestSelectRecipientsHonorsHardLimitWithoutMutatingInput(t *testing.T) {
-	s := &Server{
-		activeStalenessNs: 100,
-		idleStalenessNs:   100,
-		activeWindowNs:    100,
-	}
+	s := &Server{live: testLiveNet(t)}
 	conns := []*Connection{
 		{lastWorldStateSentNs: 100},
 		{lastWorldStateSentNs: 200},
@@ -75,7 +86,7 @@ func TestSelectRecipientsHonorsHardLimitWithoutMutatingInput(t *testing.T) {
 }
 
 func TestSelectRecipientsFastPathDoesNotBorrowSlice(t *testing.T) {
-	s := &Server{activeStalenessNs: 100, idleStalenessNs: 100, activeWindowNs: 100}
+	s := &Server{live: testLiveNet(t)}
 	conns := []*Connection{{}, {}}
 	selected, _, pooled := s.selectRecipients(conns, 1000, 0)
 	if pooled != nil || len(selected) != len(conns) || &selected[0] != &conns[0] {
@@ -133,11 +144,12 @@ func newDilationTestServer(t *testing.T) *Server {
 		},
 		Net: config.NetworkConfig{MaxConnections: 64},
 	}
-	gw := game.NewGameWorld(cfg)
+	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
+	gw := game.NewGameWorld(cfg, live)
 	t.Cleanup(gw.Stop)
 
 	time.Sleep(10 * time.Millisecond)
-	return &Server{cfg: cfg, gameWorld: gw, dilationBps: dilationBpsFull}
+	return &Server{cfg: cfg, live: live, gameWorld: gw, dilationBps: dilationBpsFull}
 }
 
 func TestTuneTimeDilationStepsDownUnderPressure(t *testing.T) {

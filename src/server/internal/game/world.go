@@ -29,6 +29,7 @@ type tickWorkerInput struct {
 
 type GameWorld struct {
 	cfg                   *config.Config
+	live                  *config.LiveNet
 	playersMu             sync.RWMutex
 	playersMap            map[uint32]*types.Player
 	broadcastFn           atomic.Value
@@ -70,8 +71,7 @@ type GameWorld struct {
 	deltaWindowBroadcasts    int64
 	lastSlowTickLog          int64
 	lastDeltaCompositeLog    int64
-	staminaStats             map[uint8]staminaStat
-	moveStats                map[uint8]moveStat
+	unitTablesPtr            atomic.Pointer[unitTables]
 }
 
 type moveStat struct {
@@ -94,7 +94,93 @@ type staminaStat struct {
 	sprintDrainPerTickCenti uint16
 }
 
-func NewGameWorld(cfg *config.Config) *GameWorld {
+// unitTables holds every per-unit-type value derived from units.All() plus
+// the (fixed) tick rate. Read on the hot path from many tick-worker
+// goroutines, so it's swapped as one atomic pointer rather than mutated —
+// see RecomputeUnitTables, called once at startup and again whenever the
+// dev-only unit admin API changes a row (internal/server/admin.go).
+type unitTables struct {
+	staminaStats        map[uint8]staminaStat
+	moveStats           map[uint8]moveStat
+	attackDurationTicks map[uint8]uint32
+	comboSteps          map[uint8]uint8
+	comboWindowTicks    map[uint8]uint32
+}
+
+func buildUnitTables(tickRate int, unitsPerMeter float64) *unitTables {
+	defs := units.All()
+
+	staminaStats := make(map[uint8]staminaStat, len(defs))
+	for _, def := range defs {
+		stat := staminaStat{
+			maxCenti:          uint16(math.Round(def.Stamina * 100)),
+			regenPerTickCenti: uint16(math.Round(def.StaminaRegenPerSecond * 100 / float64(tickRate))),
+		}
+		if def.Block != nil {
+			stat.canBlock = true
+			stat.blockDrainPerTickCenti = uint16(math.Round(def.Block.DrainPerSecond * 100 / float64(tickRate)))
+		}
+		if def.AttackStaminaCost != nil {
+			stat.attackStaminaCostCenti = uint16(math.Round(*def.AttackStaminaCost * 100))
+		}
+		stat.sprintSpeedMultiplier = def.SprintSpeedMultiplier
+		stat.sprintDrainPerTickCenti = uint16(math.Round(def.SprintStaminaCostPerSecond * 100 / float64(tickRate)))
+		staminaStats[def.TypeID] = stat
+	}
+
+	moveStats := make(map[uint8]moveStat, len(defs))
+	for _, def := range defs {
+		milli := def.MoveSpeed * unitsPerMeter * 1000 / float64(tickRate)
+		moveStats[def.TypeID] = moveStat{
+			milliUnitsPerTick: uint32(math.Round(milli)),
+			avgUnitsPerTick:   int32(math.Round(milli / 1000)),
+		}
+	}
+
+	attackDurationTicks := make(map[uint8]uint32, len(defs))
+	for _, def := range defs {
+		seconds := def.WindupSeconds + def.ActiveSeconds + def.RecoverySeconds
+		ticks := uint32(math.Round(seconds * float64(tickRate)))
+		if ticks < 1 {
+			ticks = 1
+		}
+		attackDurationTicks[def.TypeID] = ticks
+	}
+
+	comboSteps := make(map[uint8]uint8, len(defs))
+	comboWindowTicks := make(map[uint8]uint32, len(defs))
+	for _, def := range defs {
+		steps := def.ComboSteps
+		if steps < 1 {
+			steps = 1
+		}
+		comboSteps[def.TypeID] = uint8(steps)
+		comboWindowTicks[def.TypeID] = uint32(math.Round(def.ComboWindowSeconds * float64(tickRate)))
+	}
+
+	return &unitTables{
+		staminaStats:        staminaStats,
+		moveStats:           moveStats,
+		attackDurationTicks: attackDurationTicks,
+		comboSteps:          comboSteps,
+		comboWindowTicks:    comboWindowTicks,
+	}
+}
+
+func (gw *GameWorld) unitTables() *unitTables {
+	return gw.unitTablesPtr.Load()
+}
+
+// RecomputeUnitTables rebuilds every per-unit-type table from the current
+// units.All() and swaps it in atomically. Call after units.LoadDefinitions
+// picks up a change (see internal/liveconfig's unit watcher) — safe to call
+// from any goroutine, including while the game loop and tick workers are
+// running.
+func (gw *GameWorld) RecomputeUnitTables() {
+	gw.unitTablesPtr.Store(buildUnitTables(gw.cfg.Game.TickRate, gw.cfg.Game.UnitsPerMeter))
+}
+
+func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 	initialCap := cfg.Net.MaxConnections
 	if initialCap < 256 {
 		initialCap = 256
@@ -106,56 +192,9 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 		changedCap = 64
 	}
 
-	staminaStats := make(map[uint8]staminaStat, len(units.All()))
-	for _, def := range units.All() {
-		stat := staminaStat{
-			maxCenti:          uint16(math.Round(def.Stamina * 100)),
-			regenPerTickCenti: uint16(math.Round(def.StaminaRegenPerSecond * 100 / float64(cfg.Game.TickRate))),
-		}
-		if def.Block != nil {
-			stat.canBlock = true
-			stat.blockDrainPerTickCenti = uint16(math.Round(def.Block.DrainPerSecond * 100 / float64(cfg.Game.TickRate)))
-		}
-		if def.AttackStaminaCost != nil {
-			stat.attackStaminaCostCenti = uint16(math.Round(*def.AttackStaminaCost * 100))
-		}
-		stat.sprintSpeedMultiplier = def.SprintSpeedMultiplier
-		stat.sprintDrainPerTickCenti = uint16(math.Round(def.SprintStaminaCostPerSecond * 100 / float64(cfg.Game.TickRate)))
-		staminaStats[def.TypeID] = stat
-	}
-
-	moveStats := make(map[uint8]moveStat, len(units.All()))
-	for _, def := range units.All() {
-		milli := def.MoveSpeed * cfg.Game.UnitsPerMeter * 1000 / float64(cfg.Game.TickRate)
-		moveStats[def.TypeID] = moveStat{
-			milliUnitsPerTick: uint32(math.Round(milli)),
-			avgUnitsPerTick:   int32(math.Round(milli / 1000)),
-		}
-	}
-
-	attackDurationTicks := make(map[uint8]uint32, len(units.All()))
-	for _, def := range units.All() {
-		seconds := def.WindupSeconds + def.ActiveSeconds + def.RecoverySeconds
-		ticks := uint32(math.Round(seconds * float64(cfg.Game.TickRate)))
-		if ticks < 1 {
-			ticks = 1
-		}
-		attackDurationTicks[def.TypeID] = ticks
-	}
-
-	comboSteps := make(map[uint8]uint8, len(units.All()))
-	comboWindowTicks := make(map[uint8]uint32, len(units.All()))
-	for _, def := range units.All() {
-		steps := def.ComboSteps
-		if steps < 1 {
-			steps = 1
-		}
-		comboSteps[def.TypeID] = uint8(steps)
-		comboWindowTicks[def.TypeID] = uint32(math.Round(def.ComboWindowSeconds * float64(cfg.Game.TickRate)))
-	}
-
 	gw := &GameWorld{
 		cfg:          cfg,
+		live:         live,
 		playersMap:   make(map[uint32]*types.Player, 256),
 		stopChan:     make(chan struct{}),
 		nextPlayerID: 1000,
@@ -167,12 +206,8 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 		scratchChanged:        make([]types.PlayerState, 0, changedCap),
 		scratchSeenIDs:        make(map[uint32]struct{}, initialCap),
 		scratchPtrs:           make([]*types.Player, 0, initialCap),
-		staminaStats:          staminaStats,
-		moveStats:             moveStats,
-		attackDurationTicks:   attackDurationTicks,
-		comboSteps:            comboSteps,
-		comboWindowTicks:      comboWindowTicks,
 	}
+	gw.RecomputeUnitTables()
 
 	n := runtime.GOMAXPROCS(0)
 	gw.nTickWorkers = n
@@ -202,11 +237,12 @@ func NewGameWorld(cfg *config.Config) *GameWorld {
 func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
 	playerID := atomic.AddUint32(&gw.nextPlayerID, 1)
 
-	spawnRangeX := gw.cfg.World.SpawnMaxX - gw.cfg.World.SpawnMinX
-	spawnRangeY := gw.cfg.World.SpawnMaxY - gw.cfg.World.SpawnMinY
+	live := gw.live.Load()
+	spawnRangeX := live.SpawnMaxX - live.SpawnMinX
+	spawnRangeY := live.SpawnMaxY - live.SpawnMinY
 
-	spawnX := gw.cfg.World.SpawnMinX + uint16(rand.Intn(int(spawnRangeX)))
-	spawnY := gw.cfg.World.SpawnMinY + uint16(rand.Intn(int(spawnRangeY)))
+	spawnX := live.SpawnMinX + uint16(rand.Intn(int(spawnRangeX)))
+	spawnY := live.SpawnMinY + uint16(rand.Intn(int(spawnRangeY)))
 
 	player := &types.Player{
 		ID:       playerID,
@@ -387,7 +423,7 @@ func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
 	currentTick := gw.GetTickCount()
 	start := player.GetAttackStartTick()
 
-	if start > 0 && currentTick-start < gw.attackDurationTicks[player.GetUnitType()] {
+	if start > 0 && currentTick-start < gw.unitTables().attackDurationTicks[player.GetUnitType()] {
 		player.SetPendingComboInput(true)
 		return 0, 0, false
 	}
@@ -396,16 +432,17 @@ func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
 }
 
 func (gw *GameWorld) executeAttack(player *types.Player, currentTick uint32) (x, y uint16, accepted bool) {
+	tables := gw.unitTables()
 
 	step := uint8(1)
 	if currentTick <= player.GetComboExpireTick() {
 		step = player.GetComboStep() + 1
-		if step > gw.comboSteps[player.GetUnitType()] {
+		if step > tables.comboSteps[player.GetUnitType()] {
 			step = 1
 		}
 	}
 
-	if stat, ok := gw.staminaStats[player.GetUnitType()]; ok && stat.attackStaminaCostCenti > 0 {
+	if stat, ok := tables.staminaStats[player.GetUnitType()]; ok && stat.attackStaminaCostCenti > 0 {
 		if !player.TrySpendStaminaCenti(stat.attackStaminaCostCenti) {
 			player.SetPendingComboInput(false)
 			return 0, 0, false
@@ -413,7 +450,7 @@ func (gw *GameWorld) executeAttack(player *types.Player, currentTick uint32) (x,
 	}
 
 	player.SetComboStep(step)
-	player.SetComboExpireTick(currentTick + gw.attackDurationTicks[player.GetUnitType()] + gw.comboWindowTicks[player.GetUnitType()])
+	player.SetComboExpireTick(currentTick + tables.attackDurationTicks[player.GetUnitType()] + tables.comboWindowTicks[player.GetUnitType()])
 	player.SetState(types.StateAttacking)
 	player.SetAttackStartTick(currentTick)
 	player.SetPendingComboInput(false)
@@ -430,7 +467,7 @@ func (gw *GameWorld) TryBlockStart(playerID uint32) bool {
 		return false
 	}
 
-	stat, ok := gw.staminaStats[player.GetUnitType()]
+	stat, ok := gw.unitTables().staminaStats[player.GetUnitType()]
 	if !ok || !stat.canBlock {
 		return false
 	}
@@ -472,7 +509,7 @@ func (gw *GameWorld) updateBlockDrain(player *types.Player) (drained bool) {
 		return false
 	}
 
-	stat, ok := gw.staminaStats[player.GetUnitType()]
+	stat, ok := gw.unitTables().staminaStats[player.GetUnitType()]
 	if !ok {
 		return false
 	}
@@ -544,11 +581,13 @@ func (gw *GameWorld) tick() {
 	if elapsedTicks < 0 {
 		elapsedTicks = 0
 	}
-	velocityReplication := gw.cfg.Net.VelocityReplication
+	tickLive := gw.live.Load()
+	velocityReplication := tickLive.VelocityReplication
 	keyframeMod := uint32(0)
-	if gw.cfg.Net.KeyframeDivisor > 0 {
-		keyframeMod = uint32(gw.cfg.Net.KeyframeDivisor)
+	if tickLive.KeyframeDivisor > 0 {
+		keyframeMod = uint32(tickLive.KeyframeDivisor)
 	}
+	tables := gw.unitTables()
 
 	for _, player := range gw.scratchPtrs {
 		st := player.ToState()
@@ -557,7 +596,7 @@ func (gw *GameWorld) tick() {
 
 		if !fullSync {
 			prev, exists := gw.prevStates[st.ID]
-			speed := gw.moveStats[player.GetUnitType()].avgUnitsPerTick
+			speed := tables.moveStats[player.GetUnitType()].avgUnitsPerTick
 			reason := classifyDelta(st, prev, exists, elapsedTicks, speed, velocityReplication)
 
 			keyframe := keyframeMod > 0 && !reason.include && st.ID%keyframeMod == gw.keyframeCursor
@@ -607,7 +646,7 @@ func (gw *GameWorld) tick() {
 		if broadcasted {
 			gw.reportDeltaComposition()
 			gw.prevBaselineTick = worldTick
-			if mod := gw.cfg.Net.KeyframeDivisor; mod > 0 {
+			if mod := tickLive.KeyframeDivisor; mod > 0 {
 				gw.keyframeCursor = (gw.keyframeCursor + 1) % uint32(mod)
 			}
 
@@ -725,7 +764,8 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) (
 	vx, vy := player.GetVX(), player.GetVY()
 	sprinting := false
 	if vx != 0 || vy != 0 {
-		stat := gw.staminaStats[player.GetUnitType()]
+		tables := gw.unitTables()
+		stat := tables.staminaStats[player.GetUnitType()]
 
 		sprinting = player.GetSprint() && player.GetStaminaCenti() > 0
 		if sprinting {
@@ -733,7 +773,7 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) (
 			sprintDrained = true
 		}
 
-		milliRate := gw.moveStats[player.GetUnitType()].milliUnitsPerTick
+		milliRate := tables.moveStats[player.GetUnitType()].milliUnitsPerTick
 		rateMultiplier := 1.0
 		if sprinting {
 			rateMultiplier *= stat.sprintSpeedMultiplier
@@ -824,11 +864,12 @@ func (gw *GameWorld) Stop() {
 
 func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
 	for input := range ch {
+		tables := gw.unitTables()
 		for _, player := range input.ptrs {
 
 			if player.GetState() == types.StateAttacking {
 				start := player.GetAttackStartTick()
-				if start > 0 && input.worldTick-start >= gw.attackDurationTicks[player.GetUnitType()] {
+				if start > 0 && input.worldTick-start >= tables.attackDurationTicks[player.GetUnitType()] {
 					player.SetState(types.StateIdle)
 					player.SetAttackStartTick(0)
 
@@ -850,7 +891,7 @@ func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
 }
 
 func (gw *GameWorld) regenStamina(player *types.Player) {
-	stat, ok := gw.staminaStats[player.GetUnitType()]
+	stat, ok := gw.unitTables().staminaStats[player.GetUnitType()]
 	if !ok {
 		return
 	}

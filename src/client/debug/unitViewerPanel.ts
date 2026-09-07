@@ -55,7 +55,163 @@ const HTML = `
         <canvas id="uv-previewCanvas" width="256" height="256" style="background:#333;"></canvas>
     </div>
 </div>
+<div id="uv-stats" style="width:300px;flex:none;padding:16px;box-sizing:border-box;background:#222;overflow-y:auto;border-left:1px solid #333;">
+    <h1 style="font-size:15px;margin:0 0 4px;">Balance stats</h1>
+    <p style="font-size:11px;color:#999;margin:0 0 12px;line-height:1.5;">
+        Writes to Postgres and applies live within moments — new spawns and
+        per-tick stats pick it up immediately. Already-spawned players keep
+        their current HP/stamina until they reconnect.
+    </p>
+    <label style="display:block;font-size:11px;color:#aaa;margin:0 0 2px;">Range type</label>
+    <select id="uv-rangeType" style="width:100%;padding:5px;margin:0 0 10px;background:#333;color:#eee;border:1px solid #444;box-sizing:border-box;">
+        <option value="melee">melee</option>
+        <option value="ranged">ranged</option>
+    </select>
+    <div id="uv-stat-fields"></div>
+    <div id="uv-bool-fields" style="margin:4px 0 8px;"></div>
+    <h2 style="font-size:12px;color:#aaa;margin:14px 0 6px;border-top:1px solid #333;padding-top:10px;">Optional scalars</h2>
+    <div id="uv-optional-fields"></div>
+    <h2 style="font-size:12px;color:#aaa;margin:14px 0 6px;border-top:1px solid #333;padding-top:10px;">Combat profiles</h2>
+    <div id="uv-groups"></div>
+    <button id="uv-save" style="width:100%;margin-top:12px;padding:8px;background:#3a6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">Save to database</button>
+    <div id="uv-save-status" style="margin-top:8px;font-size:11px;line-height:1.5;white-space:pre-wrap;"></div>
+</div>
 `;
+
+// Always-present, non-nullable columns — required on every unit.
+const CORE_FIELDS: Array<{ key: keyof CoreStatsForm; label: string; step?: string }> = [
+    { key: "hp", label: "HP" },
+    { key: "passiveDR", label: "Passive DR (0-1)", step: "0.01" },
+    { key: "moveSpeed", label: "Move speed (m/s)", step: "0.1" },
+    { key: "range", label: "Range (m)", step: "0.1" },
+    { key: "damage", label: "Damage" },
+    { key: "windupSeconds", label: "Windup (s)", step: "0.01" },
+    { key: "activeSeconds", label: "Active (s)", step: "0.01" },
+    { key: "recoverySeconds", label: "Recovery (s)", step: "0.01" },
+    { key: "stamina", label: "Stamina" },
+    { key: "staminaRegenPerSecond", label: "Stamina regen/s", step: "0.1" },
+    { key: "sprintSpeedMultiplier", label: "Sprint speed x", step: "0.05" },
+    { key: "sprintStaminaCostPerSecond", label: "Sprint cost/s", step: "0.1" },
+    { key: "animationSpeed", label: "Animation speed", step: "0.01" },
+    { key: "costWood", label: "Cost: wood" },
+    { key: "costStone", label: "Cost: stone" },
+    { key: "costIron", label: "Cost: iron" },
+];
+
+interface CoreStatsForm {
+    hp: number;
+    passiveDR: number;
+    moveSpeed: number;
+    range: number;
+    damage: number;
+    windupSeconds: number;
+    activeSeconds: number;
+    recoverySeconds: number;
+    stamina: number;
+    staminaRegenPerSecond: number;
+    sprintSpeedMultiplier: number;
+    sprintStaminaCostPerSecond: number;
+    animationSpeed: number;
+    costWood: number;
+    costStone: number;
+    costIron: number;
+}
+
+const BOOL_FIELDS: Array<{ key: "requiresRoyalGuard" | "cleave" | "hasBraceStance"; label: string }> = [
+    { key: "requiresRoyalGuard", label: "Requires royal guard" },
+    { key: "cleave", label: "Cleave" },
+    { key: "hasBraceStance", label: "Has brace stance" },
+];
+
+// Nullable top-level scalars — empty input means "not set" (NULL in Postgres).
+const OPTIONAL_FIELDS: Array<{ key: string; label: string; step?: string; integer?: boolean }> = [
+    { key: "comboSteps", label: "Combo steps", integer: true },
+    { key: "comboWindowSeconds", label: "Combo window (s)", step: "0.01" },
+    { key: "attackStaminaCost", label: "Attack stamina cost", step: "0.1" },
+    { key: "drawHoldThresholdSeconds", label: "Draw-hold threshold (s)", step: "0.01" },
+    { key: "dodgeCostMultiplier", label: "Dodge cost x", step: "0.01" },
+    { key: "antiShieldMultiplier", label: "Anti-shield x", step: "0.01" },
+    { key: "antiWoodStructureMultiplier", label: "Anti-wood-structure x", step: "0.01" },
+];
+
+// Nested optional combat profiles — toggled on/off with a checkbox; unchecked
+// means "this unit doesn't have this mechanic" (every column in the group
+// gets written as NULL). See units.Definition / liveconfig.UnitStatsPatch.
+interface GroupFieldSpec {
+    key: string;
+    label: string;
+    step?: string;
+    integer?: boolean;
+    optional?: boolean; // nullable even while the group is enabled
+}
+interface GroupSpec {
+    key: "block" | "positionalBonus" | "opportunistBow" | "rogueQuiver" | "recon" | "fireArrow" | "dashThrust";
+    label: string;
+    fields: GroupFieldSpec[];
+}
+
+const GROUPS: GroupSpec[] = [
+    {
+        key: "block", label: "Block",
+        fields: [
+            { key: "meleeDR", label: "Melee DR", step: "0.01" },
+            { key: "rangedDR", label: "Ranged DR", step: "0.01" },
+            { key: "drainPerSecond", label: "Drain/s", step: "0.1" },
+            { key: "recoverySeconds", label: "Recovery (s)", step: "0.01", optional: true },
+        ],
+    },
+    {
+        key: "positionalBonus", label: "Positional bonus",
+        fields: [
+            { key: "staminaCostReductionPct", label: "Stamina cost reduction %", step: "0.01" },
+            { key: "minNearbyAllies", label: "Min nearby allies", integer: true },
+        ],
+    },
+    {
+        key: "opportunistBow", label: "Opportunist bow",
+        fields: [
+            { key: "damage", label: "Damage" },
+            { key: "range", label: "Range (m)", step: "0.1" },
+            { key: "cooldownSeconds", label: "Cooldown (s)", step: "0.01" },
+        ],
+    },
+    {
+        key: "rogueQuiver", label: "Rogue quiver",
+        fields: [
+            { key: "damage", label: "Damage" },
+            { key: "range", label: "Range (m)", step: "0.1" },
+            { key: "charges", label: "Charges", integer: true },
+            { key: "rechargeSeconds", label: "Recharge (s)", step: "0.01" },
+            { key: "executeMultiplier", label: "Execute x", step: "0.01" },
+            { key: "executeHpThresholdPct", label: "Execute HP threshold %", step: "0.01" },
+        ],
+    },
+    {
+        key: "recon", label: "Recon",
+        fields: [
+            { key: "viewRadiusBonusPct", label: "View radius bonus %", step: "0.01" },
+            { key: "detectionRadiusMeters", label: "Detection radius (m)", step: "0.1" },
+        ],
+    },
+    {
+        key: "fireArrow", label: "Fire arrow",
+        fields: [
+            { key: "damage", label: "Damage" },
+            { key: "structureDamageMultiplier", label: "Structure dmg x", step: "0.01" },
+            { key: "woodCostPerShot", label: "Wood cost/shot", integer: true },
+        ],
+    },
+    {
+        key: "dashThrust", label: "Dash thrust",
+        fields: [
+            { key: "distanceMeters", label: "Distance (m)", step: "0.1" },
+            { key: "windupSeconds", label: "Windup (s)", step: "0.01" },
+            { key: "recoverySeconds", label: "Recovery (s)", step: "0.01" },
+            { key: "damageMultiplier", label: "Damage x", step: "0.01" },
+            { key: "cooldownSeconds", label: "Cooldown (s)", step: "0.01" },
+        ],
+    },
+];
 
 const DISPLAY_TARGET_WIDTH = 260;
 const PREVIEW_TARGET_SIZE = 200;
@@ -99,6 +255,215 @@ export function createUnitViewerPanel(container: HTMLElement): void {
         opt.textContent = `${u.displayName} (${u.id})`;
         unitSelect.appendChild(opt);
     }
+
+    const statFieldsContainer = q<HTMLDivElement>("uv-stat-fields");
+    const boolFieldsContainer = q<HTMLDivElement>("uv-bool-fields");
+    const optionalFieldsContainer = q<HTMLDivElement>("uv-optional-fields");
+    const groupsContainer = q<HTMLDivElement>("uv-groups");
+    const rangeTypeSelect = q<HTMLSelectElement>("uv-rangeType");
+    const saveButton = q<HTMLButtonElement>("uv-save");
+    const saveStatus = q<HTMLDivElement>("uv-save-status");
+    const statInputs = new Map<keyof CoreStatsForm, HTMLInputElement>();
+    const boolInputs = new Map<string, HTMLInputElement>();
+    const optionalInputs = new Map<string, HTMLInputElement>();
+    const groupEnabled = new Map<GroupSpec["key"], HTMLInputElement>();
+    const groupInputs = new Map<GroupSpec["key"], Map<string, HTMLInputElement>>();
+
+    function numberInput(step?: string): HTMLInputElement {
+        const input = document.createElement("input");
+        input.type = "number";
+        if (step) input.step = step;
+        input.style.cssText = "width:100%;padding:5px;background:#333;color:#eee;border:1px solid #444;box-sizing:border-box;";
+        return input;
+    }
+
+    function fieldRow(label: string, input: HTMLElement): HTMLDivElement {
+        const row = document.createElement("div");
+        row.style.cssText = "margin:0 0 8px;";
+        const labelEl = document.createElement("label");
+        labelEl.textContent = label;
+        labelEl.style.cssText = "display:block;font-size:11px;color:#aaa;margin:0 0 2px;";
+        row.appendChild(labelEl);
+        row.appendChild(input);
+        return row;
+    }
+
+    for (const field of CORE_FIELDS) {
+        const input = numberInput(field.step);
+        statFieldsContainer.appendChild(fieldRow(field.label, input));
+        statInputs.set(field.key, input);
+    }
+
+    for (const field of BOOL_FIELDS) {
+        const row = document.createElement("label");
+        row.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;color:#ccc;margin:0 0 6px;cursor:pointer;";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        row.appendChild(input);
+        row.appendChild(document.createTextNode(field.label));
+        boolFieldsContainer.appendChild(row);
+        boolInputs.set(field.key, input);
+    }
+
+    for (const field of OPTIONAL_FIELDS) {
+        const input = numberInput(field.step);
+        if (field.integer) input.step = "1";
+        optionalFieldsContainer.appendChild(fieldRow(field.label, input));
+        optionalInputs.set(field.key, input);
+    }
+
+    for (const group of GROUPS) {
+        const section = document.createElement("div");
+        section.style.cssText = "margin:0 0 12px;padding:8px;background:#262626;border:1px solid #333;border-radius:4px;";
+
+        const header = document.createElement("label");
+        header.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;color:#ddd;font-weight:600;margin:0 0 8px;cursor:pointer;";
+        const enableInput = document.createElement("input");
+        enableInput.type = "checkbox";
+        header.appendChild(enableInput);
+        header.appendChild(document.createTextNode(group.label));
+        section.appendChild(header);
+        groupEnabled.set(group.key, enableInput);
+
+        const fieldsWrap = document.createElement("div");
+        const inputs = new Map<string, HTMLInputElement>();
+        for (const field of group.fields) {
+            const input = numberInput(field.step);
+            if (field.integer) input.step = "1";
+            fieldsWrap.appendChild(fieldRow(field.label + (field.optional ? " (optional)" : ""), input));
+            inputs.set(field.key, input);
+        }
+        section.appendChild(fieldsWrap);
+        groupInputs.set(group.key, inputs);
+
+        const syncDisabled = () => {
+            fieldsWrap.style.opacity = enableInput.checked ? "1" : "0.4";
+            for (const input of inputs.values()) input.disabled = !enableInput.checked;
+        };
+        enableInput.addEventListener("change", syncDisabled);
+        syncDisabled();
+
+        groupsContainer.appendChild(section);
+    }
+
+    function populateStatsForm(unit: (typeof units)[number]) {
+        statInputs.get("hp")!.value = String(unit.hp);
+        statInputs.get("passiveDR")!.value = String(unit.passiveDR);
+        statInputs.get("moveSpeed")!.value = String(unit.moveSpeed);
+        statInputs.get("range")!.value = String(unit.range);
+        statInputs.get("damage")!.value = String(unit.damage);
+        statInputs.get("windupSeconds")!.value = String(unit.windupSeconds);
+        statInputs.get("activeSeconds")!.value = String(unit.activeSeconds);
+        statInputs.get("recoverySeconds")!.value = String(unit.recoverySeconds);
+        statInputs.get("stamina")!.value = String(unit.stamina);
+        statInputs.get("staminaRegenPerSecond")!.value = String(unit.staminaRegenPerSecond);
+        statInputs.get("sprintSpeedMultiplier")!.value = String(unit.sprintSpeedMultiplier);
+        statInputs.get("sprintStaminaCostPerSecond")!.value = String(unit.sprintStaminaCostPerSecond);
+        statInputs.get("animationSpeed")!.value = String(unit.animationSpeed);
+        statInputs.get("costWood")!.value = String(unit.cost.wood);
+        statInputs.get("costStone")!.value = String(unit.cost.stone);
+        statInputs.get("costIron")!.value = String(unit.cost.iron);
+
+        rangeTypeSelect.value = unit.rangeType;
+
+        boolInputs.get("requiresRoyalGuard")!.checked = unit.requiresRoyalGuard ?? false;
+        boolInputs.get("cleave")!.checked = unit.cleave ?? false;
+        boolInputs.get("hasBraceStance")!.checked = unit.hasBraceStance ?? false;
+
+        const unitRecord = unit as unknown as Record<string, unknown>;
+        for (const field of OPTIONAL_FIELDS) {
+            const value = unitRecord[field.key];
+            optionalInputs.get(field.key)!.value = value === undefined || value === null ? "" : String(value);
+        }
+
+        for (const group of GROUPS) {
+            const groupValue = unitRecord[group.key] as Record<string, unknown> | undefined;
+            const enableInput = groupEnabled.get(group.key)!;
+            enableInput.checked = groupValue !== undefined && groupValue !== null;
+            const inputs = groupInputs.get(group.key)!;
+            for (const field of group.fields) {
+                const value = groupValue?.[field.key];
+                inputs.get(field.key)!.value = value === undefined || value === null ? "" : String(value);
+            }
+            enableInput.dispatchEvent(new Event("change"));
+        }
+
+        saveStatus.textContent = "";
+        saveStatus.style.color = "#9c9";
+    }
+
+    saveButton.addEventListener("click", () => {
+        void (async () => {
+            const unit = units.find((u) => u.id === unitSelect.value);
+            if (!unit) return;
+
+            const body: Record<string, unknown> = {
+                hp: Number(statInputs.get("hp")!.value),
+                passiveDR: Number(statInputs.get("passiveDR")!.value),
+                moveSpeed: Number(statInputs.get("moveSpeed")!.value),
+                rangeType: rangeTypeSelect.value,
+                range: Number(statInputs.get("range")!.value),
+                damage: Number(statInputs.get("damage")!.value),
+                windupSeconds: Number(statInputs.get("windupSeconds")!.value),
+                activeSeconds: Number(statInputs.get("activeSeconds")!.value),
+                recoverySeconds: Number(statInputs.get("recoverySeconds")!.value),
+                stamina: Number(statInputs.get("stamina")!.value),
+                staminaRegenPerSecond: Number(statInputs.get("staminaRegenPerSecond")!.value),
+                sprintSpeedMultiplier: Number(statInputs.get("sprintSpeedMultiplier")!.value),
+                sprintStaminaCostPerSecond: Number(statInputs.get("sprintStaminaCostPerSecond")!.value),
+                animationSpeed: Number(statInputs.get("animationSpeed")!.value),
+                cost: {
+                    wood: Number(statInputs.get("costWood")!.value),
+                    stone: Number(statInputs.get("costStone")!.value),
+                    iron: Number(statInputs.get("costIron")!.value),
+                },
+                requiresRoyalGuard: boolInputs.get("requiresRoyalGuard")!.checked,
+                cleave: boolInputs.get("cleave")!.checked,
+                hasBraceStance: boolInputs.get("hasBraceStance")!.checked,
+            };
+
+            for (const field of OPTIONAL_FIELDS) {
+                const raw = optionalInputs.get(field.key)!.value;
+                body[field.key] = raw === "" ? null : Number(raw);
+            }
+
+            for (const group of GROUPS) {
+                const enabled = groupEnabled.get(group.key)!.checked;
+                if (!enabled) {
+                    body[group.key] = null;
+                    continue;
+                }
+                const inputs = groupInputs.get(group.key)!;
+                const groupBody: Record<string, unknown> = {};
+                for (const field of group.fields) {
+                    const raw = inputs.get(field.key)!.value;
+                    groupBody[field.key] = raw === "" ? (field.optional ? null : 0) : Number(raw);
+                }
+                body[group.key] = groupBody;
+            }
+
+            saveButton.disabled = true;
+            saveStatus.style.color = "#9c9";
+            saveStatus.textContent = "Saving…";
+            try {
+                const res = await fetch(`/api/admin/units/${unit.typeId}`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                });
+                const text = await res.text();
+                if (!res.ok) throw new Error(text || `status ${res.status}`);
+                const parsed = JSON.parse(text) as { note?: string };
+                saveStatus.style.color = "#9c9";
+                saveStatus.textContent = parsed.note ?? "Saved.";
+            } catch (err) {
+                saveStatus.style.color = "#e77";
+                saveStatus.textContent = `Failed: ${err instanceof Error ? err.message : String(err)}`;
+            } finally {
+                saveButton.disabled = false;
+            }
+        })();
+    });
 
     const app = new Application();
     let appReady = false;
@@ -230,7 +595,11 @@ export function createUnitViewerPanel(container: HTMLElement): void {
         app.stage.addChild(previewSprite);
     }
 
-    unitSelect.addEventListener("change", () => void refreshAnimationOptions());
+    unitSelect.addEventListener("change", () => {
+        void refreshAnimationOptions();
+        const unit = units.find((u) => u.id === unitSelect.value);
+        if (unit) populateStatsForm(unit);
+    });
     sheetSelect.addEventListener("change", () => void refreshAnimationOptions());
     animationSelect.addEventListener("change", () => void renderSelection());
     directionSelect.addEventListener("change", () => void renderSelection());
@@ -238,6 +607,7 @@ export function createUnitViewerPanel(container: HTMLElement): void {
     if (units.length > 0) {
         unitSelect.value = units[0].id;
         void refreshAnimationOptions();
+        populateStatsForm(units[0]);
     }
 }
 
@@ -266,7 +636,7 @@ export function mountUnitViewerToggle(): void {
 
     const dialog = document.createElement("div");
     dialog.style.cssText = `
-        position: relative; width: min(1000px, 92vw); height: min(720px, 88vh);
+        position: relative; width: min(1440px, 96vw); height: min(800px, 92vh);
         background: #1b1b1b; border: 1px solid #444; border-radius: 6px; overflow: hidden;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
     `;

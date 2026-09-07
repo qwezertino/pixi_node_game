@@ -1,7 +1,7 @@
 # Makefile for Pixi Node Game - 2D Multiplayer Game
 # Client: TypeScript + PixiJS, Server: Go
 
-.PHONY: all build build-client build-server run run-client run-server dev clean test docker-init docker-up docker-build docker-test docker-monitoring docker-down protocol-test protocol-ab load-test lint
+.PHONY: all build build-client build-server run run-client run-server dev clean test docker-init docker-up docker-build docker-test docker-monitoring docker-down protocol-test protocol-ab load-test lint docker-up-core docker-upbuild-core docker-down-core docker-up-monitoring docker-down-monitoring
 
 # Variables
 SERVER_DIR=src/server
@@ -26,45 +26,47 @@ build-client:
 	@echo "🏗️  Building client..."
 	bun run build:client
 
-# Build server (Go) and output to dist directory
+# Build server (Go) and output to dist directory.
+# Game rules and unit stats no longer live in files embedded at build time —
+# they're read from Postgres at startup (docker/postgres/init/001_init.sql
+# seeds them). See internal/config.Build / internal/liveconfig.
 build-server:
 	@echo "🏗️  Building server..."
-	@echo "📋 Copying config for embedding..."
-	cp src/shared/gameConfig.json src/server/internal/config/
 	cd $(SERVER_DIR) && go build -ldflags="-s -w" -trimpath -o ../../$(SERVER_OUTPUT_DIR)/$(SERVER_BINARY) cmd/server/main.go
-	@echo "📋 Copying config files to dist..."
+
+build-configctl:
+	@echo "🏗️  Building configctl..."
+	cd $(SERVER_DIR) && go build -o ../../$(SERVER_OUTPUT_DIR)/configctl ./cmd/configctl
 
 build-server-linux:
 	@echo "🚀 Building linux server release..."
-	@echo "📋 Copying config for embedding..."
-	cp src/shared/gameConfig.json src/server/internal/config/
 	cd $(SERVER_DIR) && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o ../../$(SERVER_OUTPUT_DIR)/$(SERVER_BINARY) cmd/server/main.go
-	@echo "📋 Copying config files to dist..."
 
 # Build optimized release version
 build-release: build-client
 	@echo "🚀 Building optimized server release..."
-	@echo "📋 Copying config for embedding..."
-	cp src/shared/gameConfig.json src/server/internal/config/
 	cd $(SERVER_DIR) && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o ../../$(SERVER_OUTPUT_DIR)/$(SERVER_BINARY) cmd/server/main.go
-	@echo "📋 Copying config files to dist..."
 
 # Run client development server
 dev-client:
 	@echo "🌐 Starting client development server..."
 	bun run dev:client
 
-# Запустить клиент и сервер параллельно (dev режим, без Docker)
+# Запустить клиент и сервер параллельно (dev режим, без Docker для game,
+# но Postgres+Redis обязательны — `make docker-up-core` перед этим)
 dev:
 	@echo "🚀 Starting dev: client (Vite :8109) + server (:8108)..."
+	@echo "⚠️  Requires Postgres+Redis reachable (POSTGRES_HOST/REDIS_HOST in .env) — run 'make docker-up-core' first if not already up."
 	@$(MAKE) build-server
 	@set -a && . ./.env && set +a && \
 		(cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY) &) && \
 		bun run dev:client
 
 # Run server in development mode
+# Requires Postgres+Redis reachable — game_settings/units live only there now.
 dev-server: build-server
 	@echo "🚀 Starting server in development mode..."
+	@echo "⚠️  Requires Postgres+Redis reachable (POSTGRES_HOST/REDIS_HOST in .env) — run 'make docker-up-core' first if not already up."
 	@set -a && . ./.env && set +a && cd $(CLIENT_BUILD_DIR) && ./$(SERVER_BINARY)
 
 
@@ -82,7 +84,6 @@ clean:
 	@echo "🧹 Cleaning build artifacts..."
 	rm -rf $(CLIENT_BUILD_DIR)
 	rm -f $(SERVER_DIR)/$(SERVER_BINARY)
-	rm -f src/server/internal/config/gameConfig.json
 
 
 # Lint code
@@ -116,6 +117,35 @@ docker-up: docker-init
 docker-upbuild: docker-init
 	@echo "🐳 Building and starting containers..."
 	$(COMPOSE) up --build -d
+
+# Docker: создать директории для БД (только при первом запуске)
+docker-init-core:
+	@mkdir -p docker/data/postgres docker/data/redis
+
+# Docker: поднять только игру + БД (postgres, redis) — без мониторинга и artillery
+docker-up-core: docker-init-core
+	@echo "🐳 Starting core containers (game, postgres, redis)..."
+	$(COMPOSE) up -d game postgres redis
+
+# Docker: то же самое, но с пересборкой образа game (нужно после правок кода)
+docker-upbuild-core: docker-init-core
+	@echo "🐳 Building and starting core containers (game, postgres, redis)..."
+	$(COMPOSE) up --build -d game postgres redis
+
+# Docker: остановить только игру + БД, не трогая мониторинг
+docker-down-core:
+	@echo "🐳 Stopping core containers (game, postgres, redis)..."
+	$(COMPOSE) stop game postgres redis
+
+# Docker: поднять только стек мониторинга (prometheus, grafana, loki, promtail)
+docker-up-monitoring: docker-init
+	@echo "🐳 Starting monitoring containers (prometheus, grafana, loki, promtail)..."
+	$(COMPOSE) up -d prometheus grafana loki promtail
+
+# Docker: остановить только стек мониторинга
+docker-down-monitoring:
+	@echo "🐳 Stopping monitoring containers..."
+	$(COMPOSE) stop prometheus grafana loki promtail
 
 # Docker: запустить нагрузочный тест через artillery
 docker-test:
@@ -185,3 +215,9 @@ help:
 	@echo "  protocol-test   - Run end-to-end protocol probes (PROBE=<name> for one)"
 	@echo "  protocol-ab     - A/B velocity replication (CLIENTS=, TURNS=, SECONDS=)"
 	@echo "  deps            - Install dependencies"
+	@echo "  docker-up-core       - Start only game + postgres + redis (no monitoring, no artillery)"
+	@echo "  docker-upbuild-core  - Same, but rebuild the game image first (after code changes)"
+	@echo "  docker-down-core     - Stop only game + postgres + redis"
+	@echo "  docker-up-monitoring - Start only prometheus + grafana + loki + promtail"
+	@echo "  docker-down-monitoring - Stop only prometheus + grafana + loki + promtail"
+	@echo "  build-configctl - Build the configctl CLI (live-edit DB-backed game config)"

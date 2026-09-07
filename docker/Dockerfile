@@ -32,9 +32,6 @@ RUN go mod download
 # Copy server source
 COPY src/server/ ./
 
-# Copy gameConfig.json for go:embed (must exist before go build)
-COPY src/shared/gameConfig.json ./internal/config/gameConfig.json
-
 # Build a static, trimmed binary
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \

@@ -36,9 +36,24 @@ export interface GameConfig {
   };
 }
 
-import configData from './gameConfig.json';
+import { showLoadingError } from "./loadingScreen";
 
-export const gameConfig: GameConfig = configData;
+// Fetched from the server at startup — there is no bundled fallback. Game
+// rules live only in Postgres now (see src/server/internal/liveconfig and
+// docker/postgres/init/001_init.sql); the server must be reachable at
+// GET /api/config for the client to boot at all.
+async function loadGameConfig(): Promise<GameConfig> {
+  try {
+    const res = await fetch("/api/config");
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    return (await res.json()) as GameConfig;
+  } catch (err) {
+    showLoadingError("Could not reach the game server. Please try reloading.");
+    throw err;
+  }
+}
+
+export const gameConfig: GameConfig = await loadGameConfig();
 
 export const NETWORK = gameConfig.network;
 export const MOVEMENT = gameConfig.movement;

@@ -92,14 +92,63 @@ export class NetworkManager {
         this.requestedUnitType = DEFAULT_UNIT_TYPE;
     }
 
+    /**
+     * Connects with the given unit type. Safe to call again on an already-
+     * connected instance (respawn): tears down the previous connection and
+     * resets all per-session state first, so the new connection starts clean
+     * regardless of how the old one was doing.
+     */
     public connect(unitType: UnitType): void {
         this.requestedUnitType = isValidUnitType(unitType) ? unitType : DEFAULT_UNIT_TYPE;
+
+        this.teardownConnection();
+        this.resetSessionState();
+        this.closedByClient = false;
+        this.reconnectAttempts = 0;
 
         if (this.useWorker && typeof Worker !== 'undefined') {
             this.initWorker();
         } else {
             this.initDirectSocket();
         }
+    }
+
+    private teardownConnection(): void {
+        this.closedByClient = true;
+        this.stopDirectPings();
+        if (this.reconnectTimer !== null) {
+            window.clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        if (this.resyncRetryTimer !== null) {
+            window.clearTimeout(this.resyncRetryTimer);
+            this.resyncRetryTimer = null;
+        }
+        if (this.worker) {
+            this.worker.postMessage({ type: 'disconnect' });
+            this.worker.terminate();
+            this.worker = null;
+        }
+        if (this.socket) {
+            this.socket.close();
+            this.socket = null;
+        }
+        this.connected = false;
+    }
+
+    private resetSessionState(): void {
+        this.playerId = "";
+        this.players = {};
+        this.lastStateSequence = 0;
+        this.hasStateSequence = false;
+        this.resyncRequested = false;
+        this.receivedInitialPosition = false;
+        this.lastWorldTick = 0;
+        this.hasWorldTick = false;
+        this.dilationPct = 100;
+        this.myUnitType = 0;
+        this.playerAttributes = {};
+        this.protocolMismatch = false;
     }
 
     private initWorker() {
@@ -641,24 +690,7 @@ export class NetworkManager {
     }
 
     public disconnect(): void {
-        this.closedByClient = true;
-        this.stopDirectPings();
-        if (this.reconnectTimer !== null) {
-            window.clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        if (this.resyncRetryTimer !== null) {
-            window.clearTimeout(this.resyncRetryTimer);
-            this.resyncRetryTimer = null;
-        }
-        if (this.worker) {
-            this.worker.postMessage({ type: 'disconnect' });
-            this.worker.terminate();
-            this.worker = null;
-        } else if (this.socket) {
-            this.socket.close();
-            this.socket = null;
-        }
+        this.teardownConnection();
     }
 
     private emitLatency(latencyMs: number): void {

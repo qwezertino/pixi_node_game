@@ -10,6 +10,14 @@ services:
     environment:
       # Override path to static files inside the container
       STATIC_DIR: "/app/static"
+      # Point at the in-network service names rather than .env's host-facing values
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     # Allow up to 65 536 open file descriptors (= WebSocket connections + epoll fds).
     # Default Docker/Linux limit is 1024 — server hits EMFILE at ~1020 connections.
@@ -27,6 +35,38 @@ services:
       timeout: 10s
       start_period: 10s
       retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-game}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-game}
+      POSTGRES_DB: ${POSTGRES_DB:-game}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-game} -d ${POSTGRES_DB:-game}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:latest

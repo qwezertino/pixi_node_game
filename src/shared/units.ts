@@ -1,6 +1,3 @@
-
-import unitsData from "./units.json";
-
 export type UnitTier = "citizen" | "guard" | "archer" | "warrior" | "knight";
 export type DamageRangeType = "melee" | "ranged";
 
@@ -117,7 +114,22 @@ export interface UnitDefinition {
     dashAssetPath?: string;
 }
 
-export const UNITS: readonly UnitDefinition[] = unitsData as UnitDefinition[];
+import { showLoadingError } from "./loadingScreen";
+
+// Fetched from the server at startup — there is no bundled fallback. Unit
+// stats live only in Postgres now, see gameConfig.ts for why.
+async function loadUnits(): Promise<UnitDefinition[]> {
+    try {
+        const res = await fetch("/api/units");
+        if (!res.ok) throw new Error(`status ${res.status}`);
+        return (await res.json()) as UnitDefinition[];
+    } catch (err) {
+        showLoadingError("Could not reach the game server. Please try reloading.");
+        throw err;
+    }
+}
+
+export const UNITS: readonly UnitDefinition[] = await loadUnits();
 
 const BY_ID = new Map<string, UnitDefinition>(UNITS.map((u) => [u.id, u]));
 const BY_TYPE_ID = new Map<number, UnitDefinition>(UNITS.map((u) => [u.typeId, u]));

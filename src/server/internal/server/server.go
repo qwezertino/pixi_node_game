@@ -20,6 +20,7 @@ import (
 	"pixi_game_server/internal/clock"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/game"
+	"pixi_game_server/internal/liveconfig"
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/types"
@@ -27,8 +28,13 @@ import (
 
 type Server struct {
 	cfg       *config.Config
+	live      *config.LiveNet
 	gameWorld *game.GameWorld
 	protocol  *protocol.BinaryProtocol
+
+	gameConfigJSON []byte
+	unitsJSON      atomic.Pointer[[]byte]
+	adminStore     *liveconfig.Store
 
 	connectionsMu sync.RWMutex
 	connections   map[uint32]*Connection
@@ -49,27 +55,10 @@ type Server struct {
 	dilationModerateStreak int64
 	worldStateSeq          uint32
 
-	fanoutDropLimit                int32
-	writeBatchSize                 int
-	fanoutMaxBroadcastBytesPerTick int
-	fanoutQueueShedDepth           int
-	fanoutFairDebtMax              int32
-	fanoutFairDebtInc              int32
-	fanoutFairDebtDec              int32
-	fanoutFairDebtWeightNs         int64
-	fanoutRoundRobinWeightNs       int64
-	fanoutCriticalWindowNs         int64
-	fanoutCriticalBoostNs          int64
-	fanoutRoundRobinEpoch          int64
-	fanoutDebtEpoch                uint32
+	fanoutRoundRobinEpoch int64
+	fanoutDebtEpoch       uint32
 
-	fanoutMinRecipients  int
-	fanoutMaxRecipients  int
-	fanoutTarget         time.Duration
 	fanoutRecipientLimit int64
-	activeStalenessNs    int64
-	idleStalenessNs      int64
-	activeWindowNs       int64
 	lastFanoutTuneLog    int64
 
 	startTime time.Time
@@ -106,9 +95,12 @@ func New(cfg *config.Config) *Server {
 		cfg.Server.Workers = runtime.NumCPU()
 	}
 
+	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
+
 	server := &Server{
 		cfg:         cfg,
-		gameWorld:   game.NewGameWorld(cfg),
+		live:        live,
+		gameWorld:   game.NewGameWorld(cfg, live),
 		protocol:    &protocol.BinaryProtocol{},
 		connections: make(map[uint32]*Connection, 4096),
 		ctx:         ctx,
@@ -120,78 +112,9 @@ func New(cfg *config.Config) *Server {
 	metrics.TimeDilationPercent.Set(100)
 	metrics.TickIntervalMs.Set(float64(server.gameWorld.GetNominalTickInterval().Milliseconds()))
 
-	server.fanoutDropLimit = int32(cfg.Net.FanoutDropStreak)
-	if server.fanoutDropLimit < 1 {
-		server.fanoutDropLimit = 1
-	}
-	server.writeBatchSize = cfg.Net.WriteBatchSize
-	if server.writeBatchSize < 1 {
-		server.writeBatchSize = 1
-	}
-	server.fanoutMaxBroadcastBytesPerTick = cfg.Net.FanoutMaxBroadcastBytesPerTick
-	if server.fanoutMaxBroadcastBytesPerTick < 0 {
-		server.fanoutMaxBroadcastBytesPerTick = 0
-	}
-	server.fanoutQueueShedDepth = cfg.Net.FanoutQueueShedDepth
-	if server.fanoutQueueShedDepth < 1 {
-		server.fanoutQueueShedDepth = 0
-	}
-	server.fanoutFairDebtMax = int32(cfg.Net.FanoutFairDebtMax)
-	if server.fanoutFairDebtMax < 0 {
-		server.fanoutFairDebtMax = 0
-	}
-	server.fanoutFairDebtInc = int32(cfg.Net.FanoutFairDebtInc)
-	if server.fanoutFairDebtInc < 0 {
-		server.fanoutFairDebtInc = 0
-	}
-	server.fanoutFairDebtDec = int32(cfg.Net.FanoutFairDebtDec)
-	if server.fanoutFairDebtDec < 0 {
-		server.fanoutFairDebtDec = 0
-	}
-	server.fanoutFairDebtWeightNs = cfg.Net.FanoutFairDebtWeightNs
-	if server.fanoutFairDebtWeightNs < 0 {
-		server.fanoutFairDebtWeightNs = 0
-	}
-	server.fanoutRoundRobinWeightNs = cfg.Net.FanoutRoundRobinWeightNs
-	if server.fanoutRoundRobinWeightNs < 0 {
-		server.fanoutRoundRobinWeightNs = 0
-	}
-	server.fanoutCriticalWindowNs = cfg.Net.FanoutCriticalWindow.Nanoseconds()
-	if server.fanoutCriticalWindowNs < 0 {
-		server.fanoutCriticalWindowNs = 0
-	}
-	server.fanoutCriticalBoostNs = cfg.Net.FanoutCriticalBoostNs
-	if server.fanoutCriticalBoostNs < 0 {
-		server.fanoutCriticalBoostNs = 0
-	}
-
-	server.fanoutMinRecipients = cfg.Net.FanoutMinRecipientsPerTick
-	if server.fanoutMinRecipients < 1 {
-		server.fanoutMinRecipients = 1
-	}
-	server.fanoutMaxRecipients = cfg.Net.FanoutMaxRecipientsPerTick
-	if server.fanoutMaxRecipients > 0 && server.fanoutMinRecipients > server.fanoutMaxRecipients {
-		server.fanoutMinRecipients = server.fanoutMaxRecipients
-	}
-	server.fanoutTarget = time.Duration(cfg.Net.FanoutTargetMs) * time.Millisecond
-	if server.fanoutTarget <= 0 {
-		server.fanoutTarget = 12 * time.Millisecond
-	}
-	server.activeStalenessNs = cfg.Net.WorldStateActiveStaleness.Nanoseconds()
-	if server.activeStalenessNs <= 0 {
-		server.activeStalenessNs = (150 * time.Millisecond).Nanoseconds()
-	}
-	server.idleStalenessNs = cfg.Net.WorldStateIdleStaleness.Nanoseconds()
-	if server.idleStalenessNs < server.activeStalenessNs {
-		server.idleStalenessNs = server.activeStalenessNs
-	}
-	server.activeWindowNs = cfg.Net.WorldStateActiveWindow.Nanoseconds()
-	if server.activeWindowNs <= 0 {
-		server.activeWindowNs = (1 * time.Second).Nanoseconds()
-	}
-	if server.fanoutMaxRecipients > 0 {
-		atomic.StoreInt64(&server.fanoutRecipientLimit, int64(server.fanoutMaxRecipients))
-		metrics.FanoutRecipientLimit.Set(float64(server.fanoutMaxRecipients))
+	if snap := live.Load(); snap.FanoutMaxRecipientsPerTick > 0 {
+		atomic.StoreInt64(&server.fanoutRecipientLimit, int64(snap.FanoutMaxRecipientsPerTick))
+		metrics.FanoutRecipientLimit.Set(float64(snap.FanoutMaxRecipientsPerTick))
 	} else {
 		metrics.FanoutRecipientLimit.Set(0)
 	}
@@ -207,6 +130,46 @@ func New(cfg *config.Config) *Server {
 	return server
 }
 
+// Live exposes the hot-swappable network config so callers (main.go's DB
+// watcher) can push live updates into it.
+func (s *Server) Live() *config.LiveNet {
+	return s.live
+}
+
+// SetStaticBlobs records the exact gameConfig.json/units.json bytes the
+// server booted with (from Postgres), so the TS client can fetch the same
+// values it would otherwise have bundled at build time — see /api/config
+// and /api/units. gameConfigJSON never changes after this (game rules need a
+// restart); unitsJSON can — see UpdateUnitsJSON.
+func (s *Server) SetStaticBlobs(gameConfigJSON, unitsJSON []byte) {
+	s.gameConfigJSON = gameConfigJSON
+	s.unitsJSON.Store(&unitsJSON)
+}
+
+// UpdateUnitsJSON swaps in freshly re-marshaled unit data after a live
+// reload (see internal/liveconfig.WatchUnits), so GET /api/units serves the
+// new values to any client that (re)connects from this point on.
+func (s *Server) UpdateUnitsJSON(unitsJSON []byte) {
+	s.unitsJSON.Store(&unitsJSON)
+}
+
+// RecomputeUnitTables re-derives the game loop's per-unit-type lookup tables
+// (move speed, stamina, attack/combo timing) from the current units.All().
+// Call after internal/units.LoadDefinitions picks up a change.
+func (s *Server) RecomputeUnitTables() {
+	s.gameWorld.RecomputeUnitTables()
+}
+
+func (s *Server) handleStaticConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(s.gameConfigJSON)
+}
+
+func (s *Server) handleStaticUnits(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(*s.unitsJSON.Load())
+}
+
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
@@ -215,6 +178,14 @@ func (s *Server) Start() error {
 	mux.Handle("/", http.FileServer(http.Dir(s.cfg.Server.StaticDir)))
 
 	mux.HandleFunc("/health", s.handleHealth)
+
+	mux.HandleFunc("/api/config", s.handleStaticConfig)
+	mux.HandleFunc("/api/units", s.handleStaticUnits)
+
+	if s.adminStore != nil {
+		mux.HandleFunc("PATCH /api/admin/units/{typeId}", s.handleAdminUpdateUnit)
+		slog.Warn("unit admin API enabled — anyone who can reach this server can rewrite unit balance, ENABLE_UNIT_ADMIN_API should never be set in production")
+	}
 
 	mux.Handle("/metrics", promhttp.Handler())
 
@@ -342,7 +313,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.connectionsMu.RLock()
 	connCount := len(s.connections)
 	s.connectionsMu.RUnlock()
-	if connCount >= s.cfg.Net.MaxConnections {
+	if connCount >= s.live.Load().MaxConnections {
 		http.Error(w, "Server full", http.StatusServiceUnavailable)
 		return
 	}
@@ -388,13 +359,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createConnection(player *types.Player, rawConn net.Conn) *Connection {
 	ctx, cancel := context.WithCancel(s.ctx)
 
+	live := s.live.Load()
 	conn := &Connection{
 		player:  player,
 		rawConn: rawConn,
 		writeCh: make(chan writeJob, writeChanSize),
 		rateLimiter: rate.NewLimiter(
-			rate.Limit(s.cfg.Net.MessageRateLimit),
-			s.cfg.Net.BurstLimit,
+			rate.Limit(live.MessageRateLimit),
+			live.BurstLimit,
 		),
 		lastActivity:         clock.Now(),
 		lastWorldStateSentNs: clock.Now(),
@@ -486,11 +458,12 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 }
 
 func (s *Server) markConnectionCritical(conn *Connection) {
-	if s.fanoutCriticalWindowNs <= 0 {
+	windowNs := s.live.Load().FanoutCriticalWindowNs
+	if windowNs <= 0 {
 		return
 	}
 	nowNs := clock.Now()
-	untilNs := nowNs + s.fanoutCriticalWindowNs
+	untilNs := nowNs + windowNs
 	for {
 		curr := atomic.LoadInt64(&conn.criticalUntilNs)
 		if curr >= untilNs {
@@ -528,8 +501,9 @@ func (s *Server) cleanupConnection(c *Connection) {
 }
 
 func (s *Server) getOrCreateRateLimiter(ip string) *rate.Limiter {
-	limit := rate.Limit(s.cfg.Net.IPConnRate)
-	burst := s.cfg.Net.IPConnBurst
+	live := s.live.Load()
+	limit := rate.Limit(live.IPConnRate)
+	burst := live.IPConnBurst
 	if limit <= 0 {
 		limit = rate.Inf
 		burst = 0
