@@ -8,32 +8,37 @@ import (
 	"strconv"
 
 	"pixi_game_server/internal/liveconfig"
-	"pixi_game_server/internal/units"
 )
 
 func (s *Server) EnableUnitAdminAPI(store *liveconfig.Store) {
 	s.adminStore = store
 }
 
+type unitCostPatchRequest struct {
+	Wood  *int `json:"wood"`
+	Stone *int `json:"stone"`
+	Iron  *int `json:"iron"`
+}
+
 type unitStatsPatchRequest struct {
-	HP                         float64    `json:"hp"`
-	PassiveDR                  float64    `json:"passiveDR"`
-	MoveSpeed                  float64    `json:"moveSpeed"`
-	RangeType                  string     `json:"rangeType"`
-	Range                      float64    `json:"range"`
-	Damage                     float64    `json:"damage"`
-	WindupSeconds              float64    `json:"windupSeconds"`
-	ActiveSeconds              float64    `json:"activeSeconds"`
-	RecoverySeconds            float64    `json:"recoverySeconds"`
-	Stamina                    float64    `json:"stamina"`
-	StaminaRegenPerSecond      float64    `json:"staminaRegenPerSecond"`
-	SprintSpeedMultiplier      float64    `json:"sprintSpeedMultiplier"`
-	SprintStaminaCostPerSecond float64    `json:"sprintStaminaCostPerSecond"`
-	AnimationSpeed             float64    `json:"animationSpeed"`
-	Cost                       units.Cost `json:"cost"`
-	RequiresRoyalGuard         bool       `json:"requiresRoyalGuard"`
-	Cleave                     bool       `json:"cleave"`
-	HasBraceStance             bool       `json:"hasBraceStance"`
+	HP                         *float64              `json:"hp"`
+	PassiveDR                  *float64              `json:"passiveDR"`
+	MoveSpeed                  *float64              `json:"moveSpeed"`
+	RangeType                  *string               `json:"rangeType"`
+	Range                      *float64              `json:"range"`
+	Damage                     *float64              `json:"damage"`
+	WindupSeconds              *float64              `json:"windupSeconds"`
+	ActiveSeconds              *float64              `json:"activeSeconds"`
+	RecoverySeconds            *float64              `json:"recoverySeconds"`
+	Stamina                    *float64              `json:"stamina"`
+	StaminaRegenPerSecond      *float64              `json:"staminaRegenPerSecond"`
+	SprintSpeedMultiplier      *float64              `json:"sprintSpeedMultiplier"`
+	SprintStaminaCostPerSecond *float64              `json:"sprintStaminaCostPerSecond"`
+	AnimationSpeed             *float64              `json:"animationSpeed"`
+	Cost                       *unitCostPatchRequest `json:"cost"`
+	RequiresRoyalGuard         *bool                 `json:"requiresRoyalGuard"`
+	Cleave                     *bool                 `json:"cleave"`
+	HasBraceStance             *bool                 `json:"hasBraceStance"`
 
 	ComboSteps               *int     `json:"comboSteps"`
 	ComboWindowSeconds       *float64 `json:"comboWindowSeconds"`
@@ -118,8 +123,7 @@ func (s *Server) handleAdminUpdateUnit(w http.ResponseWriter, r *http.Request) {
 		WindupSeconds: body.WindupSeconds, ActiveSeconds: body.ActiveSeconds, RecoverySeconds: body.RecoverySeconds,
 		Stamina: body.Stamina, StaminaRegenPerSecond: body.StaminaRegenPerSecond,
 		SprintSpeedMultiplier: body.SprintSpeedMultiplier, SprintStaminaCostPerSecond: body.SprintStaminaCostPerSecond,
-		AnimationSpeed: body.AnimationSpeed,
-		CostWood:       body.Cost.Wood, CostStone: body.Cost.Stone, CostIron: body.Cost.Iron,
+		AnimationSpeed:     body.AnimationSpeed,
 		RequiresRoyalGuard: body.RequiresRoyalGuard, Cleave: body.Cleave, HasBraceStance: body.HasBraceStance,
 
 		ComboSteps:               body.ComboSteps,
@@ -130,6 +134,12 @@ func (s *Server) handleAdminUpdateUnit(w http.ResponseWriter, r *http.Request) {
 
 		AntiShieldMultiplier:        body.AntiShieldMultiplier,
 		AntiWoodStructureMultiplier: body.AntiWoodStructureMultiplier,
+	}
+
+	if body.Cost != nil {
+		patch.CostWood = body.Cost.Wood
+		patch.CostStone = body.Cost.Stone
+		patch.CostIron = body.Cost.Iron
 	}
 
 	if body.Block != nil {

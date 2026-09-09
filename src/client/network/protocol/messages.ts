@@ -25,6 +25,7 @@ export interface PlayerState {
     vy?: number;
     movementVector?: { dx: number; dy: number };
     inputSequence?: number;
+    attackStartTick?: number;
 }
 
 export interface ClientMessage {

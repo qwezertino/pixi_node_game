@@ -153,17 +153,17 @@ func TestMissedStopRecoversWithSharedFullSnapshot(t *testing.T) {
 	s.admissions = 2
 	states := []types.PlayerState{players[0].ToState(), players[1].ToState()}
 	states[0].VX = 1
-	s.broadcastTick(states, states, true, 1)
+	s.broadcastTick(states, states, true, 1, time.Millisecond)
 	drainState(t, conns[1])
 	states[0].VX = 0
-	s.broadcastTick(states, states[:1], false, 2)
+	s.broadcastTick(states, states[:1], false, 2, time.Millisecond)
 	got, _ := drainState(t, conns[1])
 	if got[0] != protocol.MessageDeltaGameState {
 		t.Fatal("healthy client lost delta")
 	}
 	drainState(t, conns[0])
 	conns[1].needsFullState.Store(true)
-	s.broadcastTick(states, nil, false, 3)
+	s.broadcastTick(states, nil, false, 3, time.Millisecond)
 	a, sharedA := drainState(t, conns[0])
 	b, sharedB := drainState(t, conns[1])
 	if a[0] != protocol.MessageGameState || b[0] != protocol.MessageGameState || sharedA != sharedB {

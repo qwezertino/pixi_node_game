@@ -88,7 +88,7 @@ var (
 
 	MovementInputsRejected = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "game_movement_inputs_rejected_total",
-		Help: "Movement transitions rejected due to stale/gapped sequence, invalid client tick, or a full ring",
+		Help: "Movement inputs rejected by the player's single-slot mailbox (OfferMovementInput) due to a stale or gapped sequence number",
 	})
 
 	BytesReceived = promauto.NewCounter(prometheus.CounterOpts{
@@ -241,11 +241,11 @@ var (
 		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 16),
 	})
 
-	WorldStateAgeAtWriteEnd = promauto.NewHistogram(prometheus.HistogramOpts{
+	WorldStateAgeAtWriteEnd = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "game_world_state_age_at_write_end_seconds",
-		Help:    "World-state age when the socket write completes",
+		Help:    "World-state age when the socket write completes, labeled by write outcome",
 		Buckets: prometheus.ExponentialBucketsRange(0.00001, 1, 16),
-	})
+	}, []string{"result"})
 
 	TimeDilationPercent = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_time_dilation_percent",

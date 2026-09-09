@@ -103,6 +103,8 @@ type PlayerState struct {
 	Sprinting bool
 
 	ComboStep uint8
+
+	AttackStartTick uint32
 }
 
 type PerformanceMetrics struct {
@@ -355,15 +357,16 @@ func (p *Player) SetPendingComboInput(pending bool) {
 
 func (p *Player) ToState() PlayerState {
 	return PlayerState{
-		ID:        p.ID,
-		X:         p.GetX(),
-		Y:         p.GetY(),
-		VX:        p.GetVX(),
-		VY:        p.GetVY(),
-		Direction: p.GetDirection(),
-		State:     p.GetState(),
-		Sprinting: p.GetSprintingNow(),
-		ComboStep: p.GetComboStep(),
+		ID:              p.ID,
+		X:               p.GetX(),
+		Y:               p.GetY(),
+		VX:              p.GetVX(),
+		VY:              p.GetVY(),
+		Direction:       p.GetDirection(),
+		State:           p.GetState(),
+		Sprinting:       p.GetSprintingNow(),
+		ComboStep:       p.GetComboStep(),
+		AttackStartTick: p.GetAttackStartTick(),
 	}
 }
 

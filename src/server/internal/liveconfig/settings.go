@@ -3,9 +3,10 @@ package liveconfig
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/units"
@@ -34,9 +35,7 @@ func (s *Store) LoadGameSettings(ctx context.Context) (*config.GameSettings, err
 	return &gs, nil
 }
 
-func (s *Store) LoadUnitDefinitions(ctx context.Context) ([]units.Definition, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT
+const unitColumns = `
 			type_id, id, display_name, tier,
 			hp, passive_dr, move_speed, range_type, range, damage,
 			windup_seconds, active_seconds, recovery_seconds,
@@ -55,10 +54,134 @@ func (s *Store) LoadUnitDefinitions(ctx context.Context) ([]units.Definition, er
 			dash_thrust_distance_meters, dash_thrust_windup_seconds, dash_thrust_recovery_seconds,
 			dash_thrust_damage_multiplier, dash_thrust_cooldown_seconds,
 			anti_shield_multiplier, anti_wood_structure_multiplier,
-			asset_path, combat_asset_path, dash_asset_path
-		FROM units
-		ORDER BY type_id
-	`)
+			asset_path, combat_asset_path, dash_asset_path`
+
+type rowScanFunc func(dest ...any) error
+
+// unitRow is a unit definition plus the raw nullable combo columns, which
+// units.Definition cannot represent (it stores ComboSteps/ComboWindowSeconds
+// as plain zero-valued fields, not pointers).
+type unitRow struct {
+	def                units.Definition
+	comboSteps         *int
+	comboWindowSeconds *float64
+}
+
+func scanUnitRow(scan rowScanFunc) (unitRow, error) {
+	var row unitRow
+	d := &row.def
+	var comboSteps, positionalMinAllies, rogueCharges, fireArrowWoodCost sql.NullInt64
+	var comboWindowSeconds, attackStaminaCost, drawHoldThresholdSeconds, dodgeCostMultiplier sql.NullFloat64
+	var blockMeleeDR, blockRangedDR, blockDrainPerSecond, blockRecoverySeconds sql.NullFloat64
+	var positionalStaminaCostReductionPct sql.NullFloat64
+	var opportunistBowDamage, opportunistBowRange, opportunistBowCooldown sql.NullFloat64
+	var rogueQuiverDamage, rogueQuiverRange, rogueQuiverRecharge, rogueQuiverExecuteMult, rogueQuiverExecuteHPPct sql.NullFloat64
+	var reconViewRadiusPct, reconDetectionRadius sql.NullFloat64
+	var fireArrowDamage, fireArrowStructureMult sql.NullFloat64
+	var dashDistance, dashWindup, dashRecovery, dashDamageMult, dashCooldown sql.NullFloat64
+	var antiShieldMultiplier, antiWoodStructureMultiplier sql.NullFloat64
+	var assetPath, combatAssetPath, dashAssetPath sql.NullString
+
+	err := scan(
+		&d.TypeID, &d.ID, &d.DisplayName, &d.Tier,
+		&d.HP, &d.PassiveDR, &d.MoveSpeed, &d.RangeType, &d.Range, &d.Damage,
+		&d.WindupSeconds, &d.ActiveSeconds, &d.RecoverySeconds,
+		&d.Stamina, &d.StaminaRegenPerSecond, &d.SprintSpeedMultiplier, &d.SprintStaminaCostPerSecond,
+		&comboSteps, &comboWindowSeconds,
+		&d.AnimationSpeed, &attackStaminaCost, &drawHoldThresholdSeconds, &dodgeCostMultiplier,
+		&d.Cost.Wood, &d.Cost.Stone, &d.Cost.Iron,
+		&d.RequiresRoyalGuard, &d.Cleave, &d.HasBraceStance,
+		&blockMeleeDR, &blockRangedDR, &blockDrainPerSecond, &blockRecoverySeconds,
+		&positionalStaminaCostReductionPct, &positionalMinAllies,
+		&opportunistBowDamage, &opportunistBowRange, &opportunistBowCooldown,
+		&rogueQuiverDamage, &rogueQuiverRange, &rogueCharges, &rogueQuiverRecharge,
+		&rogueQuiverExecuteMult, &rogueQuiverExecuteHPPct,
+		&reconViewRadiusPct, &reconDetectionRadius,
+		&fireArrowDamage, &fireArrowStructureMult, &fireArrowWoodCost,
+		&dashDistance, &dashWindup, &dashRecovery, &dashDamageMult, &dashCooldown,
+		&antiShieldMultiplier, &antiWoodStructureMultiplier,
+		&assetPath, &combatAssetPath, &dashAssetPath,
+	)
+	if err != nil {
+		return unitRow{}, err
+	}
+
+	row.comboSteps = nullIntPtr(comboSteps)
+	row.comboWindowSeconds = nullFloatPtr(comboWindowSeconds)
+	if comboSteps.Valid {
+		d.ComboSteps = int(comboSteps.Int64)
+	}
+	if comboWindowSeconds.Valid {
+		d.ComboWindowSeconds = comboWindowSeconds.Float64
+	}
+	d.AttackStaminaCost = nullFloatPtr(attackStaminaCost)
+	d.DrawHoldThresholdSeconds = nullFloatPtr(drawHoldThresholdSeconds)
+	d.DodgeCostMultiplier = nullFloatPtr(dodgeCostMultiplier)
+	d.AntiShieldMultiplier = nullFloatPtr(antiShieldMultiplier)
+	d.AntiWoodStructureMultiplier = nullFloatPtr(antiWoodStructureMultiplier)
+	d.AssetPath = assetPath.String
+	d.CombatAssetPath = combatAssetPath.String
+	d.DashAssetPath = dashAssetPath.String
+
+	if blockMeleeDR.Valid {
+		d.Block = &units.BlockProfile{
+			MeleeDR:         blockMeleeDR.Float64,
+			RangedDR:        blockRangedDR.Float64,
+			DrainPerSecond:  blockDrainPerSecond.Float64,
+			RecoverySeconds: nullFloatPtr(blockRecoverySeconds),
+		}
+	}
+	if positionalStaminaCostReductionPct.Valid {
+		d.PositionalBonus = &units.PositionalBonus{
+			StaminaCostReductionPct: positionalStaminaCostReductionPct.Float64,
+			MinNearbyAllies:         int(positionalMinAllies.Int64),
+		}
+	}
+	if opportunistBowDamage.Valid {
+		d.OpportunistBow = &units.OpportunistBow{
+			Damage:          opportunistBowDamage.Float64,
+			Range:           opportunistBowRange.Float64,
+			CooldownSeconds: opportunistBowCooldown.Float64,
+		}
+	}
+	if rogueQuiverDamage.Valid {
+		d.RogueQuiver = &units.RogueQuiver{
+			Damage:                rogueQuiverDamage.Float64,
+			Range:                 rogueQuiverRange.Float64,
+			Charges:               int(rogueCharges.Int64),
+			RechargeSeconds:       rogueQuiverRecharge.Float64,
+			ExecuteMultiplier:     rogueQuiverExecuteMult.Float64,
+			ExecuteHpThresholdPct: rogueQuiverExecuteHPPct.Float64,
+		}
+	}
+	if reconViewRadiusPct.Valid {
+		d.Recon = &units.Recon{
+			ViewRadiusBonusPct:    reconViewRadiusPct.Float64,
+			DetectionRadiusMeters: reconDetectionRadius.Float64,
+		}
+	}
+	if fireArrowDamage.Valid {
+		d.FireArrow = &units.FireArrow{
+			Damage:                    fireArrowDamage.Float64,
+			StructureDamageMultiplier: fireArrowStructureMult.Float64,
+			WoodCostPerShot:           int(fireArrowWoodCost.Int64),
+		}
+	}
+	if dashDistance.Valid {
+		d.DashThrust = &units.DashThrust{
+			DistanceMeters:   dashDistance.Float64,
+			WindupSeconds:    dashWindup.Float64,
+			RecoverySeconds:  dashRecovery.Float64,
+			DamageMultiplier: dashDamageMult.Float64,
+			CooldownSeconds:  dashCooldown.Float64,
+		}
+	}
+
+	return row, nil
+}
+
+func (s *Store) LoadUnitDefinitions(ctx context.Context) ([]units.Definition, error) {
+	rows, err := s.pool.Query(ctx, `SELECT`+unitColumns+` FROM units ORDER BY type_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -66,118 +189,21 @@ func (s *Store) LoadUnitDefinitions(ctx context.Context) ([]units.Definition, er
 
 	var defs []units.Definition
 	for rows.Next() {
-		var d units.Definition
-		var comboSteps, positionalMinAllies, rogueCharges, fireArrowWoodCost sql.NullInt64
-		var comboWindowSeconds, attackStaminaCost, drawHoldThresholdSeconds, dodgeCostMultiplier sql.NullFloat64
-		var blockMeleeDR, blockRangedDR, blockDrainPerSecond, blockRecoverySeconds sql.NullFloat64
-		var positionalStaminaCostReductionPct sql.NullFloat64
-		var opportunistBowDamage, opportunistBowRange, opportunistBowCooldown sql.NullFloat64
-		var rogueQuiverDamage, rogueQuiverRange, rogueQuiverRecharge, rogueQuiverExecuteMult, rogueQuiverExecuteHPPct sql.NullFloat64
-		var reconViewRadiusPct, reconDetectionRadius sql.NullFloat64
-		var fireArrowDamage, fireArrowStructureMult sql.NullFloat64
-		var dashDistance, dashWindup, dashRecovery, dashDamageMult, dashCooldown sql.NullFloat64
-		var antiShieldMultiplier, antiWoodStructureMultiplier sql.NullFloat64
-		var assetPath, combatAssetPath, dashAssetPath sql.NullString
-
-		err := rows.Scan(
-			&d.TypeID, &d.ID, &d.DisplayName, &d.Tier,
-			&d.HP, &d.PassiveDR, &d.MoveSpeed, &d.RangeType, &d.Range, &d.Damage,
-			&d.WindupSeconds, &d.ActiveSeconds, &d.RecoverySeconds,
-			&d.Stamina, &d.StaminaRegenPerSecond, &d.SprintSpeedMultiplier, &d.SprintStaminaCostPerSecond,
-			&comboSteps, &comboWindowSeconds,
-			&d.AnimationSpeed, &attackStaminaCost, &drawHoldThresholdSeconds, &dodgeCostMultiplier,
-			&d.Cost.Wood, &d.Cost.Stone, &d.Cost.Iron,
-			&d.RequiresRoyalGuard, &d.Cleave, &d.HasBraceStance,
-			&blockMeleeDR, &blockRangedDR, &blockDrainPerSecond, &blockRecoverySeconds,
-			&positionalStaminaCostReductionPct, &positionalMinAllies,
-			&opportunistBowDamage, &opportunistBowRange, &opportunistBowCooldown,
-			&rogueQuiverDamage, &rogueQuiverRange, &rogueCharges, &rogueQuiverRecharge,
-			&rogueQuiverExecuteMult, &rogueQuiverExecuteHPPct,
-			&reconViewRadiusPct, &reconDetectionRadius,
-			&fireArrowDamage, &fireArrowStructureMult, &fireArrowWoodCost,
-			&dashDistance, &dashWindup, &dashRecovery, &dashDamageMult, &dashCooldown,
-			&antiShieldMultiplier, &antiWoodStructureMultiplier,
-			&assetPath, &combatAssetPath, &dashAssetPath,
-		)
+		row, err := scanUnitRow(rows.Scan)
 		if err != nil {
 			return nil, err
 		}
-
-		if comboSteps.Valid {
-			d.ComboSteps = int(comboSteps.Int64)
-		}
-		if comboWindowSeconds.Valid {
-			d.ComboWindowSeconds = comboWindowSeconds.Float64
-		}
-		d.AttackStaminaCost = nullFloatPtr(attackStaminaCost)
-		d.DrawHoldThresholdSeconds = nullFloatPtr(drawHoldThresholdSeconds)
-		d.DodgeCostMultiplier = nullFloatPtr(dodgeCostMultiplier)
-		d.AntiShieldMultiplier = nullFloatPtr(antiShieldMultiplier)
-		d.AntiWoodStructureMultiplier = nullFloatPtr(antiWoodStructureMultiplier)
-		d.AssetPath = assetPath.String
-		d.CombatAssetPath = combatAssetPath.String
-		d.DashAssetPath = dashAssetPath.String
-
-		if blockMeleeDR.Valid {
-			d.Block = &units.BlockProfile{
-				MeleeDR:         blockMeleeDR.Float64,
-				RangedDR:        blockRangedDR.Float64,
-				DrainPerSecond:  blockDrainPerSecond.Float64,
-				RecoverySeconds: nullFloatPtr(blockRecoverySeconds),
-			}
-		}
-		if positionalStaminaCostReductionPct.Valid {
-			d.PositionalBonus = &units.PositionalBonus{
-				StaminaCostReductionPct: positionalStaminaCostReductionPct.Float64,
-				MinNearbyAllies:         int(positionalMinAllies.Int64),
-			}
-		}
-		if opportunistBowDamage.Valid {
-			d.OpportunistBow = &units.OpportunistBow{
-				Damage:          opportunistBowDamage.Float64,
-				Range:           opportunistBowRange.Float64,
-				CooldownSeconds: opportunistBowCooldown.Float64,
-			}
-		}
-		if rogueQuiverDamage.Valid {
-			d.RogueQuiver = &units.RogueQuiver{
-				Damage:                rogueQuiverDamage.Float64,
-				Range:                 rogueQuiverRange.Float64,
-				Charges:               int(rogueCharges.Int64),
-				RechargeSeconds:       rogueQuiverRecharge.Float64,
-				ExecuteMultiplier:     rogueQuiverExecuteMult.Float64,
-				ExecuteHpThresholdPct: rogueQuiverExecuteHPPct.Float64,
-			}
-		}
-		if reconViewRadiusPct.Valid {
-			d.Recon = &units.Recon{
-				ViewRadiusBonusPct:    reconViewRadiusPct.Float64,
-				DetectionRadiusMeters: reconDetectionRadius.Float64,
-			}
-		}
-		if fireArrowDamage.Valid {
-			d.FireArrow = &units.FireArrow{
-				Damage:                    fireArrowDamage.Float64,
-				StructureDamageMultiplier: fireArrowStructureMult.Float64,
-				WoodCostPerShot:           int(fireArrowWoodCost.Int64),
-			}
-		}
-		if dashDistance.Valid {
-			d.DashThrust = &units.DashThrust{
-				DistanceMeters:   dashDistance.Float64,
-				WindupSeconds:    dashWindup.Float64,
-				RecoverySeconds:  dashRecovery.Float64,
-				DamageMultiplier: dashDamageMult.Float64,
-				CooldownSeconds:  dashCooldown.Float64,
-			}
-		}
-
-		defs = append(defs, d)
+		defs = append(defs, row.def)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return defs, nil
+}
+
+func (s *Store) getUnitRow(ctx context.Context, typeID uint8) (unitRow, error) {
+	row := s.pool.QueryRow(ctx, `SELECT`+unitColumns+` FROM units WHERE type_id = $1`, typeID)
+	return scanUnitRow(row.Scan)
 }
 
 type BlockPatch struct {
@@ -227,26 +253,26 @@ type DashThrustPatch struct {
 }
 
 type UnitStatsPatch struct {
-	HP                         float64
-	PassiveDR                  float64
-	MoveSpeed                  float64
-	RangeType                  string
-	Range                      float64
-	Damage                     float64
-	WindupSeconds              float64
-	ActiveSeconds              float64
-	RecoverySeconds            float64
-	Stamina                    float64
-	StaminaRegenPerSecond      float64
-	SprintSpeedMultiplier      float64
-	SprintStaminaCostPerSecond float64
-	AnimationSpeed             float64
-	CostWood                   int
-	CostStone                  int
-	CostIron                   int
-	RequiresRoyalGuard         bool
-	Cleave                     bool
-	HasBraceStance             bool
+	HP                         *float64
+	PassiveDR                  *float64
+	MoveSpeed                  *float64
+	RangeType                  *string
+	Range                      *float64
+	Damage                     *float64
+	WindupSeconds              *float64
+	ActiveSeconds              *float64
+	RecoverySeconds            *float64
+	Stamina                    *float64
+	StaminaRegenPerSecond      *float64
+	SprintSpeedMultiplier      *float64
+	SprintStaminaCostPerSecond *float64
+	AnimationSpeed             *float64
+	CostWood                   *int
+	CostStone                  *int
+	CostIron                   *int
+	RequiresRoyalGuard         *bool
+	Cleave                     *bool
+	HasBraceStance             *bool
 
 	ComboSteps               *int
 	ComboWindowSeconds       *float64
@@ -266,65 +292,224 @@ type UnitStatsPatch struct {
 	DashThrust      *DashThrustPatch
 }
 
+// mergeUnitStatsPatch applies patch onto current, leaving every field the
+// patch did not set untouched. Struct-shaped sub-abilities (Block,
+// PositionalBonus, ...) are replaced wholesale when the patch provides them.
+func mergeUnitStatsPatch(current unitRow, patch UnitStatsPatch) unitRow {
+	merged := current
+	d := &merged.def
+
+	if patch.HP != nil {
+		d.HP = *patch.HP
+	}
+	if patch.PassiveDR != nil {
+		d.PassiveDR = *patch.PassiveDR
+	}
+	if patch.MoveSpeed != nil {
+		d.MoveSpeed = *patch.MoveSpeed
+	}
+	if patch.RangeType != nil {
+		d.RangeType = *patch.RangeType
+	}
+	if patch.Range != nil {
+		d.Range = *patch.Range
+	}
+	if patch.Damage != nil {
+		d.Damage = *patch.Damage
+	}
+	if patch.WindupSeconds != nil {
+		d.WindupSeconds = *patch.WindupSeconds
+	}
+	if patch.ActiveSeconds != nil {
+		d.ActiveSeconds = *patch.ActiveSeconds
+	}
+	if patch.RecoverySeconds != nil {
+		d.RecoverySeconds = *patch.RecoverySeconds
+	}
+	if patch.Stamina != nil {
+		d.Stamina = *patch.Stamina
+	}
+	if patch.StaminaRegenPerSecond != nil {
+		d.StaminaRegenPerSecond = *patch.StaminaRegenPerSecond
+	}
+	if patch.SprintSpeedMultiplier != nil {
+		d.SprintSpeedMultiplier = *patch.SprintSpeedMultiplier
+	}
+	if patch.SprintStaminaCostPerSecond != nil {
+		d.SprintStaminaCostPerSecond = *patch.SprintStaminaCostPerSecond
+	}
+	if patch.AnimationSpeed != nil {
+		d.AnimationSpeed = *patch.AnimationSpeed
+	}
+	if patch.CostWood != nil {
+		d.Cost.Wood = *patch.CostWood
+	}
+	if patch.CostStone != nil {
+		d.Cost.Stone = *patch.CostStone
+	}
+	if patch.CostIron != nil {
+		d.Cost.Iron = *patch.CostIron
+	}
+	if patch.RequiresRoyalGuard != nil {
+		d.RequiresRoyalGuard = *patch.RequiresRoyalGuard
+	}
+	if patch.Cleave != nil {
+		d.Cleave = *patch.Cleave
+	}
+	if patch.HasBraceStance != nil {
+		d.HasBraceStance = *patch.HasBraceStance
+	}
+
+	if patch.ComboSteps != nil {
+		merged.comboSteps = patch.ComboSteps
+	}
+	if patch.ComboWindowSeconds != nil {
+		merged.comboWindowSeconds = patch.ComboWindowSeconds
+	}
+	if merged.comboSteps != nil {
+		d.ComboSteps = *merged.comboSteps
+	} else {
+		d.ComboSteps = 0
+	}
+	if merged.comboWindowSeconds != nil {
+		d.ComboWindowSeconds = *merged.comboWindowSeconds
+	} else {
+		d.ComboWindowSeconds = 0
+	}
+
+	if patch.AttackStaminaCost != nil {
+		d.AttackStaminaCost = patch.AttackStaminaCost
+	}
+	if patch.DrawHoldThresholdSeconds != nil {
+		d.DrawHoldThresholdSeconds = patch.DrawHoldThresholdSeconds
+	}
+	if patch.DodgeCostMultiplier != nil {
+		d.DodgeCostMultiplier = patch.DodgeCostMultiplier
+	}
+	if patch.AntiShieldMultiplier != nil {
+		d.AntiShieldMultiplier = patch.AntiShieldMultiplier
+	}
+	if patch.AntiWoodStructureMultiplier != nil {
+		d.AntiWoodStructureMultiplier = patch.AntiWoodStructureMultiplier
+	}
+
+	if patch.Block != nil {
+		d.Block = &units.BlockProfile{
+			MeleeDR: patch.Block.MeleeDR, RangedDR: patch.Block.RangedDR,
+			DrainPerSecond: patch.Block.DrainPerSecond, RecoverySeconds: patch.Block.RecoverySeconds,
+		}
+	}
+	if patch.PositionalBonus != nil {
+		d.PositionalBonus = &units.PositionalBonus{
+			StaminaCostReductionPct: patch.PositionalBonus.StaminaCostReductionPct,
+			MinNearbyAllies:         patch.PositionalBonus.MinNearbyAllies,
+		}
+	}
+	if patch.OpportunistBow != nil {
+		d.OpportunistBow = &units.OpportunistBow{
+			Damage: patch.OpportunistBow.Damage, Range: patch.OpportunistBow.Range,
+			CooldownSeconds: patch.OpportunistBow.CooldownSeconds,
+		}
+	}
+	if patch.RogueQuiver != nil {
+		d.RogueQuiver = &units.RogueQuiver{
+			Damage: patch.RogueQuiver.Damage, Range: patch.RogueQuiver.Range,
+			Charges: patch.RogueQuiver.Charges, RechargeSeconds: patch.RogueQuiver.RechargeSeconds,
+			ExecuteMultiplier: patch.RogueQuiver.ExecuteMultiplier, ExecuteHpThresholdPct: patch.RogueQuiver.ExecuteHpThresholdPct,
+		}
+	}
+	if patch.Recon != nil {
+		d.Recon = &units.Recon{
+			ViewRadiusBonusPct: patch.Recon.ViewRadiusBonusPct, DetectionRadiusMeters: patch.Recon.DetectionRadiusMeters,
+		}
+	}
+	if patch.FireArrow != nil {
+		d.FireArrow = &units.FireArrow{
+			Damage: patch.FireArrow.Damage, StructureDamageMultiplier: patch.FireArrow.StructureDamageMultiplier,
+			WoodCostPerShot: patch.FireArrow.WoodCostPerShot,
+		}
+	}
+	if patch.DashThrust != nil {
+		d.DashThrust = &units.DashThrust{
+			DistanceMeters: patch.DashThrust.DistanceMeters, WindupSeconds: patch.DashThrust.WindupSeconds,
+			RecoverySeconds: patch.DashThrust.RecoverySeconds, DamageMultiplier: patch.DashThrust.DamageMultiplier,
+			CooldownSeconds: patch.DashThrust.CooldownSeconds,
+		}
+	}
+
+	return merged
+}
+
 func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitStatsPatch) error {
-	if err := patch.Validate(); err != nil {
+	current, err := s.getUnitRow(ctx, typeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUnitNotFound
+		}
+		return err
+	}
+
+	merged := mergeUnitStatsPatch(current, patch)
+	d := merged.def
+	if err := units.ValidateDefinition(d); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidUnit, err)
 	}
+
 	var blockMeleeDR, blockRangedDR, blockDrainPerSecond, blockRecoverySeconds *float64
-	if patch.Block != nil {
-		blockMeleeDR = &patch.Block.MeleeDR
-		blockRangedDR = &patch.Block.RangedDR
-		blockDrainPerSecond = &patch.Block.DrainPerSecond
-		blockRecoverySeconds = patch.Block.RecoverySeconds
+	if d.Block != nil {
+		blockMeleeDR = &d.Block.MeleeDR
+		blockRangedDR = &d.Block.RangedDR
+		blockDrainPerSecond = &d.Block.DrainPerSecond
+		blockRecoverySeconds = d.Block.RecoverySeconds
 	}
 
 	var positionalStaminaCostReductionPct *float64
 	var positionalMinNearbyAllies *int
-	if patch.PositionalBonus != nil {
-		positionalStaminaCostReductionPct = &patch.PositionalBonus.StaminaCostReductionPct
-		positionalMinNearbyAllies = &patch.PositionalBonus.MinNearbyAllies
+	if d.PositionalBonus != nil {
+		positionalStaminaCostReductionPct = &d.PositionalBonus.StaminaCostReductionPct
+		positionalMinNearbyAllies = &d.PositionalBonus.MinNearbyAllies
 	}
 
 	var opportunistBowDamage, opportunistBowRange, opportunistBowCooldown *float64
-	if patch.OpportunistBow != nil {
-		opportunistBowDamage = &patch.OpportunistBow.Damage
-		opportunistBowRange = &patch.OpportunistBow.Range
-		opportunistBowCooldown = &patch.OpportunistBow.CooldownSeconds
+	if d.OpportunistBow != nil {
+		opportunistBowDamage = &d.OpportunistBow.Damage
+		opportunistBowRange = &d.OpportunistBow.Range
+		opportunistBowCooldown = &d.OpportunistBow.CooldownSeconds
 	}
 
 	var rogueQuiverDamage, rogueQuiverRange, rogueQuiverRecharge *float64
 	var rogueQuiverExecuteMult, rogueQuiverExecuteHPPct *float64
 	var rogueQuiverCharges *int
-	if patch.RogueQuiver != nil {
-		rogueQuiverDamage = &patch.RogueQuiver.Damage
-		rogueQuiverRange = &patch.RogueQuiver.Range
-		rogueQuiverCharges = &patch.RogueQuiver.Charges
-		rogueQuiverRecharge = &patch.RogueQuiver.RechargeSeconds
-		rogueQuiverExecuteMult = &patch.RogueQuiver.ExecuteMultiplier
-		rogueQuiverExecuteHPPct = &patch.RogueQuiver.ExecuteHpThresholdPct
+	if d.RogueQuiver != nil {
+		rogueQuiverDamage = &d.RogueQuiver.Damage
+		rogueQuiverRange = &d.RogueQuiver.Range
+		rogueQuiverCharges = &d.RogueQuiver.Charges
+		rogueQuiverRecharge = &d.RogueQuiver.RechargeSeconds
+		rogueQuiverExecuteMult = &d.RogueQuiver.ExecuteMultiplier
+		rogueQuiverExecuteHPPct = &d.RogueQuiver.ExecuteHpThresholdPct
 	}
 
 	var reconViewRadiusPct, reconDetectionRadius *float64
-	if patch.Recon != nil {
-		reconViewRadiusPct = &patch.Recon.ViewRadiusBonusPct
-		reconDetectionRadius = &patch.Recon.DetectionRadiusMeters
+	if d.Recon != nil {
+		reconViewRadiusPct = &d.Recon.ViewRadiusBonusPct
+		reconDetectionRadius = &d.Recon.DetectionRadiusMeters
 	}
 
 	var fireArrowDamage, fireArrowStructureMult *float64
 	var fireArrowWoodCost *int
-	if patch.FireArrow != nil {
-		fireArrowDamage = &patch.FireArrow.Damage
-		fireArrowStructureMult = &patch.FireArrow.StructureDamageMultiplier
-		fireArrowWoodCost = &patch.FireArrow.WoodCostPerShot
+	if d.FireArrow != nil {
+		fireArrowDamage = &d.FireArrow.Damage
+		fireArrowStructureMult = &d.FireArrow.StructureDamageMultiplier
+		fireArrowWoodCost = &d.FireArrow.WoodCostPerShot
 	}
 
 	var dashDistance, dashWindup, dashRecovery, dashDamageMult, dashCooldown *float64
-	if patch.DashThrust != nil {
-		dashDistance = &patch.DashThrust.DistanceMeters
-		dashWindup = &patch.DashThrust.WindupSeconds
-		dashRecovery = &patch.DashThrust.RecoverySeconds
-		dashDamageMult = &patch.DashThrust.DamageMultiplier
-		dashCooldown = &patch.DashThrust.CooldownSeconds
+	if d.DashThrust != nil {
+		dashDistance = &d.DashThrust.DistanceMeters
+		dashWindup = &d.DashThrust.WindupSeconds
+		dashRecovery = &d.DashThrust.RecoverySeconds
+		dashDamageMult = &d.DashThrust.DamageMultiplier
+		dashCooldown = &d.DashThrust.CooldownSeconds
 	}
 
 	tag, err := s.pool.Exec(ctx, `
@@ -354,15 +539,15 @@ func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitSta
 		WHERE type_id = $1
 	`,
 		typeID,
-		patch.HP, patch.PassiveDR, patch.MoveSpeed, patch.RangeType, patch.Range, patch.Damage,
-		patch.WindupSeconds, patch.ActiveSeconds, patch.RecoverySeconds,
-		patch.Stamina, patch.StaminaRegenPerSecond,
-		patch.SprintSpeedMultiplier, patch.SprintStaminaCostPerSecond,
-		patch.ComboSteps, patch.ComboWindowSeconds,
-		patch.AnimationSpeed, patch.AttackStaminaCost,
-		patch.DrawHoldThresholdSeconds, patch.DodgeCostMultiplier,
-		patch.CostWood, patch.CostStone, patch.CostIron,
-		patch.RequiresRoyalGuard, patch.Cleave, patch.HasBraceStance,
+		d.HP, d.PassiveDR, d.MoveSpeed, d.RangeType, d.Range, d.Damage,
+		d.WindupSeconds, d.ActiveSeconds, d.RecoverySeconds,
+		d.Stamina, d.StaminaRegenPerSecond,
+		d.SprintSpeedMultiplier, d.SprintStaminaCostPerSecond,
+		merged.comboSteps, merged.comboWindowSeconds,
+		d.AnimationSpeed, d.AttackStaminaCost,
+		d.DrawHoldThresholdSeconds, d.DodgeCostMultiplier,
+		d.Cost.Wood, d.Cost.Stone, d.Cost.Iron,
+		d.RequiresRoyalGuard, d.Cleave, d.HasBraceStance,
 		blockMeleeDR, blockRangedDR, blockDrainPerSecond, blockRecoverySeconds,
 		positionalStaminaCostReductionPct, positionalMinNearbyAllies,
 		opportunistBowDamage, opportunistBowRange, opportunistBowCooldown,
@@ -375,7 +560,7 @@ func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitSta
 		dashDistance, dashWindup,
 		dashRecovery, dashDamageMult,
 		dashCooldown,
-		patch.AntiShieldMultiplier, patch.AntiWoodStructureMultiplier,
+		d.AntiShieldMultiplier, d.AntiWoodStructureMultiplier,
 	)
 	if err != nil {
 		return err
@@ -386,24 +571,18 @@ func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitSta
 	return s.PublishUnitsChanged(ctx)
 }
 
+func nullIntPtr(n sql.NullInt64) *int {
+	if !n.Valid {
+		return nil
+	}
+	v := int(n.Int64)
+	return &v
+}
+
 func nullFloatPtr(n sql.NullFloat64) *float64 {
 	if !n.Valid {
 		return nil
 	}
 	v := n.Float64
 	return &v
-}
-
-func (p UnitStatsPatch) Validate() error {
-	data, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	var u units.Definition
-	if err := json.Unmarshal(data, &u); err != nil {
-		return err
-	}
-	u.ID = "unit"
-	u.Cost = units.Cost{Wood: p.CostWood, Stone: p.CostStone, Iron: p.CostIron}
-	return units.ValidateDefinition(u)
 }

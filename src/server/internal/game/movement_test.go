@@ -1,6 +1,7 @@
 package game
 
 import (
+	"math"
 	"testing"
 
 	"pixi_game_server/internal/config"
@@ -190,13 +191,28 @@ func TestTryAttackCooldownIsTickBasedNotWallClock(t *testing.T) {
 }
 
 const (
-	testSpeed    = int32(4)
-	testElapsed  = int32(2)
-	velocityRepl = true
-	legacyRepl   = false
+	testMilliUnitsPerTick = uint32(4000)
+	testElapsed           = int32(2)
+	velocityRepl          = true
+	legacyRepl            = false
 )
 
+// newClassifyTestWorld builds a GameWorld with just enough state for
+// classifyDelta to run its predictor: unit move/stamina tables and world
+// bounds for the clamp it shares with updatePlayerPosition.
+func newClassifyTestWorld(milliUnitsPerTick uint32, sprintMultiplier float64, maxX, maxY uint16) *GameWorld {
+	gw := &GameWorld{
+		cfg: &config.Config{World: config.WorldConfig{MaxX: maxX, MaxY: maxY}},
+	}
+	gw.unitTablesPtr.Store(&unitTables{
+		moveStats:    map[uint8]moveStat{0: {milliUnitsPerTick: milliUnitsPerTick}},
+		staminaStats: map[uint8]staminaStat{0: {sprintSpeedMultiplier: sprintMultiplier}},
+	})
+	return gw
+}
+
 func TestClassifyDelta(t *testing.T) {
+	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1, 60000, 60000)
 
 	prev := types.PlayerState{ID: 1, X: 100, Y: 100, VX: 1, VY: 0, Direction: protocol.DirectionRight}
 	moved := func(x, y uint16, mut ...func(*types.PlayerState)) types.PlayerState {
@@ -256,7 +272,7 @@ func TestClassifyDelta(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyDelta(tc.st, prev, tc.exists, testElapsed, testSpeed, velocityRepl)
+			got := gw.classifyDelta(tc.st, prev, tc.exists, testElapsed, 0, 0, velocityRepl)
 			if got != tc.want {
 				t.Fatalf("classifyDelta = %+v, want %+v", got, tc.want)
 			}
@@ -265,11 +281,12 @@ func TestClassifyDelta(t *testing.T) {
 }
 
 func TestClassifyDeltaCatchesSingleAxisClamp(t *testing.T) {
+	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1, 6000, 60000)
 
 	prev := types.PlayerState{ID: 1, X: 5996, Y: 100, VX: 1, VY: 1}
 	st := types.PlayerState{ID: 1, X: 6000, Y: 108, VX: 1, VY: 1}
 
-	got := classifyDelta(st, prev, true, testElapsed, testSpeed, velocityRepl)
+	got := gw.classifyDelta(st, prev, true, testElapsed, 0, 0, velocityRepl)
 	if !got.diverged || !got.include {
 		t.Fatalf("single-axis clamp must be sent, got %+v", got)
 	}
@@ -279,14 +296,15 @@ func TestClassifyDeltaCatchesSingleAxisClamp(t *testing.T) {
 }
 
 func TestClassifyDeltaLegacyModeShipsPredictableMovement(t *testing.T) {
+	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1, 60000, 60000)
 	prev := types.PlayerState{ID: 1, X: 100, Y: 100, VX: 1}
 	st := types.PlayerState{ID: 1, X: 108, Y: 100, VX: 1}
 
-	legacy := classifyDelta(st, prev, true, testElapsed, testSpeed, legacyRepl)
+	legacy := gw.classifyDelta(st, prev, true, testElapsed, 0, 0, legacyRepl)
 	if !legacy.include {
 		t.Fatal("legacy mode dropped a positional change")
 	}
-	velocity := classifyDelta(st, prev, true, testElapsed, testSpeed, velocityRepl)
+	velocity := gw.classifyDelta(st, prev, true, testElapsed, 0, 0, velocityRepl)
 	if velocity.include {
 		t.Fatal("velocity mode shipped a record the client can dead-reckon")
 	}
@@ -296,6 +314,7 @@ func TestClassifyDeltaLegacyModeShipsPredictableMovement(t *testing.T) {
 }
 
 func TestClassifyDeltaBucketsAreExclusive(t *testing.T) {
+	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1, 60000, 60000)
 	prev := types.PlayerState{ID: 1, X: 10, Y: 10, VX: 1}
 	for _, st := range []types.PlayerState{
 		{ID: 1, X: 10, Y: 10, VX: 1},
@@ -306,7 +325,7 @@ func TestClassifyDeltaBucketsAreExclusive(t *testing.T) {
 	} {
 		for _, exists := range []bool{true, false} {
 			for _, mode := range []bool{velocityRepl, legacyRepl} {
-				r := classifyDelta(st, prev, exists, testElapsed, testSpeed, mode)
+				r := gw.classifyDelta(st, prev, exists, testElapsed, 0, 0, mode)
 				if r.unpredictable && r.positionOnly {
 					t.Fatalf("st=%+v counted in both composition buckets", st)
 				}
@@ -318,5 +337,41 @@ func TestClassifyDeltaBucketsAreExclusive(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestClassifyDeltaMatchesUpdatePlayerPositionForDiagonalSprintAndRemainder
+// exercises the exact scenario item 3 fixes: a sprinting player moving
+// diagonally, with a carried fractional MoveRemainderMilli, must still be
+// classified as predictable (not diverged) once the predictor uses the same
+// per-player fixed-point integration as updatePlayerPosition.
+func TestClassifyDeltaMatchesUpdatePlayerPositionForDiagonalSprintAndRemainder(t *testing.T) {
+	const milliUnitsPerTick = uint32(3700)
+	const sprintMultiplier = 1.5
+	const prevRemainderMilli = uint32(250)
+	const elapsed = int32(3)
+
+	gw := newClassifyTestWorld(milliUnitsPerTick, sprintMultiplier, 60000, 60000)
+
+	prev := types.PlayerState{ID: 1, X: 1000, Y: 1000, VX: 1, VY: 1, Sprinting: true}
+
+	rateMultiplier := sprintMultiplier / math.Sqrt2
+	milliRate := uint32(math.Round(float64(milliUnitsPerTick) * rateMultiplier))
+	distance := int64((uint64(prevRemainderMilli) + uint64(milliRate)*uint64(elapsed)) / 1000)
+	wantX := uint16(int64(prev.X) + distance)
+	wantY := uint16(int64(prev.Y) + distance)
+
+	st := prev
+	st.X, st.Y = wantX, wantY
+
+	got := gw.classifyDelta(st, prev, true, elapsed, 0, prevRemainderMilli, velocityRepl)
+	if got.diverged {
+		t.Fatalf("diagonal sprinting movement with a carried remainder must be predictable, got %+v", got)
+	}
+	if !got.positionOnly {
+		t.Fatalf("expected a plain position-only delta, got %+v", got)
+	}
+	if got.include {
+		t.Fatal("velocity-replication mode should not resend movement the client can dead-reckon")
 	}
 }

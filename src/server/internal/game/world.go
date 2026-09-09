@@ -18,7 +18,7 @@ import (
 )
 
 type broadcastFuncHolder struct {
-	fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32) bool
+	fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32, computeDur time.Duration) bool
 }
 
 type tickWorkerInput struct {
@@ -40,9 +40,11 @@ type GameWorld struct {
 	broadcastFn           atomic.Value
 	visibilityManager     *systems.VisibilityManager
 	prevStates            map[uint32]types.PlayerState
+	prevMoveRemainder     map[uint32]uint32
 	tickCount             uint32
 	scratchStates         []types.PlayerState
 	scratchChanged        []types.PlayerState
+	scratchRemainders     []uint32
 	scratchSeenIDs        map[uint32]struct{}
 	scratchPtrs           []*types.Player
 	nTickWorkers          int
@@ -74,8 +76,6 @@ type GameWorld struct {
 
 type moveStat struct {
 	milliUnitsPerTick uint32
-
-	avgUnitsPerTick int32
 }
 
 type staminaStat struct {
@@ -125,7 +125,6 @@ func buildUnitTables(tickRate int, unitsPerMeter float64) *unitTables {
 		milli := def.MoveSpeed * unitsPerMeter * 1000 / float64(tickRate)
 		moveStats[def.TypeID] = moveStat{
 			milliUnitsPerTick: uint32(math.Round(milli)),
-			avgUnitsPerTick:   int32(math.Round(milli / 1000)),
 		}
 	}
 
@@ -191,8 +190,10 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 
 		lastDeltaCompositeLog: clock.Now(),
 		prevStates:            make(map[uint32]types.PlayerState, initialCap),
+		prevMoveRemainder:     make(map[uint32]uint32, initialCap),
 		scratchStates:         make([]types.PlayerState, 0, initialCap),
 		scratchChanged:        make([]types.PlayerState, 0, changedCap),
+		scratchRemainders:     make([]uint32, 0, initialCap),
 		scratchSeenIDs:        make(map[uint32]struct{}, initialCap),
 		scratchPtrs:           make([]*types.Player, 0, initialCap),
 	}
@@ -381,7 +382,7 @@ func (gw *GameWorld) gameLoop() {
 	}
 }
 
-func (gw *GameWorld) SetTickBroadcaster(fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32) bool) {
+func (gw *GameWorld) SetTickBroadcaster(fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32, computeDur time.Duration) bool) {
 	gw.broadcastFn.Store(broadcastFuncHolder{fn: fn})
 }
 
@@ -537,8 +538,11 @@ func (gw *GameWorld) tick() {
 	gw.stepMu.Lock()
 	defer gw.stepMu.Unlock()
 
+	tickStart := time.Now()
+
 	gw.scratchStates = gw.scratchStates[:0]
 	gw.scratchChanged = gw.scratchChanged[:0]
+	gw.scratchRemainders = gw.scratchRemainders[:0]
 	clear(gw.scratchSeenIDs)
 
 	nowNano := clock.Now()
@@ -589,6 +593,10 @@ func (gw *GameWorld) tick() {
 		}
 		gw.tickWorkerWg.Wait()
 	}
+	t1 := time.Now()
+	metrics.TickPhaseDuration.WithLabelValues("range").Observe(t1.Sub(t0).Seconds())
+	metrics.TickPhaseDuration.WithLabelValues("world_step").Observe(t1.Sub(t0).Seconds())
+	metrics.TickWorldStepDuration.Observe(t1.Sub(t0).Seconds())
 
 	gw.deltaVectorChanges = 0
 	gw.deltaPositionOnly = 0
@@ -605,17 +613,16 @@ func (gw *GameWorld) tick() {
 	if tickLive.KeyframeDivisor > 0 {
 		keyframeMod = uint32(tickLive.KeyframeDivisor)
 	}
-	tables := gw.unitTables()
-
 	for _, player := range gw.scratchPtrs {
 		st := player.ToState()
 		gw.scratchStates = append(gw.scratchStates, st)
+		gw.scratchRemainders = append(gw.scratchRemainders, player.GetMoveRemainderMilli())
 		gw.scratchSeenIDs[st.ID] = struct{}{}
 
 		if !fullSync {
 			prev, exists := gw.prevStates[st.ID]
-			speed := tables.moveStats[player.GetUnitType()].avgUnitsPerTick
-			reason := classifyDelta(st, prev, exists, elapsedTicks, speed, velocityReplication)
+			prevRemainder := gw.prevMoveRemainder[st.ID]
+			reason := gw.classifyDelta(st, prev, exists, elapsedTicks, player.GetUnitType(), prevRemainder, velocityReplication)
 
 			keyframe := keyframeMod > 0 && !reason.include && st.ID%keyframeMod == gw.keyframeCursor
 
@@ -635,11 +642,6 @@ func (gw *GameWorld) tick() {
 			}
 		}
 	}
-	t1 := time.Now()
-	metrics.TickPhaseDuration.WithLabelValues("range").Observe(t1.Sub(t0).Seconds())
-	metrics.TickPhaseDuration.WithLabelValues("world_step").Observe(t1.Sub(t0).Seconds())
-	metrics.TickWorldStepDuration.Observe(t1.Sub(t0).Seconds())
-
 	t2 := time.Now()
 	metrics.TickPhaseDuration.WithLabelValues("delta").Observe(t2.Sub(t1).Seconds())
 
@@ -655,11 +657,12 @@ func (gw *GameWorld) tick() {
 	metrics.DeltaRatio.Set(float64(changedCount) / float64(len(gw.scratchStates)))
 
 	if holder, ok := gw.broadcastFn.Load().(broadcastFuncHolder); ok {
+		computeDur := time.Since(tickStart)
 		broadcasted := false
 		if fullSync {
-			broadcasted = holder.fn(gw.scratchStates, nil, true, worldTick)
+			broadcasted = holder.fn(gw.scratchStates, nil, true, worldTick, computeDur)
 		} else {
-			broadcasted = holder.fn(gw.scratchStates, gw.scratchChanged, false, worldTick)
+			broadcasted = holder.fn(gw.scratchStates, gw.scratchChanged, false, worldTick, computeDur)
 		}
 		if broadcasted {
 			gw.reportDeltaComposition()
@@ -671,10 +674,12 @@ func (gw *GameWorld) tick() {
 			for id := range gw.prevStates {
 				if _, seen := gw.scratchSeenIDs[id]; !seen {
 					delete(gw.prevStates, id)
+					delete(gw.prevMoveRemainder, id)
 				}
 			}
-			for _, st := range gw.scratchStates {
+			for i, st := range gw.scratchStates {
 				gw.prevStates[st.ID] = st
+				gw.prevMoveRemainder[st.ID] = gw.scratchRemainders[i]
 			}
 		}
 	}
@@ -691,7 +696,13 @@ type deltaReason struct {
 	positionOnly bool
 }
 
-func classifyDelta(st, prev types.PlayerState, exists bool, elapsedTicks, speed int32, velocityReplication bool) deltaReason {
+// classifyDelta predicts where st should be, starting from the last
+// broadcast state prev, using the exact same fixed-point speed integration
+// as updatePlayerPosition (per-unit rate, diagonal 1/sqrt2 factor, sprint
+// multiplier and the carried MoveRemainderMilli) for this specific player.
+// A mismatch means the client's own dead-reckoning would have diverged too,
+// so the new state must be sent rather than left to be predicted.
+func (gw *GameWorld) classifyDelta(st, prev types.PlayerState, exists bool, elapsedTicks int32, unitType uint8, prevRemainderMilli uint32, velocityReplication bool) deltaReason {
 	if !exists {
 		return deltaReason{include: true, unpredictable: true}
 	}
@@ -700,8 +711,28 @@ func classifyDelta(st, prev types.PlayerState, exists bool, elapsedTicks, speed 
 		st.State != prev.State || st.Direction != prev.Direction || st.Sprinting != prev.Sprinting ||
 		st.ComboStep != prev.ComboStep
 
-	predictedX := int32(prev.X) + int32(prev.VX)*speed*elapsedTicks
-	predictedY := int32(prev.Y) + int32(prev.VY)*speed*elapsedTicks
+	predictedX, predictedY := int32(prev.X), int32(prev.Y)
+	if elapsedTicks > 0 && (prev.VX != 0 || prev.VY != 0) {
+		tables := gw.unitTables()
+		stat := tables.staminaStats[unitType]
+		milliRate := tables.moveStats[unitType].milliUnitsPerTick
+
+		rateMultiplier := 1.0
+		if prev.Sprinting {
+			rateMultiplier *= stat.sprintSpeedMultiplier
+		}
+		if prev.VX != 0 && prev.VY != 0 {
+			rateMultiplier *= 1 / math.Sqrt2
+		}
+		if rateMultiplier != 1.0 {
+			milliRate = uint32(math.Round(float64(milliRate) * rateMultiplier))
+		}
+
+		totalMilli := uint64(prevRemainderMilli) + uint64(milliRate)*uint64(elapsedTicks)
+		distance := int64(totalMilli / 1000)
+		px, py := gw.integrateMovement(prev.X, prev.Y, prev.VX, prev.VY, distance)
+		predictedX, predictedY = int32(px), int32(py)
+	}
 	diverged := int32(st.X) != predictedX || int32(st.Y) != predictedY
 	positionMoved := st.X != prev.X || st.Y != prev.Y
 

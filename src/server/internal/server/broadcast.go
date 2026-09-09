@@ -182,21 +182,20 @@ func (s *Server) sendPong(conn *Connection, nonce uint32) {
 
 func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCreatedNs int64) bool {
 	live := s.live.Load()
-	if live.FanoutQueueShedDepth > 0 {
-		depth := len(conn.writeCh)
-		if depth >= live.FanoutQueueShedDepth {
-			metrics.WSWriteQueueDepth.Observe(float64(depth))
-
-			frame.release()
-			metrics.BroadcastsShed.Inc()
-			return false
-		}
+	depth := len(conn.writeCh)
+	metrics.WSWriteQueueDepth.Observe(float64(depth))
+	if live.FanoutQueueShedDepth > 0 && depth >= live.FanoutQueueShedDepth {
+		frame.release()
+		metrics.BroadcastsShed.Inc()
+		atomic.AddInt32(&conn.fanoutDrops, 1)
+		return false
 	}
 
 	if !atomic.CompareAndSwapInt32(&conn.pendingBroadcast, 0, 1) {
 
 		frame.release()
 		metrics.BroadcastsShed.Inc()
+		atomic.AddInt32(&conn.fanoutDrops, 1)
 		return false
 	}
 
@@ -300,12 +299,16 @@ func (s *Server) startWriteLoop(c *Connection) {
 				metrics.WSWriteBatchJobs.Observe(float64(count))
 
 				writeEndNs := clock.Now()
+				writeResultLabel := "success"
+				if err != nil {
+					writeResultLabel = "error"
+				}
 				for i := 0; i < count; i++ {
 					if jobs[i].stateCreatedNs == 0 {
 						continue
 					}
 					ageNs := writeEndNs - jobs[i].stateCreatedNs
-					metrics.WorldStateAgeAtWriteEnd.Observe(time.Duration(ageNs).Seconds())
+					metrics.WorldStateAgeAtWriteEnd.WithLabelValues(writeResultLabel).Observe(time.Duration(ageNs).Seconds())
 					atomic.StoreInt64(&c.lastWriteAgeNs, ageNs)
 					atomic.StoreInt64(&c.lastWriteObservedNs, writeEndNs)
 				}
@@ -737,7 +740,7 @@ func shouldEmitFrame(fullSync bool, changedCount int, velocityReplication bool) 
 	return fullSync || changedCount > 0 || velocityReplication
 }
 
-func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32) bool {
+func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32, computeDur time.Duration) bool {
 	if len(allPlayers) == 0 {
 		return false
 	}
@@ -765,7 +768,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.BroadcastTargets.Observe(float64(n))
 	s.connectionsMu.RUnlock()
 
-	s.enqueueAuthoritativeMovementAcks(conns)
+	ackBytesSent := s.enqueueAuthoritativeMovementAcks(conns)
 	for _, conn := range conns {
 		if conn.needsFullState.Load() || !conn.hasQueuedState {
 			hasState = true
@@ -855,7 +858,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 
 	enqueueStart := time.Now()
 	dropped := 0
-	usedBytes := 0
+	usedBytes := ackBytesSent
 	for _, conn := range recipients {
 		requested := conn.needsFullState.Swap(false)
 		needFull := fullSync || requested || !conn.hasQueuedState || conn.lastQueuedStateSeq+1 != stateSequence
@@ -901,7 +904,7 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	metrics.TickFanoutDuration.Observe(fanoutDur.Seconds())
 	s.tuneRecipientLimit(n, m, overdue, dropped, fanoutDur)
 
-	s.tuneTimeDilation(pressure, fanoutDur, s.gameWorld.GetTickDuration())
+	s.tuneTimeDilation(pressure, fanoutDur, computeDur)
 
 	if fanoutDur > 20*time.Millisecond {
 		nowNano := clock.Now()
@@ -961,6 +964,8 @@ func (s *Server) sendDirect(conn *Connection, data []byte) {
 	}
 }
 
+const movementAckFrameBytes = 15
+
 func (s *Server) sendMovementAck(conn *Connection, playerID uint32, x, y uint16, inputSequence uint32) bool {
 	if conn.enqueue(writeJob{ack: true, ackID: playerID, ackX: x, ackY: y, ackSeq: inputSequence, timeout: directWriteTimeout}) {
 		return true
@@ -969,7 +974,11 @@ func (s *Server) sendMovementAck(conn *Connection, playerID uint32, x, y uint16,
 	return false
 }
 
-func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) {
+// enqueueAuthoritativeMovementAcks sends pending movement ACKs and returns
+// the number of bytes enqueued, so callers can charge it against the same
+// per-tick fanout byte budget as regular broadcast frames.
+func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) int {
+	sentBytes := 0
 	for _, conn := range conns {
 		sequence := conn.player.GetAppliedInputSequence()
 		if sequence == atomic.LoadUint32(&conn.lastMovementAckSeq) {
@@ -978,8 +987,10 @@ func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) {
 		x, y := conn.player.GetMovementAckPosition()
 		if s.sendMovementAck(conn, conn.player.ID, x, y, sequence) {
 			atomic.StoreUint32(&conn.lastMovementAckSeq, sequence)
+			sentBytes += movementAckFrameBytes
 		}
 	}
+	return sentBytes
 }
 
 func (s *Server) sendWelcome(conn *Connection) {

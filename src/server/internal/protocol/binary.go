@@ -62,11 +62,11 @@ func playerFlags(state uint8, sprinting bool, comboStep uint8, direction uint8) 
 	return flags
 }
 
-const ProtocolVersion = 12
+const ProtocolVersion = 13
 
 const worldStateHeaderSize = 15
 
-const maxPlayerRecordSize = 12
+const maxPlayerRecordSize = 16
 
 func appendUvarint(dst []byte, v uint32) []byte {
 	for v >= 0x80 {
@@ -113,6 +113,7 @@ func appendWorldState(dst []byte, messageType uint8, players []types.PlayerState
 		dst = append(dst, uint8(player.VX), uint8(player.VY))
 
 		dst = append(dst, playerFlags(player.State, player.Sprinting, player.ComboStep, player.Direction))
+		dst = binary.LittleEndian.AppendUint32(dst, player.AttackStartTick)
 	}
 
 	return dst
