@@ -128,26 +128,6 @@ func TestDecodePing(t *testing.T) {
 	}
 }
 
-func TestEncodeMovementAck(t *testing.T) {
-	bp := &BinaryProtocol{}
-	got := bp.EncodeMovementAck(5, 100, 200, 9)
-	if len(got) != 13 || got[0] != MessageMovementAck {
-		t.Fatalf("ACK prefix/length = %v/%d", got[0], len(got))
-	}
-	if id := binary.LittleEndian.Uint32(got[1:5]); id != 5 {
-		t.Fatalf("ACK player id = %d", id)
-	}
-	if x := binary.LittleEndian.Uint16(got[5:7]); x != 100 {
-		t.Fatalf("ACK x = %d", x)
-	}
-	if y := binary.LittleEndian.Uint16(got[7:9]); y != 200 {
-		t.Fatalf("ACK y = %d", y)
-	}
-	if seq := binary.LittleEndian.Uint32(got[9:13]); seq != 9 {
-		t.Fatalf("ACK input sequence = %d", seq)
-	}
-}
-
 func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, []types.PlayerState) {
 	t.Helper()
 	if len(buf) < worldStateHeaderSize {

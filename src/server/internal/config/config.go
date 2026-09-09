@@ -2,6 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
+	"net"
 	"os"
 	"strconv"
 	"time"
@@ -15,10 +18,12 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port      int
-	Host      string
-	Workers   int
-	StaticDir string
+	ManagementAddr string
+	EnablePprof    bool
+	AdminToken     string
+	Port           int
+	Host           string
+	StaticDir      string
 }
 
 type GameConfig struct {
@@ -124,6 +129,12 @@ type clientConfigView struct {
 }
 
 func Build(gs *GameSettings) (*Config, []byte, error) {
+	if gs == nil {
+		return nil, nil, fmt.Errorf("game settings are required")
+	}
+	if err := validateEnv(); err != nil {
+		return nil, nil, err
+	}
 	tickRate := getEnvInt("TICK_RATE", gs.TickRate)
 	syncIntervalSec := getEnvInt("SYNC_INTERVAL_SEC", gs.SyncIntervalSec)
 	unitsPerMeter := getEnvFloat("UNITS_PER_METER", gs.UnitsPerMeter)
@@ -134,12 +145,26 @@ func Build(gs *GameSettings) (*Config, []byte, error) {
 	spawnMinY := getEnvInt("SPAWN_MIN_Y", gs.SpawnMinY)
 	spawnMaxY := getEnvInt("SPAWN_MAX_Y", gs.SpawnMaxY)
 
+	if tickRate < 1 || tickRate > 240 || syncIntervalSec < 1 || syncIntervalSec > 3600 {
+		return nil, nil, fmt.Errorf("tick rate must be 1..240 and sync interval 1..3600 seconds")
+	}
+	if worldWidth < 1 || worldWidth > 65535 || worldHeight < 1 || worldHeight > 65535 {
+		return nil, nil, fmt.Errorf("world dimensions must be 1..65535")
+	}
+	if spawnMinX < 0 || spawnMinY < 0 || spawnMaxX <= spawnMinX || spawnMaxY <= spawnMinY || spawnMaxX > worldWidth || spawnMaxY > worldHeight {
+		return nil, nil, fmt.Errorf("spawn area must be nonempty and inside the world")
+	}
+	if !finiteRange(gs.PlayerBaseScale, 0.01, 100) {
+		return nil, nil, fmt.Errorf("invalid player base scale")
+	}
 	cfg := &Config{
 		Server: ServerConfig{
-			Port:      getEnvInt("PORT", 8108),
-			Host:      getEnvString("HOST", "0.0.0.0"),
-			Workers:   getEnvInt("WORKERS", 0),
-			StaticDir: getEnvString("STATIC_DIR", "../dist"),
+			ManagementAddr: getEnvString("MANAGEMENT_ADDR", "127.0.0.1:8110"),
+			EnablePprof:    getEnvBool("ENABLE_PPROF", false),
+			AdminToken:     os.Getenv("ADMIN_API_TOKEN"),
+			Port:           getEnvInt("PORT", 8108),
+			Host:           getEnvString("HOST", "0.0.0.0"),
+			StaticDir:      getEnvString("STATIC_DIR", "../dist"),
 		},
 
 		Game: GameConfig{
@@ -188,6 +213,9 @@ func Build(gs *GameSettings) (*Config, []byte, error) {
 		},
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, nil, err
+	}
 	var client clientConfigView
 	client.Network.TickRate = tickRate
 	client.Network.SyncInterval = syncIntervalSec * 1000
@@ -248,4 +276,70 @@ func getEnvFloat(key string, defaultValue float64) float64 {
 		}
 	}
 	return defaultValue
+}
+
+func finiteRange(v, lo, hi float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= lo && v <= hi
+}
+
+func (c *Config) Validate() error {
+	if c.Game.TickRate < 1 || c.Game.TickRate > 240 || c.Game.SyncInterval < time.Second || c.Game.SyncInterval > time.Hour {
+		return fmt.Errorf("invalid game timing")
+	}
+	if !finiteRange(c.Game.UnitsPerMeter, 0.001, 1000) {
+		return fmt.Errorf("units per meter must be 0.001..1000")
+	}
+	if c.World.Width == 0 || c.World.Height == 0 || c.World.MaxX != c.World.Width || c.World.MaxY != c.World.Height {
+		return fmt.Errorf("invalid world bounds")
+	}
+	if c.Server.Port < 0 || c.Server.Port > 65535 {
+		return fmt.Errorf("invalid port")
+	}
+	if c.Server.ManagementAddr != "" {
+		if _, _, err := net.SplitHostPort(c.Server.ManagementAddr); err != nil {
+			return fmt.Errorf("invalid management address: %w", err)
+		}
+	}
+	for _, value := range []int{c.Net.FanoutDropStreak, c.Net.FanoutFairDebtMax, c.Net.FanoutFairDebtInc, c.Net.FanoutFairDebtDec} {
+		if value < 0 || value > 100000 {
+			return fmt.Errorf("fanout counters must be 0..100000 before conversion")
+		}
+	}
+	return BuildLiveNetConfig(c).Validate()
+}
+
+func validateEnv() error {
+	for _, key := range []string{"FANOUT_CRITICAL_BOOST_NS", "FANOUT_CRITICAL_WINDOW_MS", "FANOUT_DROP_STREAK", "FANOUT_FAIR_DEBT_DEC", "FANOUT_FAIR_DEBT_INC", "FANOUT_FAIR_DEBT_MAX", "FANOUT_FAIR_DEBT_WEIGHT_NS", "FANOUT_MAX_BROADCAST_BYTES_PER_TICK", "FANOUT_MAX_RECIPIENTS_PER_TICK", "FANOUT_MIN_RECIPIENTS_PER_TICK", "FANOUT_QUEUE_SHED_DEPTH", "FANOUT_ROUND_ROBIN_WEIGHT_NS", "FANOUT_TARGET_MS", "IP_CONN_BURST", "KEYFRAME_DIVISOR", "MAX_CONNECTIONS", "PORT", "RATE_LIMIT_BURST", "RATE_LIMIT_MSG_SEC", "SPAWN_MAX_X", "SPAWN_MAX_Y", "SPAWN_MIN_X", "SPAWN_MIN_Y", "SYNC_INTERVAL_SEC", "TICK_RATE", "WORKERS", "WORLD_HEIGHT", "WORLD_STATE_ACTIVE_STALENESS_MS", "WORLD_STATE_ACTIVE_WINDOW_MS", "WORLD_STATE_IDLE_STALENESS_MS", "WORLD_WIDTH", "WRITE_BATCH_SIZE"} {
+		value := os.Getenv(key)
+		if value == "" {
+			continue
+		}
+		v, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || v < -1000000000000 || v > 1000000000000 {
+			return fmt.Errorf("invalid integer for %s", key)
+		}
+		if len(key) >= 3 && key[len(key)-3:] == "_MS" && (v < 0 || v > 86400000) {
+			return fmt.Errorf("invalid duration for %s", key)
+		}
+	}
+	for _, key := range []string{"IP_CONN_RATE", "UNITS_PER_METER"} {
+		value := os.Getenv(key)
+		if value == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("invalid number for %s", key)
+		}
+	}
+	for _, key := range []string{"ENABLE_PPROF", "VELOCITY_REPLICATION"} {
+		value := os.Getenv(key)
+		if value == "" {
+			continue
+		}
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("invalid boolean for %s", key)
+		}
+	}
+	return nil
 }

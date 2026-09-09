@@ -3,13 +3,16 @@ package liveconfig
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/units"
 )
 
 var ErrUnitNotFound = errors.New("unit not found")
+var ErrInvalidUnit = errors.New("invalid unit")
 
 func (s *Store) LoadGameSettings(ctx context.Context) (*config.GameSettings, error) {
 	var gs config.GameSettings
@@ -264,6 +267,9 @@ type UnitStatsPatch struct {
 }
 
 func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitStatsPatch) error {
+	if err := patch.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUnit, err)
+	}
 	var blockMeleeDR, blockRangedDR, blockDrainPerSecond, blockRecoverySeconds *float64
 	if patch.Block != nil {
 		blockMeleeDR = &patch.Block.MeleeDR
@@ -386,4 +392,18 @@ func nullFloatPtr(n sql.NullFloat64) *float64 {
 	}
 	v := n.Float64
 	return &v
+}
+
+func (p UnitStatsPatch) Validate() error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	var u units.Definition
+	if err := json.Unmarshal(data, &u); err != nil {
+		return err
+	}
+	u.ID = "unit"
+	u.Cost = units.Cost{Wood: p.CostWood, Stone: p.CostStone, Iron: p.CostIron}
+	return units.ValidateDefinition(u)
 }

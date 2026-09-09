@@ -24,8 +24,8 @@ type VisibilityManager struct {
 }
 
 func NewVisibilityManager(worldWidth, worldHeight, gridSize uint16) *VisibilityManager {
-	gridW := (worldWidth + gridSize - 1) / gridSize
-	gridH := (worldHeight + gridSize - 1) / gridSize
+	gridW := uint16((uint32(worldWidth) + uint32(gridSize) - 1) / uint32(gridSize))
+	gridH := uint16((uint32(worldHeight) + uint32(gridSize) - 1) / uint32(gridSize))
 
 	vm := &VisibilityManager{
 		gridSize:   gridSize,

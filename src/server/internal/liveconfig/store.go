@@ -1,4 +1,3 @@
-
 package liveconfig
 
 import (
@@ -112,7 +111,22 @@ func (s *Store) getKey(ctx context.Context, key string) (string, bool, error) {
 }
 
 func (s *Store) SetKey(ctx context.Context, key, value string) error {
-	_, err := s.pool.Exec(ctx, `
+	settings, err := s.LoadGameSettings(ctx)
+	if err != nil {
+		return err
+	}
+	cfg, _, err := config.Build(settings)
+	if err != nil {
+		return err
+	}
+	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
+	if err := s.LoadInto(ctx, live); err != nil {
+		return err
+	}
+	if err := live.Update(func(c *config.LiveNetConfig) error { return c.ApplyKey(key, value) }); err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
 		INSERT INTO `+tableName+` (key, value, updated_at) VALUES ($1, $2, now())
 		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
 	`, key, value)
@@ -127,14 +141,14 @@ func (s *Store) LoadInto(ctx context.Context, live *config.LiveNet) error {
 	if err != nil {
 		return err
 	}
-	live.Update(func(c *config.LiveNetConfig) {
+	return live.Update(func(c *config.LiveNetConfig) error {
 		for key, value := range rows {
 			if err := c.ApplyKey(key, value); err != nil {
-				slog.Warn("live config: skipping bad row", "key", key, "value", value, "error", err)
+				return err
 			}
 		}
+		return nil
 	})
-	return nil
 }
 
 func (s *Store) Watch(ctx context.Context, live *config.LiveNet) {
@@ -159,11 +173,10 @@ func (s *Store) Watch(ctx context.Context, live *config.LiveNet) {
 			if !found {
 				continue
 			}
-			live.Update(func(c *config.LiveNetConfig) {
-				if err := c.ApplyKey(key, value); err != nil {
-					slog.Warn("live config: ignoring unknown/invalid key", "key", key, "value", value, "error", err)
-				}
-			})
+			if err := live.Update(func(c *config.LiveNetConfig) error { return c.ApplyKey(key, value) }); err != nil {
+				slog.Error("live config rejected", "key", key, "error", err)
+				continue
+			}
 			slog.Info("live config updated", "key", key, "value", value)
 		}
 	}

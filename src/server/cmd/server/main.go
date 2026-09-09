@@ -68,12 +68,15 @@ func main() {
 	slog.Info("server starting",
 		"port", cfg.Server.Port,
 		"tick_rate_hz", cfg.Game.TickRate,
-		"workers", cfg.Server.Workers,
 		"max_connections", cfg.Net.MaxConnections,
 		"unit_count", len(unitDefs),
 	)
 
-	gameServer := server.New(cfg)
+	gameServer, err := server.New(cfg)
+	if err != nil {
+		slog.Error("invalid server config", "error", err)
+		os.Exit(1)
+	}
 	gameServer.SetStaticBlobs(gameConfigJSON, unitsJSON)
 
 	if os.Getenv("ENABLE_UNIT_ADMIN_API") == "true" {
@@ -81,15 +84,18 @@ func main() {
 	}
 
 	if err := liveStore.EnsureSchema(liveConfigCtx); err != nil {
-		slog.Error("live config: failed to ensure schema", "error", err)
-	} else if err := liveStore.Seed(liveConfigCtx, gameServer.Live().Load().KeyValues()); err != nil {
-		slog.Error("live config: failed to seed net-config defaults", "error", err)
-	} else if err := liveStore.LoadInto(liveConfigCtx, gameServer.Live()); err != nil {
-		slog.Error("live config: failed to load net-config from database", "error", err)
-	} else {
-		slog.Info("live net-config loaded from database, watching for changes")
-		go liveStore.Watch(liveConfigCtx, gameServer.Live())
+		slog.Error("live config schema failed", "error", err)
+		os.Exit(1)
 	}
+	if err := liveStore.Seed(liveConfigCtx, gameServer.Live().Load().KeyValues()); err != nil {
+		slog.Error("live config seed failed", "error", err)
+		os.Exit(1)
+	}
+	if err := liveStore.LoadInto(liveConfigCtx, gameServer.Live()); err != nil {
+		slog.Error("live config rejected", "error", err)
+		os.Exit(1)
+	}
+	go liveStore.Watch(liveConfigCtx, gameServer.Live())
 
 	go liveStore.WatchUnits(liveConfigCtx, func() {
 		defs, err := liveStore.LoadUnitDefinitions(liveConfigCtx)

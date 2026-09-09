@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -176,6 +177,10 @@ func (s *Server) handleAdminUpdateUnit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.adminStore.UpdateUnitStats(r.Context(), uint8(typeID64), patch); err != nil {
+		if errors.Is(err, liveconfig.ErrInvalidUnit) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err == liveconfig.ErrUnitNotFound {
 			http.Error(w, "unit not found", http.StatusNotFound)
 			return

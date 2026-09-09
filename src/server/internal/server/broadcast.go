@@ -3,6 +3,7 @@ package server
 import (
 	"container/heap"
 	"encoding/binary"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -46,9 +47,10 @@ func wsFrameSlice(slot []byte) []byte {
 }
 
 type tickFrame struct {
-	data  []byte
-	frame []byte
-	refs  int32
+	payloadSize int
+	data        []byte
+	frame       []byte
+	refs        int32
 }
 
 func (f *tickFrame) release() {
@@ -117,7 +119,6 @@ func (h *topKMinHeap) Pop() any {
 }
 
 const (
-
 	broadcastWriteTimeout = 100 * time.Millisecond
 
 	directWriteTimeout = 30 * time.Millisecond
@@ -127,8 +128,6 @@ const (
 
 	dilationDebounceSevereTicks   = 2
 	dilationDebounceModerateTicks = 4
-
-	maxWriteFailures = 150
 
 	writeChanSize = 32
 
@@ -176,9 +175,7 @@ func writeJobFrame(job *writeJob, ackBuffer *[15]byte) []byte {
 }
 
 func (s *Server) sendPong(conn *Connection, nonce uint32) {
-	select {
-	case conn.writeCh <- writeJob{pong: true, pongNonce: nonce, timeout: directWriteTimeout}:
-	default:
+	if !conn.enqueue(writeJob{pong: true, pongNonce: nonce, timeout: directWriteTimeout}) {
 		metrics.BroadcastsDropped.Inc()
 	}
 }
@@ -200,22 +197,21 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 
 		frame.release()
 		metrics.BroadcastsShed.Inc()
-		return true
+		return false
 	}
 
 	atomic.StoreInt64(&conn.pendingStateNs, stateCreatedNs)
-	select {
-	case conn.writeCh <- writeJob{
+	if conn.enqueue(writeJob{
 		frame:          frame,
 		stateCreatedNs: stateCreatedNs,
 		enqueuedNs:     clock.Now(),
 		timeout:        broadcastWriteTimeout,
-	}:
+	}) {
 		if atomic.LoadInt32(&conn.fanoutDrops) != 0 {
 			atomic.StoreInt32(&conn.fanoutDrops, 0)
 		}
 		return true
-	default:
+	} else {
 		atomic.StoreInt64(&conn.pendingStateNs, 0)
 		atomic.StoreInt32(&conn.pendingBroadcast, 0)
 		frame.release()
@@ -228,7 +224,10 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 }
 
 func (s *Server) startWriteLoop(c *Connection) {
+	s.workers.Add(1)
 	go func() {
+		defer s.workers.Done()
+		defer func() { s.cleanupConnection(c); drainWriteCh(c.writeCh) }()
 		batchSize := s.live.Load().WriteBatchSize
 		if batchSize < 1 {
 			batchSize = 1
@@ -241,6 +240,9 @@ func (s *Server) startWriteLoop(c *Connection) {
 		ackBuffers := make([][15]byte, batchSize)
 
 		for {
+			if c.ctx.Err() != nil {
+				return
+			}
 			select {
 			case first := <-c.writeCh:
 				jobs[0] = first
@@ -274,17 +276,25 @@ func (s *Server) startWriteLoop(c *Connection) {
 					metrics.WorldStateQueueDelay.Observe(queueDelay.Seconds())
 					metrics.WorldStateAgeAtWriteStart.Observe(stateAge.Seconds())
 				}
-				c.rawConn.SetWriteDeadline(time.Now().Add(maxTimeout))
-
+				var expected int64
+				for _, frame := range frames[:count] {
+					expected += int64(len(frame))
+				}
+				err := c.rawConn.SetWriteDeadline(time.Now().Add(maxTimeout))
 				var n int64
-				var err error
-				if count == 1 {
+				if err == nil && count == 1 {
 					var nn int
 					nn, err = c.rawConn.Write(frames[0])
 					n = int64(nn)
-				} else {
+				} else if err == nil {
 					buffers := net.Buffers(frames[:count])
 					n, err = buffers.WriteTo(c.rawConn)
+				}
+				if err == nil && n != expected {
+					err = io.ErrShortWrite
+				}
+				if n > 0 {
+					metrics.BytesSent.Add(float64(n))
 				}
 				metrics.WSWriteBatchDuration.Observe(time.Since(writeStart).Seconds())
 				metrics.WSWriteBatchJobs.Observe(float64(count))
@@ -299,15 +309,10 @@ func (s *Server) startWriteLoop(c *Connection) {
 					atomic.StoreInt64(&c.lastWriteAgeNs, ageNs)
 					atomic.StoreInt64(&c.lastWriteObservedNs, writeEndNs)
 				}
-				fatalWriteFailure := false
+				fatalWriteFailure := err != nil
 				if err != nil {
 					metrics.WSWriteErrors.Inc()
-					if atomic.AddInt32(&c.writeFailures, 1) >= maxWriteFailures {
-						fatalWriteFailure = true
-					}
 				} else {
-					atomic.StoreInt32(&c.writeFailures, 0)
-					metrics.BytesSent.Add(float64(n))
 					for i := 0; i < count; i++ {
 						if jobs[i].stateCreatedNs == 0 {
 							continue
@@ -327,9 +332,6 @@ func (s *Server) startWriteLoop(c *Connection) {
 				}
 
 				if fatalWriteFailure {
-					go s.cleanupConnection(c)
-
-					drainWriteCh(c.writeCh)
 					return
 				}
 
@@ -764,6 +766,12 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	s.connectionsMu.RUnlock()
 
 	s.enqueueAuthoritativeMovementAcks(conns)
+	for _, conn := range conns {
+		if conn.needsFullState.Load() || !conn.hasQueuedState {
+			hasState = true
+			break
+		}
+	}
 
 	if !hasState {
 		releaseConnSlice(conns, buf)
@@ -773,19 +781,15 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	t0 := time.Now()
 
 	stateSequence := atomic.AddUint32(&s.worldStateSeq, 1)
-	f := broadcastFramePool.Get().(*tickFrame)
-	f.data = f.data[:0]
-
-	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-	dilationBps := s.currentDilationBps()
-	if fullSync {
-		f.data = s.protocol.AppendGameState(f.data, allPlayers, stateSequence, worldTick, dilationBps)
-		s.broadcastUnitRoster()
-	} else {
-		f.data = s.protocol.AppendDeltaGameState(f.data, changed, stateSequence, worldTick, dilationBps)
-	}
-	f.frame = wsFrameSlice(f.data)
-	payloadSize := len(f.data) - 10
+	f := s.encodeTickFrame(allPlayers, changed, fullSync, stateSequence, worldTick)
+	defer f.release()
+	var recovery *tickFrame
+	defer func() {
+		if recovery != nil {
+			recovery.release()
+		}
+	}()
+	payloadSize := f.payloadSize
 	if payloadSize > 0 {
 		metrics.BroadcastPayloadBytes.Observe(float64(payloadSize))
 	}
@@ -840,9 +844,6 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		}
 		releaseConnSlice(conns, buf)
 
-		f.data = f.data[:0]
-		f.frame = nil
-		broadcastFramePool.Put(f)
 		return false
 	}
 
@@ -852,13 +853,37 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		metrics.BroadcastDeferred.Add(float64(deferred))
 	}
 
-	atomic.StoreInt32(&f.refs, int32(m))
-
 	enqueueStart := time.Now()
 	dropped := 0
+	usedBytes := 0
 	for _, conn := range recipients {
-		if !s.enqueueBroadcastJob(conn, f, sentAtNs) {
+		requested := conn.needsFullState.Swap(false)
+		needFull := fullSync || requested || !conn.hasQueuedState || conn.lastQueuedStateSeq+1 != stateSequence
+		frame := f
+		if needFull && !fullSync {
+			if recovery == nil {
+				recovery = s.encodeTickFrame(allPlayers, nil, true, stateSequence, worldTick)
+			}
+			frame = recovery
+		}
+		if budget := live.FanoutMaxBroadcastBytesPerTick; budget > 0 && usedBytes > 0 && usedBytes+len(frame.frame) > budget {
+			conn.needsFullState.Store(true)
 			dropped++
+			continue
+		}
+		atomic.AddInt32(&frame.refs, 1)
+		if s.enqueueBroadcastJob(conn, frame, sentAtNs) {
+			usedBytes += len(frame.frame)
+			conn.lastQueuedStateSeq = stateSequence
+			conn.hasQueuedState = true
+		} else {
+			conn.needsFullState.Store(true)
+			dropped++
+		}
+	}
+	for _, conn := range conns {
+		if !conn.hasQueuedState || conn.lastQueuedStateSeq != stateSequence {
+			conn.needsFullState.Store(true)
 		}
 	}
 	enqueueDur := time.Since(enqueueStart)
@@ -896,72 +921,52 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	return true
 }
 
-func (s *Server) broadcastEvent(frameBytes []byte) {
-	s.connectionsMu.RLock()
-	for _, conn := range s.connections {
-		select {
-		case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
-		default:
-			metrics.BroadcastsDropped.Inc()
-		}
+func (s *Server) encodeTickFrame(all, changed []types.PlayerState, full bool, sequence, tick uint32) *tickFrame {
+	f := broadcastFramePool.Get().(*tickFrame)
+	f.data = f.data[:0]
+	if full {
+		roster := s.protocol.EncodeUnitRoster(s.gameWorld.GetAllUnitAssignments())
+		frame, _ := ws.CompileFrame(ws.NewBinaryFrame(roster))
+		f.data = append(f.data, frame...)
 	}
-	s.connectionsMu.RUnlock()
+	offset := len(f.data)
+	f.data = append(f.data, make([]byte, 10)...)
+	if full {
+		f.data = s.protocol.AppendGameState(f.data, all, sequence, tick, s.currentDilationBps())
+	} else {
+		f.data = s.protocol.AppendDeltaGameState(f.data, changed, sequence, tick, s.currentDilationBps())
+	}
+	f.payloadSize = len(f.data) - offset - 10
+	frame := wsFrameSlice(f.data[offset:])
+	size := copy(f.data[offset:], frame)
+	f.data = f.data[:offset+size]
+	f.frame = f.data
+	atomic.StoreInt32(&f.refs, 1)
+	return f
 }
 
 func (s *Server) sendInitialState(conn *Connection) {
-	allPlayers := s.gameWorld.GetAllPlayers()
-
-	f := broadcastFramePool.Get().(*tickFrame)
-	f.data = f.data[:0]
-	f.data = append(f.data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-	seq := atomic.LoadUint32(&s.worldStateSeq)
-
-	worldTick := s.gameWorld.GetTickCount()
-	f.data = s.protocol.AppendGameState(f.data, allPlayers, seq, worldTick, s.currentDilationBps())
-	frame := wsFrameSlice(f.data)
-
-	frameBytes := make([]byte, len(frame))
-	copy(frameBytes, frame)
-
-	f.data = f.data[:0]
-	f.frame = nil
-	broadcastFramePool.Put(f)
-
-	select {
-	case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
-		atomic.StoreInt64(&conn.lastWorldStateSentNs, clock.Now())
-	default:
-		metrics.BroadcastsDropped.Inc()
+	if conn.resyncLimiter.Allow() {
+		conn.needsFullState.Store(true)
 	}
 }
 
 func (s *Server) sendDirect(conn *Connection, data []byte) {
-	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
+	frame, err := ws.CompileFrame(ws.NewBinaryFrame(data))
 	if err != nil {
 		return
 	}
-	select {
-	case conn.writeCh <- writeJob{direct: frameBytes, timeout: directWriteTimeout}:
-	default:
+	if !conn.enqueue(writeJob{direct: frame, timeout: directWriteTimeout}) {
 		metrics.BroadcastsDropped.Inc()
 	}
 }
 
 func (s *Server) sendMovementAck(conn *Connection, playerID uint32, x, y uint16, inputSequence uint32) bool {
-	select {
-	case conn.writeCh <- writeJob{
-		ack:     true,
-		ackID:   playerID,
-		ackX:    x,
-		ackY:    y,
-		ackSeq:  inputSequence,
-		timeout: directWriteTimeout,
-	}:
+	if conn.enqueue(writeJob{ack: true, ackID: playerID, ackX: x, ackY: y, ackSeq: inputSequence, timeout: directWriteTimeout}) {
 		return true
-	default:
-		metrics.BroadcastsDropped.Inc()
-		return false
 	}
+	metrics.BroadcastsDropped.Inc()
+	return false
 }
 
 func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) {
@@ -982,55 +987,6 @@ func (s *Server) sendWelcome(conn *Connection) {
 	s.sendDirect(conn, data)
 }
 
-func (s *Server) sendUnitRoster(conn *Connection) {
-	assignments := s.gameWorld.GetAllUnitAssignments()
-	if len(assignments) == 0 {
-		return
-	}
-	data := s.protocol.EncodeUnitRoster(assignments)
-	s.sendDirect(conn, data)
-}
-
-func (s *Server) broadcastUnitRoster() {
-	assignments := s.gameWorld.GetAllUnitAssignments()
-	if len(assignments) == 0 {
-		return
-	}
-	data := s.protocol.EncodeUnitRoster(assignments)
-	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
-	if err != nil {
-		slog.Error("failed to compile unit roster frame", "error", err)
-		return
-	}
-	s.broadcastEvent(frameBytes)
-}
-
-func (s *Server) notifyPlayerJoined(newPlayer *types.Player) {
-	playerState := types.PlayerState{
-		ID:        newPlayer.ID,
-		X:         uint16(newPlayer.GetX()),
-		Y:         uint16(newPlayer.GetY()),
-		Direction: protocol.DirectionRight,
-	}
-	data := s.protocol.EncodePlayerJoined(playerState)
-	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
-	if err != nil {
-		slog.Error("failed to compile player joined frame", "error", err)
-		return
-	}
-	s.broadcastEvent(frameBytes)
-}
-
-func (s *Server) notifyPlayerLeft(leftPlayerID uint32) {
-	data := s.protocol.EncodePlayerLeft(leftPlayerID)
-	frameBytes, err := ws.CompileFrame(ws.NewBinaryFrame(data))
-	if err != nil {
-		slog.Error("failed to compile player left frame", "error", err)
-		return
-	}
-	s.broadcastEvent(frameBytes)
-}
-
 func (s *Server) runPingLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1048,10 +1004,7 @@ func (s *Server) runPingLoop() {
 					go s.cleanupConnection(conn)
 					continue
 				}
-				select {
-				case conn.writeCh <- writeJob{direct: pingFrame, timeout: directWriteTimeout}:
-				default:
-				}
+				conn.enqueue(writeJob{direct: pingFrame, timeout: directWriteTimeout})
 			}
 			s.connectionsMu.RUnlock()
 

@@ -18,6 +18,8 @@ const ramp = Number(process.env.RAMP_SECONDS || 30)*1000;
 const hold = Number(process.env.HOLD_SECONDS || 45)*1000;
 const movementInterval = Number(process.env.MOVE_INTERVAL_MS || 8000);
 const port = Number(process.env.PORT || 18108);
+const managementPort = Number(process.env.MANAGEMENT_PORT || port + 2);
+const managementBase = process.env.MANAGEMENT_URL || `http://127.0.0.1:${managementPort}`;
 const base = process.env.SERVER_URL || `http://127.0.0.1:${port}`;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const histograms = new Map(), counters = new Map();
@@ -35,6 +37,7 @@ const events = { emit(kind, name, value = 1) {
 const log = fs.openSync(path.join(directory, 'server.log'), 'w');
 // Explicit common settings, independent of secret-bearing application .env.
 const child = process.env.SERVER_URL ? null : spawn(binary, [], { env: { ...process.env, PORT: String(port),
+  MANAGEMENT_ADDR: `127.0.0.1:${managementPort}`, ENABLE_PPROF: 'true',
   GOGC: '400', GOMEMLIMIT: '2GiB', IP_CONN_RATE: '200', IP_CONN_BURST: '200',
   VELOCITY_REPLICATION: 'true', KEYFRAME_DIVISOR: '100', WRITE_BATCH_SIZE: '8',
 }, stdio: ['ignore', log, log] });
@@ -51,7 +54,7 @@ function cleanup() {
 process.once('SIGINT', () => { cleanup(); process.exitCode = 130; });
 process.once('SIGTERM', () => { cleanup(); process.exitCode = 143; });
 async function save(endpoint, filename) {
-  const res = await fetch(base+endpoint, { signal: AbortSignal.timeout(30000) });
+  const res = await fetch(managementBase+endpoint, { signal: AbortSignal.timeout(30000) });
   if (!res.ok) throw new Error(`${endpoint}: ${res.status}`);
   fs.writeFileSync(path.join(directory, filename), Buffer.from(await res.arrayBuffer()));
 }

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -9,6 +11,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +27,7 @@ import (
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/types"
+	"pixi_game_server/internal/units"
 )
 
 type Server struct {
@@ -36,9 +40,16 @@ type Server struct {
 	unitsJSON      atomic.Pointer[[]byte]
 	adminStore     *liveconfig.Store
 
-	connectionsMu sync.RWMutex
-	connections   map[uint32]*Connection
-	rh            readHandler
+	connectionsMu    sync.RWMutex
+	connections      map[uint32]*Connection
+	lifecycleMu      sync.Mutex
+	stopping         bool
+	admissions       int
+	handlers         sync.WaitGroup
+	workers          sync.WaitGroup
+	shutdownOnce     sync.Once
+	shutdownDone     chan struct{}
+	managementServer *http.Server
 
 	rateLimiters sync.Map
 
@@ -67,12 +78,17 @@ type Server struct {
 type Connection struct {
 	player               *types.Player
 	rawConn              net.Conn
-	fd                   int
+	enqueueMu            sync.Mutex
+	closed               bool
+	needsFullState       atomic.Bool
+	lastQueuedStateSeq   uint32
+	hasQueuedState       bool
+	resyncLimiter        *rate.Limiter
+	controlLimiter       *rate.Limiter
 	rateLimiter          *rate.Limiter
 	writeCh              chan writeJob
 	closeOnce            sync.Once
 	lastActivity         int64
-	writeFailures        int32
 	fanoutDrops          int32
 	fanoutFairDebt       int32
 	fanoutDebtEpoch      uint32
@@ -88,24 +104,27 @@ type Connection struct {
 	cancel               context.CancelFunc
 }
 
-func New(cfg *config.Config) *Server {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	if cfg.Server.Workers == 0 {
-		cfg.Server.Workers = runtime.NumCPU()
+func New(cfg *config.Config) (*Server, error) {
+	if cfg == nil {
+		return nil, errors.New("config is required")
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 
 	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
 
 	server := &Server{
-		cfg:         cfg,
-		live:        live,
-		gameWorld:   game.NewGameWorld(cfg, live),
-		protocol:    &protocol.BinaryProtocol{},
-		connections: make(map[uint32]*Connection, 4096),
-		ctx:         ctx,
-		cancel:      cancel,
-		startTime:   time.Now(),
+		cfg:          cfg,
+		live:         live,
+		gameWorld:    game.NewGameWorld(cfg, live),
+		protocol:     &protocol.BinaryProtocol{},
+		connections:  make(map[uint32]*Connection, 4096),
+		ctx:          ctx,
+		cancel:       cancel,
+		startTime:    time.Now(),
+		shutdownDone: make(chan struct{}),
 	}
 
 	server.dilationBps = dilationBpsFull
@@ -119,15 +138,26 @@ func New(cfg *config.Config) *Server {
 		metrics.FanoutRecipientLimit.Set(0)
 	}
 
-	go server.runPingLoop()
-
-	server.rh = newReadHandler(server)
+	server.workers.Add(1)
+	go func() { defer server.workers.Done(); server.runPingLoop() }()
 
 	server.gameWorld.SetTickBroadcaster(server.broadcastTick)
+	server.workers.Add(1)
+	go func() {
+		defer server.workers.Done()
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-server.ctx.Done():
+				return
+			case <-ticker.C:
+				server.rateLimiters.Range(func(key, _ any) bool { server.rateLimiters.Delete(key); return true })
+			}
+		}
+	}()
 
-	go server.performanceMonitor()
-
-	return server
+	return server, nil
 }
 
 func (s *Server) Live() *config.LiveNet {
@@ -157,91 +187,129 @@ func (s *Server) handleStaticUnits(w http.ResponseWriter, r *http.Request) {
 	w.Write(*s.unitsJSON.Load())
 }
 
-func (s *Server) Start() error {
+func (s *Server) publicHandler() http.Handler {
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/ws", s.handleWebSocket)
-
 	mux.Handle("/", http.FileServer(http.Dir(s.cfg.Server.StaticDir)))
-
 	mux.HandleFunc("/health", s.handleHealth)
-
 	mux.HandleFunc("/api/config", s.handleStaticConfig)
 	mux.HandleFunc("/api/units", s.handleStaticUnits)
-
-	if s.adminStore != nil {
-		mux.HandleFunc("PATCH /api/admin/units/{typeId}", s.handleAdminUpdateUnit)
-		slog.Warn("unit admin API enabled — anyone who can reach this server can rewrite unit balance, ENABLE_UNIT_ADMIN_API should never be set in production")
+	for _, path := range []string{"/metrics", "/metrics/", "/debug/", "/api/admin/"} {
+		mux.HandleFunc(path, http.NotFound)
 	}
+	return mux
+}
 
+func (s *Server) managementHandler() http.Handler {
+	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-
 	mux.HandleFunc("/metrics/json", s.handleMetricsJSON)
+	if s.cfg.Server.EnablePprof {
+		mux.Handle("/debug/pprof/", http.DefaultServeMux)
+	}
+	if s.adminStore != nil {
+		mux.HandleFunc("PATCH /api/admin/units/{typeId}", func(w http.ResponseWriter, r *http.Request) {
+			authorization := r.Header.Get("Authorization")
+			token := strings.TrimPrefix(authorization, "Bearer ")
+			expected := s.cfg.Server.AdminToken
+			if !strings.HasPrefix(authorization, "Bearer ") || expected == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+			s.handleAdminUpdateUnit(w, r)
+		})
+	}
+	return mux
+}
 
-	if os.Getenv("PPROF_BLOCK_RATE") == "1" {
+func (s *Server) Start() error {
+	s.lifecycleMu.Lock()
+	if s.stopping || s.httpServer != nil {
+		s.lifecycleMu.Unlock()
+		return errors.New("server already started or stopping")
+	}
+	if s.adminStore != nil && len(s.cfg.Server.AdminToken) < 32 {
+		s.lifecycleMu.Unlock()
+		return errors.New("unit admin API requires ADMIN_API_TOKEN of at least 32 bytes")
+	}
+	makeServer := func(addr string, handler http.Handler) *http.Server {
+		return &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	}
+	s.httpServer = makeServer(net.JoinHostPort(s.cfg.Server.Host, fmt.Sprint(s.cfg.Server.Port)), s.publicHandler())
+	managementAddr := s.cfg.Server.ManagementAddr
+	if managementAddr == "" {
+		managementAddr = "127.0.0.1:8110"
+	}
+	s.managementServer = makeServer(managementAddr, s.managementHandler())
+	publicListener, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		s.lifecycleMu.Unlock()
+		return err
+	}
+	managementListener, err := net.Listen("tcp", managementAddr)
+	if err != nil {
+		publicListener.Close()
+		s.lifecycleMu.Unlock()
+		return err
+	}
+	s.workers.Add(2)
+	errs := make(chan error, 2)
+	for _, pair := range []struct {
+		server   *http.Server
+		listener net.Listener
+	}{
+		{s.httpServer, publicListener}, {s.managementServer, managementListener},
+	} {
+		go func() { defer s.workers.Done(); errs <- pair.server.Serve(pair.listener) }()
+	}
+	s.lifecycleMu.Unlock()
+	slog.Info("server listening", "addr", publicListener.Addr(), "management_addr", managementListener.Addr())
+	if os.Getenv("PPROF_BLOCK_RATE") == "1" && s.cfg.Server.EnablePprof {
 		runtime.SetBlockProfileRate(1)
 		runtime.SetMutexProfileFraction(1)
 	}
-	mux.Handle("/debug/pprof/", http.DefaultServeMux)
-	mux.Handle("/debug/pprof/cmdline", http.DefaultServeMux)
-	mux.Handle("/debug/pprof/profile", http.DefaultServeMux)
-	mux.Handle("/debug/pprof/symbol", http.DefaultServeMux)
-	mux.Handle("/debug/pprof/trace", http.DefaultServeMux)
-
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-ticker.C:
-				s.rateLimiters.Range(func(k, _ any) bool {
-					s.rateLimiters.Delete(k)
-					return true
-				})
-			}
-		}
-	}()
-
-	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
-
-	slog.Info("server listening", "addr", addr)
-	slog.Info("serving static files", "dir", s.cfg.Server.StaticDir)
-
-	s.httpServer = &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    16 << 10,
+	err = <-errs
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
 	}
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	var err error
-	if s.httpServer != nil {
-		err = s.httpServer.Shutdown(ctx)
+	s.shutdownOnce.Do(func() {
+		s.lifecycleMu.Lock()
+		s.stopping = true
+		s.lifecycleMu.Unlock()
+		go func() {
+			defer close(s.shutdownDone)
+			for _, srv := range []*http.Server{s.httpServer, s.managementServer} {
+				if srv != nil {
+					srv.Close()
+				}
+			}
+			s.handlers.Wait()
+			s.gameWorld.Stop()
+			s.cancel()
+			s.connectionsMu.RLock()
+			conns := make([]*Connection, 0, len(s.connections))
+			for _, c := range s.connections {
+				conns = append(conns, c)
+			}
+			s.connectionsMu.RUnlock()
+			for _, c := range conns {
+				s.cleanupConnection(c)
+			}
+			s.workers.Wait()
+		}()
+	})
+	select {
+	case <-s.shutdownDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-
-	s.connectionsMu.RLock()
-	conns := make([]*Connection, 0, len(s.connections))
-	for _, conn := range s.connections {
-		conns = append(conns, conn)
-	}
-	s.connectionsMu.RUnlock()
-	for _, conn := range conns {
-		conn.cancel()
-	}
-
-	s.cancel()
-	s.gameWorld.Stop()
-	slog.Info("server stopped", "drained_connections", len(conns))
-	return err
 }
 
 const (
@@ -296,51 +364,68 @@ func (s *Server) logRejectedFrame(c *Connection, hdr ws.Header) {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-
-	s.connectionsMu.RLock()
-	connCount := len(s.connections)
-	s.connectionsMu.RUnlock()
-	if connCount >= s.live.Load().MaxConnections {
-		http.Error(w, "Server full", http.StatusServiceUnavailable)
+	s.lifecycleMu.Lock()
+	if s.stopping || s.admissions >= s.live.Load().MaxConnections {
+		s.lifecycleMu.Unlock()
+		http.Error(w, "Server unavailable", http.StatusServiceUnavailable)
 		return
 	}
-
+	s.admissions++
+	s.handlers.Add(1)
+	s.lifecycleMu.Unlock()
+	defer s.handlers.Done()
+	admitted := false
+	defer func() {
+		if !admitted {
+			s.releaseAdmission()
+		}
+	}()
 	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		clientIP = r.RemoteAddr
 	}
-	limiter := s.getOrCreateRateLimiter(clientIP)
-
-	if !limiter.Allow() {
+	if !s.getOrCreateRateLimiter(clientIP).Allow() {
 		metrics.IPRateLimited.Inc()
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
-
-	rawConn, _, _, err := ws.UpgradeHTTP(r, w)
+	requestedUnitType := r.URL.Query().Get("unit")
+	if requestedUnitType != "" && !units.IsValid(requestedUnitType) {
+		http.Error(w, "Unknown unit", http.StatusBadRequest)
+		return
+	}
+	rawConn, buffer, _, err := (ws.HTTPUpgrader{Timeout: 5 * time.Second}).Upgrade(r, w)
 	if err != nil {
-		slog.Error("websocket upgrade failed", "error", err, "remote_addr", r.RemoteAddr)
 		metrics.WSUpgradeErrors.Inc()
 		return
 	}
-
-	requestedUnitType := r.URL.Query().Get("unit")
 	player := s.gameWorld.AddPlayer(requestedUnitType)
 	connection := s.createConnection(player, rawConn)
-
 	s.sendWelcome(connection)
-
-	s.sendInitialState(connection)
-	s.sendUnitRoster(connection)
-
+	connection.needsFullState.Store(true)
 	s.connectionsMu.Lock()
 	s.connections[player.ID] = connection
 	s.connectionsMu.Unlock()
-
 	metrics.ConnectionsTotal.Inc()
 	metrics.PlayersConnected.Inc()
+	admitted = true
+	s.startWriteLoop(connection)
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		defer s.cleanupConnection(connection)
+		if buffer != nil {
+			s.readLoop(connection, buffer.Reader)
+		} else {
+			s.readLoop(connection, rawConn)
+		}
+	}()
+}
 
-	s.rh.register(s, connection)
+func (s *Server) releaseAdmission() {
+	s.lifecycleMu.Lock()
+	s.admissions--
+	s.lifecycleMu.Unlock()
 }
 
 func (s *Server) createConnection(player *types.Player, rawConn net.Conn) *Connection {
@@ -355,23 +440,22 @@ func (s *Server) createConnection(player *types.Player, rawConn net.Conn) *Conne
 			rate.Limit(live.MessageRateLimit),
 			live.BurstLimit,
 		),
+		resyncLimiter:        rate.NewLimiter(1, 1),
+		controlLimiter:       rate.NewLimiter(10, 20),
 		lastActivity:         clock.Now(),
 		lastWorldStateSentNs: clock.Now(),
 		ctx:                  ctx,
 		cancel:               cancel,
 	}
-	s.startWriteLoop(conn)
 	return conn
 }
 
 func (s *Server) processMessage(connection *Connection, message []byte) {
 	clientMsg, err := s.protocol.DecodeClientMessage(message)
 	if err != nil {
-		slog.Error("message decode failed", "player_id", connection.player.ID, "error", err)
+		s.cleanupConnection(connection)
 		return
 	}
-
-	connection.player.IncrementMessageCount()
 
 	switch clientMsg.Type {
 	case protocol.MessageMove:
@@ -409,30 +493,22 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 	case protocol.MessageDirection:
 		metrics.MessagesReceived.WithLabelValues("direction").Inc()
 		s.markConnectionCritical(connection)
-		s.gameWorld.ProcessEvent(types.GameEvent{
-			PlayerID:  connection.player.ID,
-			Type:      types.EventFace,
-			Direction: clientMsg.Direction,
-		})
+		s.queueAction(connection, types.PlayerAction{Type: types.ActionFace, Direction: clientMsg.Direction})
 
 	case protocol.MessageAttack:
 		metrics.MessagesReceived.WithLabelValues("attack").Inc()
 		s.markConnectionCritical(connection)
-		s.gameWorld.TryAttack(connection.player.ID)
-
-	case protocol.MessageAttackEnd:
+		s.queueAction(connection, types.PlayerAction{Type: types.ActionAttack})
 
 	case protocol.MessageBlockStart:
 		metrics.MessagesReceived.WithLabelValues("block_start").Inc()
 		s.markConnectionCritical(connection)
-		s.gameWorld.TryBlockStart(connection.player.ID)
+		s.queueAction(connection, types.PlayerAction{Type: types.ActionBlockStart})
 
 	case protocol.MessageBlockEnd:
 		metrics.MessagesReceived.WithLabelValues("block_end").Inc()
 		s.markConnectionCritical(connection)
-		s.gameWorld.EndBlock(connection.player.ID)
-
-	case protocol.MessageViewportUpdate:
+		s.queueAction(connection, types.PlayerAction{Type: types.ActionBlockEnd})
 
 	case protocol.MessageSyncRequest:
 		metrics.MessagesReceived.WithLabelValues("sync_request").Inc()
@@ -462,28 +538,44 @@ func (s *Server) markConnectionCritical(conn *Connection) {
 	}
 }
 
+func (s *Server) queueAction(c *Connection, action types.PlayerAction) {
+	if !s.gameWorld.QueueAction(c.player.ID, action) {
+		s.cleanupConnection(c)
+	}
+}
+
+func (c *Connection) enqueue(job writeJob) bool {
+	c.enqueueMu.Lock()
+	defer c.enqueueMu.Unlock()
+	if c.closed {
+		return false
+	}
+	select {
+	case c.writeCh <- job:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) cleanupConnection(c *Connection) {
 	c.closeOnce.Do(func() {
-		playerID := c.player.ID
-
-		metrics.DisconnectionsTotal.Inc()
-		metrics.PlayersConnected.Dec()
-		metrics.SessionDuration.Observe(time.Since(c.player.JoinTime).Seconds())
-
-		s.rh.remove(c)
-
-		s.connectionsMu.Lock()
-		delete(s.connections, playerID)
-		s.connectionsMu.Unlock()
-
-		s.notifyPlayerLeft(playerID)
-
+		c.enqueueMu.Lock()
+		c.closed = true
 		c.cancel()
-		drainWriteCh(c.writeCh)
-
 		c.rawConn.Close()
-
-		s.gameWorld.RemovePlayer(playerID)
+		c.enqueueMu.Unlock()
+		s.connectionsMu.Lock()
+		_, registered := s.connections[c.player.ID]
+		delete(s.connections, c.player.ID)
+		s.connectionsMu.Unlock()
+		if registered {
+			s.releaseAdmission()
+			metrics.DisconnectionsTotal.Inc()
+			metrics.PlayersConnected.Dec()
+			metrics.SessionDuration.Observe(time.Since(c.player.JoinTime).Seconds())
+			s.gameWorld.RemovePlayer(c.player.ID)
+		}
 	})
 }
 
@@ -502,26 +594,14 @@ func (s *Server) getOrCreateRateLimiter(ip string) *rate.Limiter {
 	return newLimiter
 }
 
-func (s *Server) performanceMonitor() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-
-		case <-ticker.C:
-			s.logPerformanceStats()
-		}
-	}
-}
-
-func (s *Server) logPerformanceStats() {
-
-}
-
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.lifecycleMu.Lock()
+	stopping := s.stopping
+	s.lifecycleMu.Unlock()
+	if stopping {
+		http.Error(w, "Server draining", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"healthy","uptime_seconds":%d,"players":%d}`,

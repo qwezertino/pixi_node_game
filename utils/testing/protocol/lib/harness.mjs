@@ -9,7 +9,7 @@
 import { MOVEMENT, NETWORK } from './config.mjs';
 
 const DEFAULT_URL = process.env.GAME_WS_URL ?? 'ws://127.0.0.1:8108/ws';
-const METRICS_URL = process.env.GAME_METRICS_URL ?? 'http://127.0.0.1:8108/metrics';
+const METRICS_URL = process.env.GAME_METRICS_URL ?? 'http://127.0.0.1:8110/metrics';
 
 export const SPEED = MOVEMENT.playerSpeedPerTick;
 export const TICK_RATE = NETWORK.tickRate;

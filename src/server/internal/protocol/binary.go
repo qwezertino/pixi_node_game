@@ -236,55 +236,10 @@ func (bp *BinaryProtocol) AppendDeltaGameState(dst []byte, players []types.Playe
 	return appendWorldState(dst, MessageDeltaGameState, players, stateSequence, worldTick, dilationBps)
 }
 
-func (bp *BinaryProtocol) EncodePlayerJoined(player types.PlayerState) []byte {
-	buffer := make([]byte, 12)
-	offset := 0
-
-	buffer[offset] = MessagePlayerJoined
-	offset++
-
-	binary.LittleEndian.PutUint32(buffer[offset:], player.ID)
-	offset += 4
-	binary.LittleEndian.PutUint16(buffer[offset:], player.X)
-	offset += 2
-	binary.LittleEndian.PutUint16(buffer[offset:], player.Y)
-	offset += 2
-	buffer[offset] = uint8(player.VX)
-	offset++
-	buffer[offset] = uint8(player.VY)
-	offset++
-
-	buffer[offset] = playerFlags(player.State, player.Sprinting, player.ComboStep, player.Direction)
-
-	return buffer
-}
-
 func (bp *BinaryProtocol) EncodePlayerLeft(playerID uint32) []byte {
 	buffer := make([]byte, 5)
 	buffer[0] = MessagePlayerLeft
 	binary.LittleEndian.PutUint32(buffer[1:], playerID)
-	return buffer
-}
-
-func (bp *BinaryProtocol) EncodeMovementAck(playerID uint32, x, y uint16, inputSequence uint32) []byte {
-
-	buffer := make([]byte, 13)
-	offset := 0
-
-	buffer[offset] = MessageMovementAck
-	offset++
-
-	binary.LittleEndian.PutUint32(buffer[offset:], playerID)
-	offset += 4
-
-	binary.LittleEndian.PutUint16(buffer[offset:], x)
-	offset += 2
-
-	binary.LittleEndian.PutUint16(buffer[offset:], y)
-	offset += 2
-
-	binary.LittleEndian.PutUint32(buffer[offset:], inputSequence)
-
 	return buffer
 }
 

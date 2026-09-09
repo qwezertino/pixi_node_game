@@ -17,9 +17,6 @@ STATIC_DIR=../dist
 # ─── Connection limits ────────────────────────────────────────────────────────
 MAX_CONNECTIONS=12000
 
-# ─── Worker pools (0 = auto-detect CPU count) ────────────────────────────────
-WORKERS=0
-
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 # Max messages per second per client
 RATE_LIMIT_MSG_SEC=120
@@ -101,3 +98,8 @@ GRAFANA_PORT=3000
 GRAFANA_ADMIN_PASSWORD=admin
 LOKI_PORT=3100
 COMPOSE_PROJECT_NAME=pixi_game
+
+MANAGEMENT_ADDR=127.0.0.1:8110
+ENABLE_PPROF=false
+ENABLE_UNIT_ADMIN_API=false
+ADMIN_API_TOKEN=

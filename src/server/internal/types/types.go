@@ -54,6 +54,9 @@ type UnitAssignment struct {
 }
 
 type Player struct {
+	actionMu             sync.Mutex
+	actions              [MaxPendingActions]PlayerAction
+	actionCount          int
 	ID                   uint32
 	X                    uint32
 	Y                    uint32
@@ -81,32 +84,12 @@ type Player struct {
 	LastActivity int64
 	JoinTime     time.Time
 
-	MessageCount uint64
-
 	inputMu              sync.Mutex
 	pendingInput         MovementInput
 	hasPendingInput      bool
 	lastReceivedInput    uint32
 	hasLastReceivedInput bool
 }
-
-type GameEvent struct {
-	PlayerID      uint32
-	Type          EventType
-	VectorX       int8
-	VectorY       int8
-	Direction     uint8
-	InputSequence uint32
-	Timestamp     int64
-}
-
-type EventType uint8
-
-const (
-	EventMove EventType = iota
-	EventAttack
-	EventFace
-)
 
 type PlayerState struct {
 	ID        uint32
@@ -334,14 +317,6 @@ func (p *Player) SetLastUpdate(timestamp int64) {
 	atomic.StoreInt64(&p.LastUpdate, timestamp)
 }
 
-func (p *Player) IncrementMessageCount() uint64 {
-	return atomic.AddUint64(&p.MessageCount, 1)
-}
-
-func (p *Player) GetMessageCount() uint64 {
-	return atomic.LoadUint64(&p.MessageCount)
-}
-
 func (p *Player) GetAttackStartTick() uint32 {
 	return atomic.LoadUint32(&p.AttackStartTick)
 }
@@ -390,4 +365,42 @@ func (p *Player) ToState() PlayerState {
 		Sprinting: p.GetSprintingNow(),
 		ComboStep: p.GetComboStep(),
 	}
+}
+
+const MaxPendingActions = 32
+
+type ActionType uint8
+
+const (
+	ActionAttack ActionType = iota
+	ActionBlockStart
+	ActionBlockEnd
+	ActionFace
+)
+
+type PlayerAction struct {
+	Type      ActionType
+	Direction uint8
+}
+
+func (p *Player) OfferAction(action PlayerAction) bool {
+	if action.Type > ActionFace || action.Direction > 3 {
+		return false
+	}
+	p.actionMu.Lock()
+	defer p.actionMu.Unlock()
+	if p.actionCount == len(p.actions) {
+		return false
+	}
+	p.actions[p.actionCount] = action
+	p.actionCount++
+	return true
+}
+
+func (p *Player) ConsumeActions(dst []PlayerAction) []PlayerAction {
+	p.actionMu.Lock()
+	defer p.actionMu.Unlock()
+	dst = append(dst, p.actions[:p.actionCount]...)
+	p.actionCount = 0
+	return dst
 }

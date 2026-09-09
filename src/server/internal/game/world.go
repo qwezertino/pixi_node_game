@@ -28,6 +28,11 @@ type tickWorkerInput struct {
 }
 
 type GameWorld struct {
+	stepMu                sync.Mutex
+	stopOnce              sync.Once
+	loopDone              chan struct{}
+	workersDone           sync.WaitGroup
+	membershipChanged     bool
 	cfg                   *config.Config
 	live                  *config.LiveNet
 	playersMu             sync.RWMutex
@@ -50,14 +55,7 @@ type GameWorld struct {
 	nominalTickIntervalNs int64
 	currentTickIntervalNs int64
 
-	attackDurationTicks map[uint8]uint32
-
-	comboSteps map[uint8]uint8
-
-	comboWindowTicks         map[uint8]uint32
 	nextPlayerID             uint32
-	playerCountEstimate      uint32
-	lastFullSync             time.Time
 	deltaVectorChanges       int
 	deltaPositionOnly        int
 	deltaClamped             int
@@ -75,7 +73,6 @@ type GameWorld struct {
 }
 
 type moveStat struct {
-
 	milliUnitsPerTick uint32
 
 	avgUnitsPerTick int32
@@ -167,6 +164,8 @@ func (gw *GameWorld) unitTables() *unitTables {
 }
 
 func (gw *GameWorld) RecomputeUnitTables() {
+	gw.stepMu.Lock()
+	defer gw.stepMu.Unlock()
 	gw.unitTablesPtr.Store(buildUnitTables(gw.cfg.Game.TickRate, gw.cfg.Game.UnitsPerMeter))
 }
 
@@ -187,8 +186,8 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 		live:         live,
 		playersMap:   make(map[uint32]*types.Player, 256),
 		stopChan:     make(chan struct{}),
+		loopDone:     make(chan struct{}),
 		nextPlayerID: 1000,
-		lastFullSync: time.Now(),
 
 		lastDeltaCompositeLog: clock.Now(),
 		prevStates:            make(map[uint32]types.PlayerState, initialCap),
@@ -205,7 +204,8 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 	for i := range gw.tickWorkerChs {
 		ch := make(chan tickWorkerInput, 1)
 		gw.tickWorkerChs[i] = ch
-		go gw.runTickWorker(ch)
+		gw.workersDone.Add(1)
+		go func() { defer gw.workersDone.Done(); gw.runTickWorker(ch) }()
 	}
 
 	gw.visibilityManager = systems.NewVisibilityManager(
@@ -225,6 +225,8 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 }
 
 func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
+	gw.stepMu.Lock()
+	defer gw.stepMu.Unlock()
 	playerID := atomic.AddUint32(&gw.nextPlayerID, 1)
 
 	live := gw.live.Load()
@@ -253,29 +255,34 @@ func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
 
 	gw.playersMu.Lock()
 	gw.playersMap[playerID] = player
+	gw.membershipChanged = true
 	gw.playersMu.Unlock()
 	gw.visibilityManager.AddPlayer(playerID, spawnX, spawnY)
-	atomic.AddUint32(&gw.playerCountEstimate, 1)
 
 	return player
 }
 
 func (gw *GameWorld) RemovePlayer(playerID uint32) {
+	gw.stepMu.Lock()
+	defer gw.stepMu.Unlock()
 	gw.playersMu.Lock()
 	_, loaded := gw.playersMap[playerID]
 	if loaded {
 		delete(gw.playersMap, playerID)
+		gw.membershipChanged = true
 	}
 	gw.playersMu.Unlock()
 	if loaded {
 		gw.visibilityManager.RemovePlayer(playerID)
-		atomic.AddUint32(&gw.playerCountEstimate, ^uint32(0))
 		metrics.EventsProcessed.WithLabelValues("disconnect").Inc()
 	}
 }
 
-func (gw *GameWorld) ProcessEvent(event types.GameEvent) {
-	gw.handleEvent(event)
+func (gw *GameWorld) QueueAction(playerID uint32, action types.PlayerAction) bool {
+	gw.playersMu.RLock()
+	player := gw.playersMap[playerID]
+	gw.playersMu.RUnlock()
+	return player != nil && player.OfferAction(action)
 }
 
 func (gw *GameWorld) QueueMovementInput(playerID uint32, dx, dy int8, sequence uint32, sprint bool) types.InputResult {
@@ -332,6 +339,7 @@ func (gw *GameWorld) GetPlayerCount() int {
 }
 
 func (gw *GameWorld) gameLoop() {
+	defer close(gw.loopDone)
 
 	tickInterval := gw.GetNominalTickInterval()
 	ticker := time.NewTicker(tickInterval)
@@ -399,6 +407,12 @@ func (gw *GameWorld) GetTickDuration() time.Duration {
 }
 
 func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
+	gw.stepMu.Lock()
+	defer gw.stepMu.Unlock()
+	return gw.tryAttack(playerID)
+}
+
+func (gw *GameWorld) tryAttack(playerID uint32) (x, y uint16, accepted bool) {
 	gw.playersMu.RLock()
 	player, ok := gw.playersMap[playerID]
 	gw.playersMu.RUnlock()
@@ -450,6 +464,12 @@ func (gw *GameWorld) executeAttack(player *types.Player, currentTick uint32) (x,
 }
 
 func (gw *GameWorld) TryBlockStart(playerID uint32) bool {
+	gw.stepMu.Lock()
+	defer gw.stepMu.Unlock()
+	return gw.tryBlockStart(playerID)
+}
+
+func (gw *GameWorld) tryBlockStart(playerID uint32) bool {
 	gw.playersMu.RLock()
 	player, ok := gw.playersMap[playerID]
 	gw.playersMu.RUnlock()
@@ -475,6 +495,12 @@ func (gw *GameWorld) TryBlockStart(playerID uint32) bool {
 }
 
 func (gw *GameWorld) EndBlock(playerID uint32) {
+	gw.stepMu.Lock()
+	defer gw.stepMu.Unlock()
+	gw.endBlock(playerID)
+}
+
+func (gw *GameWorld) endBlock(playerID uint32) {
 	gw.playersMu.RLock()
 	player, ok := gw.playersMap[playerID]
 	gw.playersMu.RUnlock()
@@ -508,6 +534,8 @@ func (gw *GameWorld) updateBlockDrain(player *types.Player) (drained bool) {
 }
 
 func (gw *GameWorld) tick() {
+	gw.stepMu.Lock()
+	defer gw.stepMu.Unlock()
 
 	gw.scratchStates = gw.scratchStates[:0]
 	gw.scratchChanged = gw.scratchChanged[:0]
@@ -518,10 +546,10 @@ func (gw *GameWorld) tick() {
 	worldTick := atomic.AddUint32(&gw.tickCount, 1)
 
 	lastSync := atomic.LoadInt64(&gw.lastSyncTime)
-	fullSync := lastSync == 0 || time.Duration(nowNano-lastSync) >= gw.cfg.Game.SyncInterval
+	fullSync := gw.membershipChanged || lastSync == 0 || time.Duration(nowNano-lastSync) >= gw.cfg.Game.SyncInterval
 	if fullSync {
+		gw.membershipChanged = false
 		atomic.StoreInt64(&gw.lastSyncTime, nowNano)
-		gw.lastFullSync = time.Now()
 	}
 
 	t0 := time.Now()
@@ -805,37 +833,6 @@ func (gw *GameWorld) integrateMovement(x, y uint16, vx, vy int8, distance int64)
 	return uint16(newX), uint16(newY)
 }
 
-func (gw *GameWorld) handleEvent(event types.GameEvent) {
-	gw.playersMu.RLock()
-	player, exists := gw.playersMap[event.PlayerID]
-	gw.playersMu.RUnlock()
-	if !exists {
-		return
-	}
-
-	switch event.Type {
-	case types.EventMove:
-		player.OfferMovementInput(types.MovementInput{
-			Sequence: event.InputSequence,
-			DX:       event.VectorX,
-			DY:       event.VectorY,
-		})
-
-	case types.EventFace:
-		metrics.EventsProcessed.WithLabelValues("face").Inc()
-		player.SetDirection(event.Direction)
-
-	case types.EventAttack:
-		metrics.EventsProcessed.WithLabelValues("attack").Inc()
-
-		if player.GetState() == types.StateAttacking {
-			break
-		}
-		player.SetState(types.StateAttacking)
-		player.SetAttackStartTick(gw.GetTickCount())
-	}
-}
-
 func (gw *GameWorld) GetMetrics() types.PerformanceMetrics {
 	return types.PerformanceMetrics{
 		ConnectedPlayers: uint32(gw.GetPlayerCount()),
@@ -844,12 +841,14 @@ func (gw *GameWorld) GetMetrics() types.PerformanceMetrics {
 }
 
 func (gw *GameWorld) Stop() {
-	close(gw.stopChan)
-
-	for _, ch := range gw.tickWorkerChs {
-		close(ch)
-	}
-	slog.Info("gameworld stopped")
+	gw.stopOnce.Do(func() {
+		close(gw.stopChan)
+		<-gw.loopDone
+		for _, ch := range gw.tickWorkerChs {
+			close(ch)
+		}
+		gw.workersDone.Wait()
+	})
 }
 
 func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
@@ -869,6 +868,19 @@ func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
 				}
 			}
 
+			var actions [types.MaxPendingActions]types.PlayerAction
+			for _, action := range player.ConsumeActions(actions[:0]) {
+				switch action.Type {
+				case types.ActionAttack:
+					gw.tryAttack(player.ID)
+				case types.ActionBlockStart:
+					gw.tryBlockStart(player.ID)
+				case types.ActionBlockEnd:
+					gw.endBlock(player.ID)
+				case types.ActionFace:
+					player.SetDirection(action.Direction)
+				}
+			}
 			sprintDrained := gw.updatePlayerPosition(player, input.nowNano)
 			blockDrained := gw.updateBlockDrain(player)
 

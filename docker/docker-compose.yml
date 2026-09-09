@@ -10,6 +10,7 @@ services:
     environment:
       # Override path to static files inside the container
       STATIC_DIR: "/app/static"
+      MANAGEMENT_ADDR: "0.0.0.0:8110"
       # Point at the in-network service names rather than .env's host-facing values
       POSTGRES_HOST: postgres
       REDIS_HOST: redis

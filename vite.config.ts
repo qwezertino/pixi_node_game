@@ -11,6 +11,7 @@ export default defineConfig({
     port: 8109,
     open: true,
     proxy: {
+      "/api/admin": { target: "http://127.0.0.1:8110" },
       "/ws": {
         target: "ws://127.0.0.1:8108",
         ws: true,

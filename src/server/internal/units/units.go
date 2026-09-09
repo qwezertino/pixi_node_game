@@ -109,29 +109,37 @@ type Definition struct {
 const DefaultUnitType = "spearman"
 
 type state struct {
-	all      []Definition
-	byID     map[string]Definition
-	byTypeID map[uint8]Definition
+	all  []Definition
+	byID map[string]Definition
 }
 
 var current atomic.Pointer[state]
 
 func init() {
 
-	current.Store(&state{byID: map[string]Definition{}, byTypeID: map[uint8]Definition{}})
+	current.Store(&state{byID: map[string]Definition{}})
 }
 
 func LoadDefinitions(defs []Definition) error {
 	newByID := make(map[string]Definition, len(defs))
 	newByTypeID := make(map[uint8]Definition, len(defs))
 	for _, u := range defs {
+		if err := ValidateDefinition(u); err != nil {
+			return err
+		}
+		if _, ok := newByID[u.ID]; ok {
+			return fmt.Errorf("duplicate unit ID %q", u.ID)
+		}
+		if _, ok := newByTypeID[u.TypeID]; ok {
+			return fmt.Errorf("duplicate unit type ID %d", u.TypeID)
+		}
 		newByID[u.ID] = u
 		newByTypeID[u.TypeID] = u
 	}
 	if _, ok := newByID[DefaultUnitType]; !ok {
 		return fmt.Errorf("units: DefaultUnitType %q not found in loaded definitions", DefaultUnitType)
 	}
-	current.Store(&state{all: defs, byID: newByID, byTypeID: newByTypeID})
+	current.Store(&state{all: defs, byID: newByID})
 	return nil
 }
 
@@ -142,14 +150,6 @@ func All() []Definition {
 func Get(id string) Definition {
 	s := current.Load()
 	if u, ok := s.byID[id]; ok {
-		return u
-	}
-	return s.byID[DefaultUnitType]
-}
-
-func GetByTypeID(typeID uint8) Definition {
-	s := current.Load()
-	if u, ok := s.byTypeID[typeID]; ok {
 		return u
 	}
 	return s.byID[DefaultUnitType]

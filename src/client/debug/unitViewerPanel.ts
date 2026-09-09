@@ -73,6 +73,8 @@ const HTML = `
     <div id="uv-optional-fields"></div>
     <h2 style="font-size:12px;color:#aaa;margin:14px 0 6px;border-top:1px solid #333;padding-top:10px;">Combat profiles</h2>
     <div id="uv-groups"></div>
+    <label for="uv-adminToken">Admin API token</label>
+    <input id="uv-adminToken" type="password" autocomplete="off" style="width:100%;box-sizing:border-box;margin-top:4px;" />
     <button id="uv-save" style="width:100%;margin-top:12px;padding:8px;background:#3a6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">Save to database</button>
     <div id="uv-save-status" style="margin-top:8px;font-size:11px;line-height:1.5;white-space:pre-wrap;"></div>
 </div>
@@ -443,7 +445,7 @@ export function createUnitViewerPanel(container: HTMLElement): void {
             try {
                 const res = await fetch(`/api/admin/units/${unit.typeId}`, {
                     method: "PATCH",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${q<HTMLInputElement>("uv-adminToken").value}` },
                     body: JSON.stringify(body),
                 });
                 const text = await res.text();

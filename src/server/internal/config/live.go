@@ -3,11 +3,14 @@ package config
 import (
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type LiveNetConfig struct {
+	WorldWidth                     uint16
+	WorldHeight                    uint16
 	MaxConnections                 int
 	MessageRateLimit               int
 	BurstLimit                     int
@@ -40,6 +43,7 @@ type LiveNetConfig struct {
 
 func BuildLiveNetConfig(cfg *Config) *LiveNetConfig {
 	c := &LiveNetConfig{
+		WorldWidth: cfg.World.Width, WorldHeight: cfg.World.Height,
 		MaxConnections:                 cfg.Net.MaxConnections,
 		MessageRateLimit:               cfg.Net.MessageRateLimit,
 		BurstLimit:                     cfg.Net.BurstLimit,
@@ -69,74 +73,59 @@ func BuildLiveNetConfig(cfg *Config) *LiveNetConfig {
 		SpawnMinY:                      cfg.World.SpawnMinY,
 		SpawnMaxY:                      cfg.World.SpawnMaxY,
 	}
-	clampLiveNetConfig(c)
 	return c
 }
 
-func clampLiveNetConfig(c *LiveNetConfig) {
-	if c.FanoutDropStreak < 1 {
-		c.FanoutDropStreak = 1
+func (c *LiveNetConfig) Validate() error {
+	ints := []struct {
+		name            string
+		value, min, max int64
+	}{
+		{"max_connections", int64(c.MaxConnections), 1, 65535},
+		{"rate_limit_msg_sec", int64(c.MessageRateLimit), 1, 100000},
+		{"rate_limit_burst", int64(c.BurstLimit), 1, 100000},
+		{"ip_conn_burst", int64(c.IPConnBurst), 0, 100000},
+		{"fanout_max_broadcast_bytes_per_tick", int64(c.FanoutMaxBroadcastBytesPerTick), 0, 1 << 40},
+		{"keyframe_divisor", int64(c.KeyframeDivisor), 0, 100000},
+		{"fanout_queue_shed_depth", int64(c.FanoutQueueShedDepth), 0, 32},
+		{"fanout_drop_streak", int64(c.FanoutDropStreak), 1, 100000},
+		{"write_batch_size", int64(c.WriteBatchSize), 1, 64},
+		{"fanout_fair_debt_max", int64(c.FanoutFairDebtMax), 0, 100000},
+		{"fanout_fair_debt_inc", int64(c.FanoutFairDebtInc), 0, 100000},
+		{"fanout_fair_debt_dec", int64(c.FanoutFairDebtDec), 0, 100000},
+		{"fanout_fair_debt_weight_ns", c.FanoutFairDebtWeightNs, 0, int64(time.Second)},
+		{"fanout_round_robin_weight_ns", c.FanoutRoundRobinWeightNs, 0, int64(time.Second)},
+		{"fanout_critical_window", c.FanoutCriticalWindowNs, 0, int64(time.Hour)},
+		{"fanout_critical_boost_ns", c.FanoutCriticalBoostNs, 0, int64(time.Hour)},
+		{"fanout_min_recipients_per_tick", int64(c.FanoutMinRecipientsPerTick), 1, 65535},
+		{"fanout_max_recipients_per_tick", int64(c.FanoutMaxRecipientsPerTick), 0, 65535},
+		{"fanout_target", int64(c.FanoutTarget), 1, int64(time.Minute)},
+		{"world_state_active_staleness", c.WorldStateActiveStalenessNs, 1, int64(time.Hour)},
+		{"world_state_idle_staleness", c.WorldStateIdleStalenessNs, 1, int64(time.Hour)},
+		{"world_state_active_window", c.WorldStateActiveWindowNs, 1, int64(time.Hour)},
 	}
-	if c.WriteBatchSize < 1 {
-		c.WriteBatchSize = 1
+	for _, field := range ints {
+		if field.value < field.min || field.value > field.max {
+			return fmt.Errorf("%s must be between %d and %d", field.name, field.min, field.max)
+		}
 	}
-	if c.FanoutMaxBroadcastBytesPerTick < 0 {
-		c.FanoutMaxBroadcastBytesPerTick = 0
-	}
-	if c.FanoutQueueShedDepth < 1 {
-		c.FanoutQueueShedDepth = 0
-	}
-	if c.FanoutFairDebtMax < 0 {
-		c.FanoutFairDebtMax = 0
-	}
-	if c.FanoutFairDebtInc < 0 {
-		c.FanoutFairDebtInc = 0
-	}
-	if c.FanoutFairDebtDec < 0 {
-		c.FanoutFairDebtDec = 0
-	}
-	if c.FanoutFairDebtWeightNs < 0 {
-		c.FanoutFairDebtWeightNs = 0
-	}
-	if c.FanoutRoundRobinWeightNs < 0 {
-		c.FanoutRoundRobinWeightNs = 0
-	}
-	if c.FanoutCriticalWindowNs < 0 {
-		c.FanoutCriticalWindowNs = 0
-	}
-	if c.FanoutCriticalBoostNs < 0 {
-		c.FanoutCriticalBoostNs = 0
-	}
-	if c.FanoutMinRecipientsPerTick < 1 {
-		c.FanoutMinRecipientsPerTick = 1
+	if !finiteRange(c.IPConnRate, 0, 100000) || c.IPConnRate > 0 && c.IPConnBurst < 1 {
+		return fmt.Errorf("invalid IP rate limit")
 	}
 	if c.FanoutMaxRecipientsPerTick > 0 && c.FanoutMinRecipientsPerTick > c.FanoutMaxRecipientsPerTick {
-		c.FanoutMinRecipientsPerTick = c.FanoutMaxRecipientsPerTick
-	}
-	if c.FanoutTarget <= 0 {
-		c.FanoutTarget = 12 * time.Millisecond
-	}
-	if c.WorldStateActiveStalenessNs <= 0 {
-		c.WorldStateActiveStalenessNs = (150 * time.Millisecond).Nanoseconds()
+		return fmt.Errorf("fanout minimum exceeds maximum")
 	}
 	if c.WorldStateIdleStalenessNs < c.WorldStateActiveStalenessNs {
-		c.WorldStateIdleStalenessNs = c.WorldStateActiveStalenessNs
+		return fmt.Errorf("idle staleness must be >= active staleness")
 	}
-	if c.WorldStateActiveWindowNs <= 0 {
-		c.WorldStateActiveWindowNs = (1 * time.Second).Nanoseconds()
+	if c.SpawnMaxX <= c.SpawnMinX || c.SpawnMaxY <= c.SpawnMinY || c.SpawnMaxX > c.WorldWidth || c.SpawnMaxY > c.WorldHeight {
+		return fmt.Errorf("spawn area must be nonempty and inside world bounds")
 	}
-	if c.MaxConnections < 1 {
-		c.MaxConnections = 1
-	}
-	if c.SpawnMaxX <= c.SpawnMinX {
-		c.SpawnMaxX = c.SpawnMinX + 1
-	}
-	if c.SpawnMaxY <= c.SpawnMinY {
-		c.SpawnMaxY = c.SpawnMinY + 1
-	}
+	return nil
 }
 
 type LiveNet struct {
+	mu  sync.Mutex
 	ptr atomic.Pointer[LiveNetConfig]
 }
 
@@ -150,13 +139,18 @@ func (l *LiveNet) Load() *LiveNetConfig {
 	return l.ptr.Load()
 }
 
-func (l *LiveNet) Update(mutate func(*LiveNetConfig)) *LiveNetConfig {
-	curr := l.ptr.Load()
-	next := *curr
-	mutate(&next)
-	clampLiveNetConfig(&next)
+func (l *LiveNet) Update(mutate func(*LiveNetConfig) error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	next := *l.ptr.Load()
+	if err := mutate(&next); err != nil {
+		return err
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
 	l.ptr.Store(&next)
-	return &next
+	return nil
 }
 
 var LiveConfigKeys = []string{
@@ -192,34 +186,34 @@ var LiveConfigKeys = []string{
 
 func (c *LiveNetConfig) KeyValues() map[string]string {
 	return map[string]string{
-		"max_connections":                      strconv.Itoa(c.MaxConnections),
-		"rate_limit_msg_sec":                   strconv.Itoa(c.MessageRateLimit),
-		"rate_limit_burst":                     strconv.Itoa(c.BurstLimit),
-		"ip_conn_rate":                         strconv.FormatFloat(c.IPConnRate, 'f', -1, 64),
-		"ip_conn_burst":                        strconv.Itoa(c.IPConnBurst),
-		"fanout_max_broadcast_bytes_per_tick":  strconv.Itoa(c.FanoutMaxBroadcastBytesPerTick),
-		"velocity_replication":                 strconv.FormatBool(c.VelocityReplication),
-		"keyframe_divisor":                     strconv.Itoa(c.KeyframeDivisor),
-		"fanout_queue_shed_depth":              strconv.Itoa(c.FanoutQueueShedDepth),
-		"fanout_drop_streak":                   strconv.Itoa(int(c.FanoutDropStreak)),
-		"write_batch_size":                     strconv.Itoa(c.WriteBatchSize),
-		"fanout_fair_debt_max":                 strconv.Itoa(int(c.FanoutFairDebtMax)),
-		"fanout_fair_debt_inc":                 strconv.Itoa(int(c.FanoutFairDebtInc)),
-		"fanout_fair_debt_dec":                 strconv.Itoa(int(c.FanoutFairDebtDec)),
-		"fanout_fair_debt_weight_ns":           strconv.FormatInt(c.FanoutFairDebtWeightNs, 10),
-		"fanout_round_robin_weight_ns":         strconv.FormatInt(c.FanoutRoundRobinWeightNs, 10),
-		"fanout_critical_window_ms":            strconv.FormatInt(c.FanoutCriticalWindowNs/int64(time.Millisecond), 10),
-		"fanout_critical_boost_ns":             strconv.FormatInt(c.FanoutCriticalBoostNs, 10),
-		"fanout_min_recipients_per_tick":       strconv.Itoa(c.FanoutMinRecipientsPerTick),
-		"fanout_max_recipients_per_tick":       strconv.Itoa(c.FanoutMaxRecipientsPerTick),
-		"fanout_target_ms":                     strconv.FormatInt(int64(c.FanoutTarget/time.Millisecond), 10),
-		"world_state_active_staleness_ms":      strconv.FormatInt(c.WorldStateActiveStalenessNs/int64(time.Millisecond), 10),
-		"world_state_idle_staleness_ms":        strconv.FormatInt(c.WorldStateIdleStalenessNs/int64(time.Millisecond), 10),
-		"world_state_active_window_ms":         strconv.FormatInt(c.WorldStateActiveWindowNs/int64(time.Millisecond), 10),
-		"spawn_min_x":                          strconv.Itoa(int(c.SpawnMinX)),
-		"spawn_max_x":                          strconv.Itoa(int(c.SpawnMaxX)),
-		"spawn_min_y":                          strconv.Itoa(int(c.SpawnMinY)),
-		"spawn_max_y":                          strconv.Itoa(int(c.SpawnMaxY)),
+		"max_connections":                     strconv.Itoa(c.MaxConnections),
+		"rate_limit_msg_sec":                  strconv.Itoa(c.MessageRateLimit),
+		"rate_limit_burst":                    strconv.Itoa(c.BurstLimit),
+		"ip_conn_rate":                        strconv.FormatFloat(c.IPConnRate, 'f', -1, 64),
+		"ip_conn_burst":                       strconv.Itoa(c.IPConnBurst),
+		"fanout_max_broadcast_bytes_per_tick": strconv.Itoa(c.FanoutMaxBroadcastBytesPerTick),
+		"velocity_replication":                strconv.FormatBool(c.VelocityReplication),
+		"keyframe_divisor":                    strconv.Itoa(c.KeyframeDivisor),
+		"fanout_queue_shed_depth":             strconv.Itoa(c.FanoutQueueShedDepth),
+		"fanout_drop_streak":                  strconv.Itoa(int(c.FanoutDropStreak)),
+		"write_batch_size":                    strconv.Itoa(c.WriteBatchSize),
+		"fanout_fair_debt_max":                strconv.Itoa(int(c.FanoutFairDebtMax)),
+		"fanout_fair_debt_inc":                strconv.Itoa(int(c.FanoutFairDebtInc)),
+		"fanout_fair_debt_dec":                strconv.Itoa(int(c.FanoutFairDebtDec)),
+		"fanout_fair_debt_weight_ns":          strconv.FormatInt(c.FanoutFairDebtWeightNs, 10),
+		"fanout_round_robin_weight_ns":        strconv.FormatInt(c.FanoutRoundRobinWeightNs, 10),
+		"fanout_critical_window_ms":           strconv.FormatInt(c.FanoutCriticalWindowNs/int64(time.Millisecond), 10),
+		"fanout_critical_boost_ns":            strconv.FormatInt(c.FanoutCriticalBoostNs, 10),
+		"fanout_min_recipients_per_tick":      strconv.Itoa(c.FanoutMinRecipientsPerTick),
+		"fanout_max_recipients_per_tick":      strconv.Itoa(c.FanoutMaxRecipientsPerTick),
+		"fanout_target_ms":                    strconv.FormatInt(int64(c.FanoutTarget/time.Millisecond), 10),
+		"world_state_active_staleness_ms":     strconv.FormatInt(c.WorldStateActiveStalenessNs/int64(time.Millisecond), 10),
+		"world_state_idle_staleness_ms":       strconv.FormatInt(c.WorldStateIdleStalenessNs/int64(time.Millisecond), 10),
+		"world_state_active_window_ms":        strconv.FormatInt(c.WorldStateActiveWindowNs/int64(time.Millisecond), 10),
+		"spawn_min_x":                         strconv.Itoa(int(c.SpawnMinX)),
+		"spawn_max_x":                         strconv.Itoa(int(c.SpawnMaxX)),
+		"spawn_min_y":                         strconv.Itoa(int(c.SpawnMinY)),
+		"spawn_max_y":                         strconv.Itoa(int(c.SpawnMaxY)),
 	}
 }
 
@@ -262,6 +256,9 @@ func (c *LiveNetConfig) ApplyKey(key, value string) error {
 		if err != nil {
 			return err
 		}
+		if ms < 0 || ms > 86400000 {
+			return fmt.Errorf("duration out of range")
+		}
 		c.FanoutCriticalWindowNs = ms * int64(time.Millisecond)
 		return nil
 	case "fanout_critical_boost_ns":
@@ -275,12 +272,18 @@ func (c *LiveNetConfig) ApplyKey(key, value string) error {
 		if err != nil {
 			return err
 		}
+		if ms < 0 || ms > 86400000 {
+			return fmt.Errorf("duration out of range")
+		}
 		c.FanoutTarget = time.Duration(ms) * time.Millisecond
 		return nil
 	case "world_state_active_staleness_ms":
 		ms, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
 			return err
+		}
+		if ms < 0 || ms > 86400000 {
+			return fmt.Errorf("duration out of range")
 		}
 		c.WorldStateActiveStalenessNs = ms * int64(time.Millisecond)
 		return nil
@@ -289,12 +292,18 @@ func (c *LiveNetConfig) ApplyKey(key, value string) error {
 		if err != nil {
 			return err
 		}
+		if ms < 0 || ms > 86400000 {
+			return fmt.Errorf("duration out of range")
+		}
 		c.WorldStateIdleStalenessNs = ms * int64(time.Millisecond)
 		return nil
 	case "world_state_active_window_ms":
 		ms, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
 			return err
+		}
+		if ms < 0 || ms > 86400000 {
+			return fmt.Errorf("duration out of range")
 		}
 		c.WorldStateActiveWindowNs = ms * int64(time.Millisecond)
 		return nil
