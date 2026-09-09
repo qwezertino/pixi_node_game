@@ -78,7 +78,6 @@ const HTML = `
 </div>
 `;
 
-// Always-present, non-nullable columns — required on every unit.
 const CORE_FIELDS: Array<{ key: keyof CoreStatsForm; label: string; step?: string }> = [
     { key: "hp", label: "HP" },
     { key: "passiveDR", label: "Passive DR (0-1)", step: "0.01" },
@@ -123,7 +122,6 @@ const BOOL_FIELDS: Array<{ key: "requiresRoyalGuard" | "cleave" | "hasBraceStanc
     { key: "hasBraceStance", label: "Has brace stance" },
 ];
 
-// Nullable top-level scalars — empty input means "not set" (NULL in Postgres).
 const OPTIONAL_FIELDS: Array<{ key: string; label: string; step?: string; integer?: boolean }> = [
     { key: "comboSteps", label: "Combo steps", integer: true },
     { key: "comboWindowSeconds", label: "Combo window (s)", step: "0.01" },
@@ -134,15 +132,12 @@ const OPTIONAL_FIELDS: Array<{ key: string; label: string; step?: string; intege
     { key: "antiWoodStructureMultiplier", label: "Anti-wood-structure x", step: "0.01" },
 ];
 
-// Nested optional combat profiles — toggled on/off with a checkbox; unchecked
-// means "this unit doesn't have this mechanic" (every column in the group
-// gets written as NULL). See units.Definition / liveconfig.UnitStatsPatch.
 interface GroupFieldSpec {
     key: string;
     label: string;
     step?: string;
     integer?: boolean;
-    optional?: boolean; // nullable even while the group is enabled
+    optional?: boolean;
 }
 interface GroupSpec {
     key: "block" | "positionalBonus" | "opportunistBow" | "rogueQuiver" | "recon" | "fireArrow" | "dashThrust";

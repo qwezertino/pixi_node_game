@@ -38,10 +38,6 @@ export interface GameConfig {
 
 import { showLoadingError } from "./loadingScreen";
 
-// Fetched from the server at startup — there is no bundled fallback. Game
-// rules live only in Postgres now (see src/server/internal/liveconfig and
-// docker/postgres/init/001_init.sql); the server must be reachable at
-// GET /api/config for the client to boot at all.
 async function loadGameConfig(): Promise<GameConfig> {
   try {
     const res = await fetch("/api/config");

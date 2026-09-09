@@ -29,10 +29,6 @@ func main() {
 	liveConfigCtx, liveConfigCancel := context.WithCancel(context.Background())
 	defer liveConfigCancel()
 
-	// Postgres is mandatory: game/world rules (game_settings) and unit stats
-	// (units) live only in the database now, seeded once by
-	// docker/postgres/init/001_init.sql — there is no bundled-file fallback
-	// left to fall back to.
 	dbCtx, dbCancel := context.WithTimeout(liveConfigCtx, 5*time.Second)
 	liveStore, dbErr := liveconfig.Connect(dbCtx)
 	dbCancel()
@@ -95,10 +91,6 @@ func main() {
 		go liveStore.Watch(liveConfigCtx, gameServer.Live())
 	}
 
-	// Live-reload unit stats: any PATCH /api/admin/units/{typeId} (from this
-	// instance or another one behind the same DB) publishes here, and every
-	// connected server re-reads the whole `units` table and recomputes the
-	// move/stamina/attack tables — see internal/game.RecomputeUnitTables.
 	go liveStore.WatchUnits(liveConfigCtx, func() {
 		defs, err := liveStore.LoadUnitDefinitions(liveConfigCtx)
 		if err != nil {

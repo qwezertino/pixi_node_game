@@ -7,10 +7,6 @@ import (
 	"time"
 )
 
-// LiveNetConfig holds the subset of NetworkConfig (plus spawn bounds) that is
-// safe to change while the server is running: it only feeds per-tick fanout
-// decisions and per-connection setup, never anything baked into precomputed
-// tables (tick rate, world size, unit stats) or already-bound listeners.
 type LiveNetConfig struct {
 	MaxConnections                 int
 	MessageRateLimit               int
@@ -42,10 +38,6 @@ type LiveNetConfig struct {
 	SpawnMaxY                      uint16
 }
 
-// BuildLiveNetConfig seeds a LiveNetConfig from the static Config built at
-// startup (.env defaults). This is only the initial value: once the live
-// config store (Postgres/Redis, see internal/liveconfig) takes over, DB rows
-// win.
 func BuildLiveNetConfig(cfg *Config) *LiveNetConfig {
 	c := &LiveNetConfig{
 		MaxConnections:                 cfg.Net.MaxConnections,
@@ -81,9 +73,6 @@ func BuildLiveNetConfig(cfg *Config) *LiveNetConfig {
 	return c
 }
 
-// clampLiveNetConfig applies the same floors/derived rules the old
-// server.New() used to bake in once at startup. It must run on every
-// update too, since values can now change at runtime.
 func clampLiveNetConfig(c *LiveNetConfig) {
 	if c.FanoutDropStreak < 1 {
 		c.FanoutDropStreak = 1
@@ -147,10 +136,6 @@ func clampLiveNetConfig(c *LiveNetConfig) {
 	}
 }
 
-// LiveNet is a lock-free, hot-swappable holder for LiveNetConfig. Readers on
-// the tick/fanout hot path call Load() once per function and read fields off
-// the returned snapshot; writers (the DB watcher) call Update to publish a
-// brand new, fully-clamped snapshot atomically.
 type LiveNet struct {
 	ptr atomic.Pointer[LiveNetConfig]
 }
@@ -165,8 +150,6 @@ func (l *LiveNet) Load() *LiveNetConfig {
 	return l.ptr.Load()
 }
 
-// Update clones the current snapshot, applies mutate, clamps the result and
-// publishes it as the new snapshot in one atomic swap.
 func (l *LiveNet) Update(mutate func(*LiveNetConfig)) *LiveNetConfig {
 	curr := l.ptr.Load()
 	next := *curr
@@ -176,8 +159,6 @@ func (l *LiveNet) Update(mutate func(*LiveNetConfig)) *LiveNetConfig {
 	return &next
 }
 
-// LiveConfigKeys lists every DB-backed key in the order they should be
-// seeded, matched 1:1 with ApplyKey/KeyValues below.
 var LiveConfigKeys = []string{
 	"max_connections",
 	"rate_limit_msg_sec",
@@ -209,8 +190,6 @@ var LiveConfigKeys = []string{
 	"spawn_max_y",
 }
 
-// KeyValues renders every live key as its current string value, for seeding
-// the DB on first run.
 func (c *LiveNetConfig) KeyValues() map[string]string {
 	return map[string]string{
 		"max_connections":                      strconv.Itoa(c.MaxConnections),
@@ -244,9 +223,6 @@ func (c *LiveNetConfig) KeyValues() map[string]string {
 	}
 }
 
-// ApplyKey parses value and writes it onto the matching field. Unknown keys
-// are reported but never fatal — a typo in the DB shouldn't take the field
-// down, it should just be ignored (and logged by the caller).
 func (c *LiveNetConfig) ApplyKey(key, value string) error {
 	switch key {
 	case "max_connections":

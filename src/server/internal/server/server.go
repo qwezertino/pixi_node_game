@@ -130,32 +130,19 @@ func New(cfg *config.Config) *Server {
 	return server
 }
 
-// Live exposes the hot-swappable network config so callers (main.go's DB
-// watcher) can push live updates into it.
 func (s *Server) Live() *config.LiveNet {
 	return s.live
 }
 
-// SetStaticBlobs records the exact gameConfig.json/units.json bytes the
-// server booted with (from Postgres), so the TS client can fetch the same
-// values it would otherwise have bundled at build time — see /api/config
-// and /api/units. gameConfigJSON never changes after this (game rules need a
-// restart); unitsJSON can — see UpdateUnitsJSON.
 func (s *Server) SetStaticBlobs(gameConfigJSON, unitsJSON []byte) {
 	s.gameConfigJSON = gameConfigJSON
 	s.unitsJSON.Store(&unitsJSON)
 }
 
-// UpdateUnitsJSON swaps in freshly re-marshaled unit data after a live
-// reload (see internal/liveconfig.WatchUnits), so GET /api/units serves the
-// new values to any client that (re)connects from this point on.
 func (s *Server) UpdateUnitsJSON(unitsJSON []byte) {
 	s.unitsJSON.Store(&unitsJSON)
 }
 
-// RecomputeUnitTables re-derives the game loop's per-unit-type lookup tables
-// (move speed, stamina, attack/combo timing) from the current units.All().
-// Call after internal/units.LoadDefinitions picks up a change.
 func (s *Server) RecomputeUnitTables() {
 	s.gameWorld.RecomputeUnitTables()
 }

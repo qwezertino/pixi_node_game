@@ -94,11 +94,6 @@ type staminaStat struct {
 	sprintDrainPerTickCenti uint16
 }
 
-// unitTables holds every per-unit-type value derived from units.All() plus
-// the (fixed) tick rate. Read on the hot path from many tick-worker
-// goroutines, so it's swapped as one atomic pointer rather than mutated —
-// see RecomputeUnitTables, called once at startup and again whenever the
-// dev-only unit admin API changes a row (internal/server/admin.go).
 type unitTables struct {
 	staminaStats        map[uint8]staminaStat
 	moveStats           map[uint8]moveStat
@@ -171,11 +166,6 @@ func (gw *GameWorld) unitTables() *unitTables {
 	return gw.unitTablesPtr.Load()
 }
 
-// RecomputeUnitTables rebuilds every per-unit-type table from the current
-// units.All() and swaps it in atomically. Call after units.LoadDefinitions
-// picks up a change (see internal/liveconfig's unit watcher) — safe to call
-// from any goroutine, including while the game loop and tick workers are
-// running.
 func (gw *GameWorld) RecomputeUnitTables() {
 	gw.unitTablesPtr.Store(buildUnitTables(gw.cfg.Game.TickRate, gw.cfg.Game.UnitsPerMeter))
 }

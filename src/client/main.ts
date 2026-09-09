@@ -18,11 +18,6 @@ import { StatusBarWidget } from "./ui/statusBar";
 import { StaminaPredictor } from "./utils/staminaPredictor";
 import type { UnitDefinition } from "../shared/units";
 
-// Everything tied to one spawned life. Rebuilt by startSession() on first
-// load and again on every dev "🔄 Respawn" — see the note there for why a
-// page reload isn't needed. Long-lived, one-time app state (the PixiJS
-// Application, NetworkManager, PlayerManager, InputManager, ...) lives
-// outside this and is never recreated.
 interface Session {
     localUnit: UnitDefinition;
     playerSprite: AnimatedSprite;
@@ -116,9 +111,6 @@ interface Session {
 
     const playerManager = new PlayerManager(playerContainer, networkManager, coordinateConverter);
 
-    // The current life. null only while startSession() is mid-flight
-    // (unit-select screen showing, or waiting on the server's welcome) —
-    // every listener/ticker callback below checks for that and no-ops.
     let session: Session | null = null;
 
     async function startSession(): Promise<void> {
@@ -201,9 +193,6 @@ interface Session {
         };
     }
 
-    // Registered once — NetworkManager's onXxx callbacks accumulate rather
-    // than replace, so re-registering per session on every respawn would
-    // pile up duplicates. Each one reads whatever `session` currently is.
     networkManager.onUnitRoster((entries) => {
         if (!session) return;
         const own = entries[networkManager.getPlayerId()];

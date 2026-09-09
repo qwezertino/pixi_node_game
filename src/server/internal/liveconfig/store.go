@@ -1,25 +1,4 @@
-// Package liveconfig wires config.LiveNet to Postgres (source of truth,
-// persisted) and Redis (pub/sub fan-out of "something changed" events), and
-// also reads the static game_settings/units tables (see settings.go and
-// docker/postgres/init/001_init.sql) — everything the server needs now lives
-// in Postgres, seeded once by that migration.
-//
-// Flow for the live-tunable `game_config` table (rate limits, fanout tuning):
-//  1. Server.New builds an initial LiveNetConfig from .env defaults — this is
-//     only ever a seed value, applied via Seed's ON CONFLICT DO NOTHING.
-//  2. On startup, EnsureSchema+Seed create the table if missing and insert
-//     the seed values for any key not already present, so the DB becomes
-//     authoritative from then on without clobbering values an operator
-//     already changed.
-//  3. LoadInto pulls every row from Postgres and applies it onto the live
-//     config in a single atomic swap.
-//  4. Watch subscribes to a Redis channel; any publish there (from configctl,
-//     an admin panel, or another server instance) triggers a re-read of that
-//     one key from Postgres and a live, in-memory update.
-//
-// game_settings and units (settings.go) are read once at startup with no
-// live-reload and no fallback — see internal/config.GameSettings and
-// internal/units.LoadDefinitions.
+
 package liveconfig
 
 import (
@@ -39,9 +18,6 @@ const (
 	updatesChannel = "game_config_updates"
 	tableName      = "game_config"
 
-	// unitsUpdatesChannel carries no payload worth reading — any publish on
-	// it just means "reload the whole `units` table", since recomputing all
-	// 11 rows is cheap and a per-unit diff isn't worth the complexity.
 	unitsUpdatesChannel = "units_updates"
 )
 
@@ -50,9 +26,6 @@ type Store struct {
 	redis *redis.Client
 }
 
-// Connect dials Postgres and Redis using POSTGRES_*/REDIS_* env vars (see
-// .env). It returns (nil, err) if either is unreachable so the caller can
-// fall back to the static config instead of failing to boot.
 func Connect(ctx context.Context) (*Store, error) {
 	dsn := postgresDSNFromEnv()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -95,9 +68,6 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	return err
 }
 
-// Seed inserts any key from seed that isn't already present in the table.
-// Existing rows are left untouched — the DB, once populated, is the source
-// of truth going forward.
 func (s *Store) Seed(ctx context.Context, seed map[string]string) error {
 	for key, value := range seed {
 		_, err := s.pool.Exec(ctx, `
@@ -141,8 +111,6 @@ func (s *Store) getKey(ctx context.Context, key string) (string, bool, error) {
 	return value, true, nil
 }
 
-// SetKey upserts a value in Postgres and publishes a change notification on
-// Redis so every connected server instance re-reads it immediately.
 func (s *Store) SetKey(ctx context.Context, key, value string) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO `+tableName+` (key, value, updated_at) VALUES ($1, $2, now())
@@ -154,8 +122,6 @@ func (s *Store) SetKey(ctx context.Context, key, value string) error {
 	return s.redis.Publish(ctx, updatesChannel, key).Err()
 }
 
-// LoadInto applies every row currently in Postgres onto live in one atomic
-// update, so a partially-read DB never produces a torn snapshot.
 func (s *Store) LoadInto(ctx context.Context, live *config.LiveNet) error {
 	rows, err := s.LoadAll(ctx)
 	if err != nil {
@@ -171,8 +137,6 @@ func (s *Store) LoadInto(ctx context.Context, live *config.LiveNet) error {
 	return nil
 }
 
-// Watch blocks, applying every published key change onto live, until ctx is
-// cancelled. Run it in its own goroutine.
 func (s *Store) Watch(ctx context.Context, live *config.LiveNet) {
 	sub := s.redis.Subscribe(ctx, updatesChannel)
 	defer sub.Close()
@@ -205,15 +169,10 @@ func (s *Store) Watch(ctx context.Context, live *config.LiveNet) {
 	}
 }
 
-// PublishUnitsChanged tells every connected server instance to reload the
-// `units` table (see WatchUnits). Call it after any write to that table.
 func (s *Store) PublishUnitsChanged(ctx context.Context) error {
 	return s.redis.Publish(ctx, unitsUpdatesChannel, "reload").Err()
 }
 
-// WatchUnits blocks, calling onReload for every publish on the units
-// channel, until ctx is cancelled. Run it in its own goroutine — like Watch,
-// but for the whole `units` table rather than one config key at a time.
 func (s *Store) WatchUnits(ctx context.Context, onReload func()) {
 	sub := s.redis.Subscribe(ctx, unitsUpdatesChannel)
 	defer sub.Close()

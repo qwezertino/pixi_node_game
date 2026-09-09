@@ -68,10 +68,6 @@ type NetworkConfig struct {
 	WorldStateActiveWindow         time.Duration
 }
 
-// GameSettings mirrors the `game_settings` row in Postgres (see
-// docker/postgres/init/001_init.sql) — the single source for game/world
-// rules that used to live in gameConfig.json. No live-reload: these are
-// baked into precomputed tables and an already-bound listener at startup.
 type GameSettings struct {
 	TickRate        int
 	SyncIntervalSec int
@@ -90,9 +86,6 @@ type GameSettings struct {
 	WorldBackgroundColor string
 }
 
-// clientConfigView is the exact JSON shape the TS client expects at
-// GET /api/config (see src/shared/gameConfig.ts's GameConfig interface) —
-// what used to be the bundled gameConfig.json.
 type clientConfigView struct {
 	Network struct {
 		TickRate     int `json:"tickRate"`
@@ -130,12 +123,6 @@ type clientConfigView struct {
 	} `json:"colors"`
 }
 
-// Build applies .env overrides on top of settings loaded from Postgres and
-// returns both the internal Config the Go server runs on and the exact JSON
-// served to the client at GET /api/config — built from the same effective
-// values, so client and server can never see different tick rate, world
-// size, etc. (the whole reason those were pulled out of two separate bundled
-// files in the first place).
 func Build(gs *GameSettings) (*Config, []byte, error) {
 	tickRate := getEnvInt("TICK_RATE", gs.TickRate)
 	syncIntervalSec := getEnvInt("SYNC_INTERVAL_SEC", gs.SyncIntervalSec)

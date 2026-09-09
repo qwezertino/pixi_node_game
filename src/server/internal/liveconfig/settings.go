@@ -11,10 +11,6 @@ import (
 
 var ErrUnitNotFound = errors.New("unit not found")
 
-// LoadGameSettings reads the singleton `game_settings` row (see
-// docker/postgres/init/001_init.sql) — the static game/world rules that used
-// to live in gameConfig.json. There is no fallback: this table is expected
-// to exist and be seeded by the migration.
 func (s *Store) LoadGameSettings(ctx context.Context) (*config.GameSettings, error) {
 	var gs config.GameSettings
 	err := s.pool.QueryRow(ctx, `
@@ -35,10 +31,6 @@ func (s *Store) LoadGameSettings(ctx context.Context) (*config.GameSettings, err
 	return &gs, nil
 }
 
-// LoadUnitDefinitions reads every row of the `units` table (see
-// docker/postgres/init/001_init.sql) — the per-unit-type stats that used to
-// live in units.json. There is no fallback: this table is expected to exist
-// and be seeded by the migration.
 func (s *Store) LoadUnitDefinitions(ctx context.Context) ([]units.Definition, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT
@@ -185,13 +177,6 @@ func (s *Store) LoadUnitDefinitions(ctx context.Context) ([]units.Definition, er
 	return defs, nil
 }
 
-// BlockPatch, PositionalBonusPatch, ... mirror the nested optional combat
-// profiles on units.Definition (see internal/units). A nil group pointer on
-// UnitStatsPatch means "this unit doesn't have this mechanic" and writes
-// NULL to every column in the group; a non-nil group always writes concrete
-// values for that group's columns (RecoverySeconds inside BlockPatch is the
-// one field that's independently optional even when the group is present,
-// matching block_recovery_seconds being nullable on its own).
 type BlockPatch struct {
 	MeleeDR         float64
 	RangedDR        float64
@@ -238,11 +223,6 @@ type DashThrustPatch struct {
 	CooldownSeconds  float64
 }
 
-// UnitStatsPatch is the full set of unit fields the dev-only Unit Viewer
-// panel can edit (GET/PATCH /api/admin/units, see server.go) — every column
-// on the `units` row except the identity ones (type_id, id, display_name,
-// tier) and asset paths, which aren't balance knobs and would risk breaking
-// unit lookup or sprite loading if edited from this form.
 type UnitStatsPatch struct {
 	HP                         float64
 	PassiveDR                  float64
@@ -283,17 +263,6 @@ type UnitStatsPatch struct {
 	DashThrust      *DashThrustPatch
 }
 
-// UpdateUnitStats writes patch onto the unit row identified by typeID and
-// publishes a reload notification (see PublishUnitsChanged/WatchUnits) so
-// every connected server instance picks it up within moments — no restart.
-// Already-spawned players keep the HP/stamina they spawned with; only new
-// spawns (and everything computed per-tick: move speed, stamina regen, block
-// drain, attack/combo timing) see the new values. It does not touch schema,
-// seeding, id/display_name/tier, or asset paths — see UnitStatsPatch.
-//
-// Nil group/scalar pointers write NULL (pgx encodes a typed nil pointer as
-// SQL NULL) — that's how a unit's optional mechanics (block, dash-thrust,
-// combo, ...) get added or removed via this form, not just tuned.
 func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitStatsPatch) error {
 	var blockMeleeDR, blockRangedDR, blockDrainPerSecond, blockRecoverySeconds *float64
 	if patch.Block != nil {

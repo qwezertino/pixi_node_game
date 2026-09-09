@@ -1,6 +1,4 @@
-// configctl reads and writes the live game config stored in Postgres and
-// notifies running servers over Redis so they pick the change up immediately
-// — no restart, no redeploy. See internal/liveconfig for the wire format.
+
 package main
 
 import (

@@ -10,21 +10,10 @@ import (
 	"pixi_game_server/internal/units"
 )
 
-// EnableUnitAdminAPI wires PATCH /api/admin/units/{typeId} for the dev-only
-// Unit Viewer panel (see src/client/debug/unitViewerPanel.ts). Call it only
-// when ENABLE_UNIT_ADMIN_API=true (see cmd/server/main.go) — with no call,
-// Start() never registers the route, so production deployments never expose
-// a write path into game balance data.
 func (s *Server) EnableUnitAdminAPI(store *liveconfig.Store) {
 	s.adminStore = store
 }
 
-// unitStatsPatchRequest mirrors units.Definition's JSON shape (see
-// src/shared/units.ts) so the client can round-trip whatever GET /api/units
-// gave it. Pointer fields are the nullable/optional columns on `units` —
-// an absent (or explicit null) field decodes as nil and UpdateUnitStats
-// writes SQL NULL for it, so this is also how a mechanic (block, dash-thrust,
-// combo, ...) gets added to or removed from a unit, not just tuned.
 type unitStatsPatchRequest struct {
 	HP                         float64    `json:"hp"`
 	PassiveDR                  float64    `json:"passiveDR"`
@@ -109,11 +98,6 @@ type dashThrustPatchRequest struct {
 	CooldownSeconds  float64 `json:"cooldownSeconds"`
 }
 
-// handleAdminUpdateUnit only ever runs when EnableUnitAdminAPI registered it
-// (see Start()). It writes straight to Postgres and publishes a reload
-// notification (see internal/liveconfig.PublishUnitsChanged) — every
-// connected server picks it up within moments, no restart. Already-spawned
-// players keep the HP/stamina they spawned with; the response says so.
 func (s *Server) handleAdminUpdateUnit(w http.ResponseWriter, r *http.Request) {
 	typeID64, err := strconv.ParseUint(r.PathValue("typeId"), 10, 8)
 	if err != nil {

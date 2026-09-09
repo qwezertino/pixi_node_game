@@ -57,10 +57,6 @@ type DashThrust struct {
 	CooldownSeconds  float64 `json:"cooldownSeconds"`
 }
 
-// Definition is a unit's full stat block. json tags are used both ways: for
-// scanning out of the `units` Postgres table (see internal/liveconfig) and
-// for serving GET /api/units to the TS client, which needs the exact same
-// shape it used to get from the bundled units.json.
 type Definition struct {
 	TypeID      uint8  `json:"typeId"`
 	ID          string `json:"id"`
@@ -112,9 +108,6 @@ type Definition struct {
 
 const DefaultUnitType = "spearman"
 
-// state bundles the three derived lookups together so a reload can publish
-// them as one atomic pointer swap — readers never see a byID built from one
-// generation of defs paired with a byTypeID from another.
 type state struct {
 	all      []Definition
 	byID     map[string]Definition
@@ -124,19 +117,10 @@ type state struct {
 var current atomic.Pointer[state]
 
 func init() {
-	// Empty-but-non-nil default so All/Get/GetByTypeID/IsValid are safe to
-	// call before main.go's first LoadDefinitions (e.g. in tests that build
-	// a GameWorld without ever loading real unit data).
+
 	current.Store(&state{byID: map[string]Definition{}, byTypeID: map[uint8]Definition{}})
 }
 
-// LoadDefinitions replaces the active unit definitions with defs — at
-// startup from main.go, and again any time the dev-only unit admin API
-// changes a row (see internal/liveconfig's unit watcher and
-// internal/server/admin.go). There is no embedded/file fallback: Postgres's
-// `units` table is authoritative. Safe to call concurrently with All/Get/
-// GetByTypeID/IsValid — it's a single atomic pointer swap, not a mutation of
-// shared maps.
 func LoadDefinitions(defs []Definition) error {
 	newByID := make(map[string]Definition, len(defs))
 	newByTypeID := make(map[uint8]Definition, len(defs))

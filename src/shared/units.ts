@@ -116,8 +116,6 @@ export interface UnitDefinition {
 
 import { showLoadingError } from "./loadingScreen";
 
-// Fetched from the server at startup — there is no bundled fallback. Unit
-// stats live only in Postgres now, see gameConfig.ts for why.
 async function loadUnits(): Promise<UnitDefinition[]> {
     try {
         const res = await fetch("/api/units");
