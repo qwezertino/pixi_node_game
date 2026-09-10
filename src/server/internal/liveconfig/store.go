@@ -7,9 +7,11 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -19,12 +21,29 @@ import (
 const (
 	updatesChannel = "game_config_updates"
 	tableName      = "game_config"
+	revisionTable  = "game_config_revision"
 
 	unitsUpdatesChannel = "units_updates"
 )
 
+// dbPool is the subset of *pgxpool.Pool used by Store. It exists so tests can
+// substitute a mock pool.
+type dbPool interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Ping(ctx context.Context) error
+	Close()
+}
+
+type dbQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 type Store struct {
-	pool  *pgxpool.Pool
+	pool  dbPool
 	redis *redis.Client
 }
 
@@ -60,12 +79,26 @@ func (s *Store) Close() {
 }
 
 func (s *Store) EnsureSchema(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `
+	if _, err := s.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+tableName+` (
 			key        TEXT PRIMARY KEY,
 			value      TEXT NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)
+	`); err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS `+revisionTable+` (
+			id       INTEGER PRIMARY KEY,
+			revision BIGINT NOT NULL DEFAULT 0
+		)
+	`); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO `+revisionTable+` (id, revision) VALUES (1, 0)
+		ON CONFLICT (id) DO NOTHING
 	`)
 	return err
 }
@@ -83,8 +116,8 @@ func (s *Store) Seed(ctx context.Context, seed map[string]string) error {
 	return nil
 }
 
-func (s *Store) LoadAll(ctx context.Context) (map[string]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT key, value FROM `+tableName)
+func loadAll(ctx context.Context, db dbQuerier) (map[string]string, error) {
+	rows, err := db.Query(ctx, `SELECT key, value FROM `+tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +134,10 @@ func (s *Store) LoadAll(ctx context.Context) (map[string]string, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) LoadAll(ctx context.Context) (map[string]string, error) {
+	return loadAll(ctx, s.pool)
+}
+
 func (s *Store) getKey(ctx context.Context, key string) (string, bool, error) {
 	var value string
 	err := s.pool.QueryRow(ctx, `SELECT value FROM `+tableName+` WHERE key = $1`, key).Scan(&value)
@@ -114,83 +151,99 @@ func (s *Store) getKey(ctx context.Context, key string) (string, bool, error) {
 }
 
 // SetKey sets a single live config key. See SetKeys for the atomicity and
-// recovery guarantees.
+// concurrency guarantees.
 func (s *Store) SetKey(ctx context.Context, key, value string) error {
 	return s.SetKeys(ctx, map[string]string{key: value})
 }
 
-// SetKeys applies patch as one atomic change to the live config: every key
-// in patch is validated and persisted together, so related keys (for
-// example a min/max pair) can be moved from one valid combination to
-// another in a single call instead of racing two separate SetKey calls
-// against each other.
-//
-// Unlike the old SetKey, this does not require every value already stored
-// in the database to be valid on its own: it starts from the raw stored
-// rows, overlays patch on top, and only then validates the resulting
-// snapshot. A row left over from a bad direct SQL edit therefore no longer
-// blocks fixing that very row (or any other key) through this API — any
-// other still-invalid legacy key is simply left out of the validated
-// snapshot and keeps its old on-disk value untouched.
+// SetKeys applies patch as one atomic, serialized change to the live config:
+// the current config revision row is locked first, the stored keys are read
+// and merged with patch under that lock, the merged result is validated as a
+// whole, and only then is patch written and the revision advanced — all in
+// one transaction. On success it publishes a single notification carrying
+// the new revision number.
 func (s *Store) SetKeys(ctx context.Context, patch map[string]string) error {
 	if len(patch) == 0 {
 		return nil
 	}
 
-	settings, err := s.LoadGameSettings(ctx)
+	revision, err := s.setKeysTx(ctx, patch)
 	if err != nil {
 		return err
+	}
+	return s.redis.Publish(ctx, updatesChannel, strconv.FormatInt(revision, 10)).Err()
+}
+
+func (s *Store) setKeysTx(ctx context.Context, patch map[string]string) (int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := lockConfigRevision(ctx, tx); err != nil {
+		return 0, err
+	}
+
+	settings, err := loadGameSettings(ctx, tx)
+	if err != nil {
+		return 0, err
 	}
 	cfg, _, err := config.Build(settings)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	raw, err := s.LoadAll(ctx)
+	raw, err := loadAll(ctx, tx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := resolveLiveNetPatch(config.BuildLiveNetConfig(cfg), raw, patch); err != nil {
-		return err
+		return 0, err
 	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
 
 	for key, value := range patch {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO `+tableName+` (key, value, updated_at) VALUES ($1, $2, now())
 			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
 		`, key, value); err != nil {
-			return err
+			return 0, err
 		}
+	}
+
+	revision, err := bumpConfigRevision(ctx, tx)
+	if err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return err
+		return 0, err
 	}
-
-	for key := range patch {
-		if err := s.redis.Publish(ctx, updatesChannel, key).Err(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return revision, nil
 }
 
-// resolveLiveNetPatch validates patch against a snapshot built from raw
-// stored key/value rows: patch is applied first, atomically, as one group
-// (so cross-field invariants between patched keys are enforced together);
-// any other raw key is then layered in best-effort, one at a time, and
-// silently skipped (keeping baseline's value for it) if it no longer
-// validates. This lets a single still-invalid legacy row be fixed, or any
-// other key be changed, without that legacy row blocking every write.
-func resolveLiveNetPatch(baseline *config.LiveNetConfig, raw map[string]string, patch map[string]string) (*config.LiveNetConfig, error) {
-	live := config.NewLiveNet(baseline)
+func lockConfigRevision(ctx context.Context, tx pgx.Tx) (int64, error) {
+	var revision int64
+	err := tx.QueryRow(ctx, `SELECT revision FROM `+revisionTable+` WHERE id = 1 FOR UPDATE`).Scan(&revision)
+	return revision, err
+}
 
+func bumpConfigRevision(ctx context.Context, tx pgx.Tx) (int64, error) {
+	var revision int64
+	err := tx.QueryRow(ctx, `UPDATE `+revisionTable+` SET revision = revision + 1 WHERE id = 1 RETURNING revision`).Scan(&revision)
+	return revision, err
+}
+
+func resolveLiveNetPatch(baseline *config.LiveNetConfig, raw map[string]string, patch map[string]string) (*config.LiveNetConfig, error) {
+	merged := make(map[string]string, len(raw)+len(patch))
+	for key, value := range raw {
+		merged[key] = value
+	}
+	for key, value := range patch {
+		merged[key] = value
+	}
+
+	live := config.NewLiveNet(baseline)
 	if err := live.Update(func(c *config.LiveNetConfig) error {
-		for key, value := range patch {
+		for key, value := range merged {
 			if err := c.ApplyKey(key, value); err != nil {
 				return fmt.Errorf("%s: %w", key, err)
 			}
@@ -199,20 +252,11 @@ func resolveLiveNetPatch(baseline *config.LiveNetConfig, raw map[string]string, 
 	}); err != nil {
 		return nil, err
 	}
-
-	for key, value := range raw {
-		if _, patched := patch[key]; patched {
-			continue
-		}
-		key, value := key, value
-		if err := live.Update(func(c *config.LiveNetConfig) error { return c.ApplyKey(key, value) }); err != nil {
-			slog.Warn("live config: ignoring stored value that no longer validates", "key", key, "value", value, "error", err)
-		}
-	}
-
 	return live.Load(), nil
 }
 
+// LoadInto reloads every stored key from scratch and applies it to live as
+// one atomically validated snapshot.
 func (s *Store) LoadInto(ctx context.Context, live *config.LiveNet) error {
 	rows, err := s.LoadAll(ctx)
 	if err != nil {
@@ -228,6 +272,9 @@ func (s *Store) LoadInto(ctx context.Context, live *config.LiveNet) error {
 	})
 }
 
+// Watch listens for config-revision notifications and, for each one,
+// reloads and applies the entire stored config to live as a single atomic
+// snapshot rather than key by key.
 func (s *Store) Watch(ctx context.Context, live *config.LiveNet) {
 	sub := s.redis.Subscribe(ctx, updatesChannel)
 	defer sub.Close()
@@ -241,20 +288,11 @@ func (s *Store) Watch(ctx context.Context, live *config.LiveNet) {
 			if !ok {
 				return
 			}
-			key := msg.Payload
-			value, found, err := s.getKey(ctx, key)
-			if err != nil {
-				slog.Error("live config: failed to reload key after notification", "key", key, "error", err)
+			if err := s.LoadInto(ctx, live); err != nil {
+				slog.Error("live config: failed to apply snapshot after notification", "revision", msg.Payload, "error", err)
 				continue
 			}
-			if !found {
-				continue
-			}
-			if err := live.Update(func(c *config.LiveNetConfig) error { return c.ApplyKey(key, value) }); err != nil {
-				slog.Error("live config rejected", "key", key, "error", err)
-				continue
-			}
-			slog.Info("live config updated", "key", key, "value", value)
+			slog.Info("live config updated", "revision", msg.Payload)
 		}
 	}
 }

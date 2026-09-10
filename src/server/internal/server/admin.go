@@ -16,52 +16,6 @@ func (s *Server) EnableUnitAdminAPI(store *liveconfig.Store) {
 	s.adminStore = store
 }
 
-type blockPatchRequest struct {
-	MeleeDR         float64  `json:"meleeDR"`
-	RangedDR        float64  `json:"rangedDR"`
-	DrainPerSecond  float64  `json:"drainPerSecond"`
-	RecoverySeconds *float64 `json:"recoverySeconds"`
-}
-
-type positionalBonusPatchRequest struct {
-	StaminaCostReductionPct float64 `json:"staminaCostReductionPct"`
-	MinNearbyAllies         int     `json:"minNearbyAllies"`
-}
-
-type opportunistBowPatchRequest struct {
-	Damage          float64 `json:"damage"`
-	Range           float64 `json:"range"`
-	CooldownSeconds float64 `json:"cooldownSeconds"`
-}
-
-type rogueQuiverPatchRequest struct {
-	Damage                float64 `json:"damage"`
-	Range                 float64 `json:"range"`
-	Charges               int     `json:"charges"`
-	RechargeSeconds       float64 `json:"rechargeSeconds"`
-	ExecuteMultiplier     float64 `json:"executeMultiplier"`
-	ExecuteHpThresholdPct float64 `json:"executeHpThresholdPct"`
-}
-
-type reconPatchRequest struct {
-	ViewRadiusBonusPct    float64 `json:"viewRadiusBonusPct"`
-	DetectionRadiusMeters float64 `json:"detectionRadiusMeters"`
-}
-
-type fireArrowPatchRequest struct {
-	Damage                    float64 `json:"damage"`
-	StructureDamageMultiplier float64 `json:"structureDamageMultiplier"`
-	WoodCostPerShot           int     `json:"woodCostPerShot"`
-}
-
-type dashThrustPatchRequest struct {
-	DistanceMeters   float64 `json:"distanceMeters"`
-	WindupSeconds    float64 `json:"windupSeconds"`
-	RecoverySeconds  float64 `json:"recoverySeconds"`
-	DamageMultiplier float64 `json:"damageMultiplier"`
-	CooldownSeconds  float64 `json:"cooldownSeconds"`
-}
-
 func isJSONNull(raw json.RawMessage) bool {
 	return string(raw) == "null"
 }

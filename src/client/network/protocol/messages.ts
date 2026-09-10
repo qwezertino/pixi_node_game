@@ -26,6 +26,7 @@ export interface PlayerState {
     movementVector?: { dx: number; dy: number };
     inputSequence?: number;
     attackStartTick?: number;
+    moveRemainderMilli?: number;
 }
 
 export interface ClientMessage {
@@ -155,7 +156,7 @@ export interface UnitRosterMessage extends ServerMessage {
     entries: Record<string, PlayerAttributes>;
 }
 
-export const PROTOCOL_VERSION = 13;
+export const PROTOCOL_VERSION = 14;
 
 export enum MessageType {
     JOIN = 1,

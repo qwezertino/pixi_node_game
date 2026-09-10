@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the server, bundles the real client decoder, then runs every probe against a
-# freshly started server. Any probe failing fails the run.
+# Builds the server, bundles the real client decoder and movement formula, then runs
+# every probe against a freshly started server. Any probe failing fails the run.
 #
 # Usage: utils/testing/protocol/run.sh [probe-name ...]
 #
@@ -12,7 +12,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 HERE="$ROOT/utils/testing/protocol"
-WORK="${TMPDIR:-/tmp}/pixi-protocol-probes"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pixi-protocol-probes.XXXXXX")"
 SERVER_PID=""
 PG_CONTAINER=""
 REDIS_CONTAINER=""
@@ -53,10 +53,23 @@ start_isolated_db() {
         return
     fi
     if ! command -v docker > /dev/null; then
-        echo "⚠ docker not found — reusing whatever POSTGRES_HOST/REDIS_HOST already point at"
-        echo "  (recommendation: install docker, or run against docker/docker-compose.yml's postgres+redis)"
-        return
+        echo "✗ docker not found and GAME_TEST_ISOLATED_DB is not 'off'"
+        echo "  refusing to fall back to POSTGRES_HOST/REDIS_HOST implicitly: this run would"
+        echo "  EnsureSchema/Seed and subscribe against whatever those already point at,"
+        echo "  which may be a real dev/CI database."
+        echo "  install docker, or set GAME_TEST_ISOLATED_DB=off to explicitly opt in to"
+        echo "  reusing the already-configured POSTGRES_HOST/REDIS_HOST."
+        exit 1
     fi
+
+    # The scratch fixture (DB_ENV, below) must be the only source of DB/Redis coordinates
+    # for the server this script starts. A REDIS_PASSWORD inherited from the calling
+    # shell's dev/CI environment would otherwise leak into this scratch run — the scratch
+    # Redis started below has no password, so a client that tries to AUTH with one left
+    # over from the host environment would simply fail to connect. Scoped to this
+    # function, not the top of the script, so GAME_TEST_ISOLATED_DB=off still gets
+    # whatever REDIS_PASSWORD the real stack it points at actually needs.
+    unset REDIS_PASSWORD
 
     local pg_port redis_port suffix
     suffix="$$-$RANDOM"
@@ -93,6 +106,7 @@ start_isolated_db() {
     done
     [ "$pg_ready" -eq 1 ] || { echo "scratch Postgres did not become ready"; docker logs "$PG_CONTAINER" 2>&1 | tail -20 || true; exit 1; }
 
+    local redis_ready=0
     for _ in $(seq 1 60); do
         if docker exec "$REDIS_CONTAINER" redis-cli ping > /dev/null 2>&1; then
             redis_ready=1
@@ -109,12 +123,20 @@ start_isolated_db() {
 echo "▶ building server"
 (cd "$ROOT/src/server" && go build -o "$WORK/gameserver" ./cmd/server)
 
-echo "▶ bundling the client decoder"
-# Probes decode with the shipped decoder, not a copy of it: a world-state frame has no
-# per-record framing, so a drifted decoder yields wrong player IDs instead of an error.
+echo "▶ bundling the client decoder and movement formula"
+# Probes decode with the shipped decoder, and predict movement with the shipped
+# formula, rather than copies of either: a world-state frame has no per-record framing,
+# so a drifted decoder yields wrong player IDs instead of an error, and a hand-rolled
+# speed formula can hide or fake the exact rounding drift this is meant to catch.
+# Bundled into this run's own $WORK, never into the repo tree, so concurrent runs (e.g.
+# parallel CI jobs) never race over the same decoder/binary/log files.
 (cd "$ROOT" && npx esbuild src/client/network/protocol/binaryProtocol.ts \
     --bundle --format=esm --platform=neutral --log-level=warning \
-    --outfile="$HERE/lib/proto.mjs")
+    --outfile="$WORK/proto.mjs")
+(cd "$ROOT" && npx esbuild src/client/utils/movement.ts \
+    --bundle --format=esm --platform=neutral --log-level=warning \
+    --outfile="$WORK/movement.mjs")
+export GAME_PROTOCOL_DIR="$WORK"
 
 start_isolated_db
 

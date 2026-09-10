@@ -7,20 +7,23 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 HERE="$ROOT/utils/testing/protocol"
-WORK="${TMPDIR:-/tmp}/pixi-protocol-probes"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pixi-protocol-probes.XXXXXX")"
 CLIENTS="${1:-12}"; TURNS="${2:-1.5}"; SECS="${3:-10}"
 SERVER_PID=""
 
 cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; }
 trap cleanup EXIT
 
-mkdir -p "$WORK"
 cp "$ROOT/src/shared/gameConfig.json" "$ROOT/src/server/internal/config/"
 (cd "$ROOT/src/server" && go build -o "$WORK/gameserver" ./cmd/server) || exit 1
 rm -f "$ROOT/src/server/internal/config/gameConfig.json"
 (cd "$ROOT" && npx esbuild src/client/network/protocol/binaryProtocol.ts \
     --bundle --format=esm --platform=neutral --log-level=warning \
-    --outfile="$HERE/lib/proto.mjs") || exit 1
+    --outfile="$WORK/proto.mjs") || exit 1
+(cd "$ROOT" && npx esbuild src/client/utils/movement.ts \
+    --bundle --format=esm --platform=neutral --log-level=warning \
+    --outfile="$WORK/movement.mjs") || exit 1
+export GAME_PROTOCOL_DIR="$WORK"
 
 run_mode() {
     VELOCITY_REPLICATION="$1" STATIC_DIR="$WORK" "$WORK/gameserver" > "$WORK/ab_$1.log" 2>&1 &

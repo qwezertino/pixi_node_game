@@ -7,6 +7,12 @@ import { GameClient, loadProtocol, sleep, DIRECTIONS, stats, report } from '../l
 const STEPS = Number(process.env.STEPS ?? 300);
 const TURN_EVERY = Number(process.env.TURN_EVERY ?? 15);
 
+// The wire carries moveRemainderMilli, so the client replays the server's exact
+// fixed-point integrator rather than a rounded approximation of it — a suppressed
+// player's tracked belief must therefore match the next authoritative record exactly,
+// not just within some tolerance.
+const MAX_MID_MOVEMENT_ERROR_UNITS = 0;
+
 const protocol = await loadProtocol();
 const mover = await GameClient.connect(protocol);
 const watcher = await GameClient.connect(protocol);
@@ -30,13 +36,22 @@ const error = belief && authoritative
 const reckonShare = watcher.deadReckoned / Math.max(watcher.deadReckoned + watcher.serverRecords, 1);
 const failures = [...mover.decodeFailures, ...watcher.decodeFailures];
 
+// A STOP always sends an absolute position, wiping out whatever drift accumulated
+// during the run — checking only after STOP would hide exactly the bug (accumulated
+// suppression error) this probe exists to catch. maxPredictionError() instead compares
+// authoritative-vs-predicted on every pair of authoritative records received *during*
+// movement, at the same worldTick, using the real client predictor.
+const midMovementError = watcher.maxPredictionError();
+
 mover.close(); watcher.close();
 report('dead reckoning: converges on the authoritative position', [
     { label: 'latest transition acknowledged', actual: `${mover.lastAckSequence}/${mover.sequence}`, pass: mover.lastAckSequence === mover.sequence },
     { label: 'reconstructed position error', actual: error === null ? 'no samples' : `${error.toFixed(2)}px`, pass: error === 0 },
+    { label: 'mid-movement prediction error', actual: `${midMovementError.toFixed(2)}px`, pass: midMovementError <= MAX_MID_MOVEMENT_ERROR_UNITS },
     { label: 'decoder failures', actual: failures.length, pass: failures.length === 0 },
 ], {
     reckonedShare: `${(100 * reckonShare).toFixed(1)}%`,
     recordsPerFrame: +(watcher.records / Math.max(watcher.frames, 1)).toFixed(2),
     bytesPerFrame: +(watcher.bytes / Math.max(watcher.frames, 1)).toFixed(1),
+    predictionSamples: watcher.predictionSamples.length,
 });

@@ -46,8 +46,6 @@ func ValidateDefinition(u Definition) error {
 		}
 	}
 
-	// These map to Postgres SMALLINT columns (int2, range -32768..32767); the
-	// generic 0..65535 check in validateNumbers is too wide for them.
 	type smallintField struct {
 		name string
 		v    int

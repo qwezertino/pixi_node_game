@@ -10,24 +10,35 @@ utils/testing/protocol/run.sh pacing           # one probe
 utils/testing/protocol/ab-velocity.sh 12 1.5   # velocity replication A/B
 ```
 
-`run.sh` builds the server, starts it on a scratch directory, runs the probes and fails
-if any probe fails or the server logs an error. No manual setup.
+`run.sh` builds the server, starts it in its own temp directory (a fresh `mktemp -d` per
+run, so parallel runs never share a binary/log/decoder), runs the probes and fails if
+any probe fails or the server logs an error. No manual setup.
 
-## Why they bundle the client decoder
+By default it also spins up scratch Postgres/Redis containers scoped to the run — set
+`GAME_TEST_ISOLATED_DB=off` to explicitly reuse whatever `POSTGRES_HOST`/`REDIS_HOST`
+are already configured to instead. Without Docker and without that explicit opt-in,
+`run.sh` fails rather than silently falling back to a real dev/CI database.
 
-Every probe decodes frames with `src/client/network/protocol/binaryProtocol.ts`,
-bundled by `run.sh` into `lib/proto.mjs` (git-ignored). A hand-written copy would drift.
-That matters more than usual here: a world-state frame carries no per-record framing, so
-a decoder that disagrees with the server does not fail — it silently produces wrong
-player IDs. Bundling the shipped decoder is what makes a wire-format change verifiable.
+## Why they bundle the client decoder and movement formula
+
+Every probe decodes frames with `src/client/network/protocol/binaryProtocol.ts`, and
+predicts movement with `src/client/utils/movement.ts`'s `milliRatePerTick`/
+`integrateRemainder` — the same fixed-point integrator the server carries
+`moveRemainderMilli` for — both bundled by `run.sh` into the run's temp directory
+(`$GAME_PROTOCOL_DIR`). Hand-written copies would drift. That matters more than usual
+here: a world-state frame carries no per-record framing, so a decoder that disagrees
+with the server does not fail — it silently produces wrong player IDs. And a hand-rolled
+speed formula can hide, or fake, the exact client-side drift these probes exist to
+catch. Bundling the shipped code is what makes a wire-format or prediction change
+verifiable at all.
 
 ## The probes
 
 | Probe | Pins |
 |---|---|
-| `determinism` | A held vector uses one START and one STOP; travel equals `client ticks × playerSpeedPerTick` for every client's view. |
+| `determinism` | A held vector uses one START and one STOP, timestamped by the server's own worldTick (not wall-clock sleep counts); every watcher's reconstructed travel matches the mover's own authoritative ACK exactly. |
 | `pacing` | Replication lands on a steady cadence. Jitter is paid for twice — fewer updates, and a larger interpolation delay to hide them. |
-| `dead-reckoning` | A watcher reconstructing a mover from velocity alone converges exactly on that mover's authoritative `MOVEMENT_ACK`. |
+| `dead-reckoning` | A watcher reconstructing a mover from velocity and the wire `moveRemainderMilli` converges exactly on that mover's authoritative `MOVEMENT_ACK`, both after STOP and, on every authoritative record received while still moving, against the belief carried since the previous one — zero drift, not just bounded drift, since the client now replays the server's exact integrator. |
 | `ack-flow` | Several input transitions inside one replication interval coalesce to the latest authoritative ACK. |
 | `resilience` | Duplicate transitions are idempotent; a rate-limit burst closes the stream instead of silently losing a command. |
 | `bandwidth` | Not pass/fail — reports records and bytes on the wire plus the delta composition. Used by `ab-velocity.sh`. |

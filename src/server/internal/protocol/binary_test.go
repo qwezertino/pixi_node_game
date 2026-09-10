@@ -158,7 +158,7 @@ func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, 
 			shift += 7
 		}
 
-		const recordTail = 11
+		const recordTail = 13
 		if offset+recordTail > len(buf) {
 			t.Fatal("truncated player record")
 		}
@@ -167,15 +167,16 @@ func decodeWorldState(t *testing.T, buf []byte) (uint8, uint32, uint32, uint16, 
 
 		flags := buf[offset+6]
 		players = append(players, types.PlayerState{
-			ID:              id,
-			X:               binary.LittleEndian.Uint16(buf[offset:]),
-			Y:               binary.LittleEndian.Uint16(buf[offset+2:]),
-			VX:              int8(buf[offset+4]),
-			VY:              int8(buf[offset+5]),
-			State:           flags & flagsStateMask,
-			Sprinting:       flags&flagsSprinting != 0,
-			Direction:       (flags >> 6) & 0x03,
-			AttackStartTick: binary.LittleEndian.Uint32(buf[offset+7:]),
+			ID:                 id,
+			X:                  binary.LittleEndian.Uint16(buf[offset:]),
+			Y:                  binary.LittleEndian.Uint16(buf[offset+2:]),
+			VX:                 int8(buf[offset+4]),
+			VY:                 int8(buf[offset+5]),
+			State:              flags & flagsStateMask,
+			Sprinting:          flags&flagsSprinting != 0,
+			Direction:          (flags >> 6) & 0x03,
+			AttackStartTick:    binary.LittleEndian.Uint32(buf[offset+7:]),
+			MoveRemainderMilli: binary.LittleEndian.Uint16(buf[offset+11:]),
 		})
 		offset += recordTail
 	}
@@ -189,10 +190,10 @@ func TestAppendWorldStateRoundTrip(t *testing.T) {
 	bp := &BinaryProtocol{}
 
 	players := []types.PlayerState{
-		{ID: 9000, X: 5, Y: 6, VX: 1, VY: -1, State: 1, AttackStartTick: 123456},
+		{ID: 9000, X: 5, Y: 6, VX: 1, VY: -1, State: 1, AttackStartTick: 123456, MoveRemainderMilli: 500},
 		{ID: 1, X: 10, Y: 20, VX: -1, VY: 1, Direction: DirectionLeft, Sprinting: true},
 		{ID: 2, X: 30, Y: 40},
-		{ID: 65535, X: 6000, Y: 3000, Direction: DirectionUp, State: 2, AttackStartTick: 4294967295},
+		{ID: 65535, X: 6000, Y: 3000, Direction: DirectionUp, State: 2, AttackStartTick: 4294967295, MoveRemainderMilli: 999},
 	}
 	want := map[uint32]types.PlayerState{}
 	for _, p := range players {
@@ -233,7 +234,7 @@ func TestAppendWorldStatePreservesFramePrefix(t *testing.T) {
 		t.Fatalf("type=%d seq=%d tick=%d dilation=%d players=%d", msgType, sequence, worldTick, dilationBps, len(decoded))
 	}
 
-	const denseRecordSize = 12
+	const denseRecordSize = 14
 	if size := len(got) - len(prefix); size != worldStateHeaderSize+2*denseRecordSize {
 		t.Fatalf("dense-ID frame = %d bytes, want %d", size, worldStateHeaderSize+2*denseRecordSize)
 	}

@@ -234,7 +234,7 @@ export class BinaryProtocol {
                 shift += 7;
             } while (byte & 0x80);
 
-            if (offset + 11 > data.length) break;
+            if (offset + 13 > data.length) break;
 
             const id = (prevId + delta) >>> 0;
             prevId = id;
@@ -256,6 +256,9 @@ export class BinaryProtocol {
             const attackStartTick = view.getUint32(offset, true);
             offset += 4;
 
+            const moveRemainderMilli = view.getUint16(offset, true);
+            offset += 2;
+
             const direction = directionFromCode((flags >> 6) & 0x03);
             const state = flags & 0x03;
             const moving = vx !== 0 || vy !== 0;
@@ -276,6 +279,7 @@ export class BinaryProtocol {
                 vx,
                 vy,
                 attackStartTick,
+                moveRemainderMilli,
             };
         }
 

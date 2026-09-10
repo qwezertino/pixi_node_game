@@ -6,7 +6,7 @@ import {
     AnimationController,
     PlayerState as AnimationPlayerState,
 } from "../controllers/animationController";
-import { unitsPerTick } from "../utils/movement";
+import { milliRatePerTick, integrateRemainder } from "../utils/movement";
 import { CoordinateConverter } from "../utils/coordinateConverter";
 import { getUnitDefinitionByTypeId, type UnitDefinition } from "../../shared/units";
 import type { Direction } from "../utils/animationLayout";
@@ -40,6 +40,7 @@ class RemotePlayer {
     isMoving: boolean = false;
     isBlocking: boolean = false;
     isSprinting: boolean = false;
+    moveRemainderMilli: number = 0;
 
     private snapshots: PositionSnapshot[] = [];
     private interpolationDelayMs = 75;
@@ -103,12 +104,13 @@ class RemotePlayer {
     /**
      * Advance a player the server deliberately omitted from a frame.
      *
-     * Position is a deterministic function of velocity on both sides (`pos += v*speed`
-     * per tick, integer), so the server only sends a record when that integration would
-     * be wrong — a velocity change, or a world-boundary clamp. For every other player
-     * the client reproduces the record the server chose not to send and feeds it to the
-     * same snapshot buffer, so the interpolator below is unchanged and cannot tell the
-     * difference.
+     * Position is a deterministic function of velocity on both sides, using the same
+     * fixed-point integrator as the server (moveRemainderMilli carried and updated here
+     * exactly like GameWorld.updatePlayerPosition), so the server only sends a record
+     * when that integration would be wrong — a velocity/sprint change, or a
+     * world-boundary clamp. For every other player the client reproduces the record the
+     * server chose not to send bit-for-bit and feeds it to the same snapshot buffer, so
+     * the interpolator below is unchanged and cannot tell the difference.
      *
      * Deliberately unclamped: it mirrors the server's prediction, and any clamp the
      * server applied arrives as a real record on the next frame.
@@ -125,14 +127,14 @@ class RemotePlayer {
             return;
         }
 
-        let step = unitsPerTick(this.unitDefinition) * elapsedTicks;
+        const diagonal = this.movementVector.dx !== 0 && this.movementVector.dy !== 0;
+        const milliRate = milliRatePerTick(this.unitDefinition, this.isSprinting, diagonal);
+        const { distance, remainder } = integrateRemainder(this.moveRemainderMilli, milliRate, elapsedTicks);
+        this.moveRemainderMilli = remainder;
 
-        if (this.movementVector.dx !== 0 && this.movementVector.dy !== 0) {
-            step = Math.round(step * Math.SQRT1_2);
-        }
         this.pushSnapshot(
-            last.x + this.movementVector.dx * step,
-            last.y + this.movementVector.dy * step,
+            last.x + this.movementVector.dx * distance,
+            last.y + this.movementVector.dy * distance,
             stateSequence
         );
     }
@@ -396,6 +398,7 @@ export class PlayerManager {
                     existingPlayer.isMoving = playerState.moving;
                     existingPlayer.isBlocking = playerState.blocking ?? false;
                     existingPlayer.isSprinting = playerState.sprinting ?? false;
+                    existingPlayer.moveRemainderMilli = playerState.moveRemainderMilli ?? 0;
                     existingPlayer.setMovementVector(
                         playerState.vx ?? 0,
                         playerState.vy ?? 0
@@ -440,17 +443,17 @@ export class PlayerManager {
     }
 
     private async createRemotePlayer(playerState: PlayerState): Promise<void> {
-        const worldTickAtJoin = this.networkManager.getWorldTick();
         const unitDefinition = getUnitDefinitionByTypeId(this.networkManager.getUnitType(playerState.id));
         const characterVisual = await this.loadVisualFor(unitDefinition);
 
-        if (this.remotePlayers.has(playerState.id) || !this.networkManager.getPlayers()[playerState.id]) {
+        const currentState = this.networkManager.getPlayers()[playerState.id];
+        if (this.remotePlayers.has(playerState.id) || !currentState) {
             return;
         }
 
         const screenPos = this.coordinateConverter.virtualToScreen(
-            playerState.position.x,
-            playerState.position.y
+            currentState.position.x,
+            currentState.position.y
         );
         const position = new Point(screenPos.x, screenPos.y);
 
@@ -460,32 +463,30 @@ export class PlayerManager {
             characterVisual,
             unitDefinition,
             this.coordinateConverter,
-            playerState.position
+            currentState.position
         );
 
-        remotePlayer.direction = playerState.direction;
-        remotePlayer.isMoving = playerState.moving;
-        remotePlayer.isBlocking = playerState.blocking ?? false;
-        remotePlayer.isSprinting = playerState.sprinting ?? false;
+        remotePlayer.direction = currentState.direction;
+        remotePlayer.isMoving = currentState.moving;
+        remotePlayer.isBlocking = currentState.blocking ?? false;
+        remotePlayer.isSprinting = currentState.sprinting ?? false;
+        remotePlayer.moveRemainderMilli = currentState.moveRemainderMilli ?? 0;
         remotePlayer.currentHp = this.networkManager.getHp(playerState.id);
         const knownStamina = this.networkManager.getStamina(playerState.id);
         if (knownStamina !== undefined) remotePlayer.staminaPredictor.reconcile(knownStamina);
 
-        if (playerState.movementVector) {
-            remotePlayer.setMovementVector(
-                playerState.movementVector.dx,
-                playerState.movementVector.dy
-            );
-        }
+        remotePlayer.setMovementVector(currentState.vx ?? 0, currentState.vy ?? 0);
+        remotePlayer.syncPosition(currentState.position.x, currentState.position.y);
 
-        if (playerState.attacking) {
-            const elapsedTicks = playerState.attackStartTick !== undefined
-                ? (worldTickAtJoin - playerState.attackStartTick) >>> 0
+        if (currentState.attacking) {
+            const worldTick = this.networkManager.getWorldTick();
+            const elapsedTicks = currentState.attackStartTick !== undefined
+                ? (worldTick - currentState.attackStartTick) >>> 0
                 : 0;
             const elapsedMs = elapsedTicks <= MAX_ATTACK_JOIN_ELAPSED_TICKS
                 ? elapsedTicks * (1000 / TICK_RATE)
                 : 0;
-            remotePlayer.performAttack(playerState.comboStep ?? 1, elapsedMs);
+            remotePlayer.performAttack(currentState.comboStep ?? 1, elapsedMs);
         }
 
         this.playerContainer.addChild(remotePlayer.sprite);

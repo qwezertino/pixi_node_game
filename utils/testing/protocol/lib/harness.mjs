@@ -6,12 +6,20 @@
 // a mismatched decoder does not fail, it silently yields wrong player IDs. Bundling the
 // real one is what makes a wire-format change verifiable at all.
 
-import { HTTP_BASE, MOVEMENT, NETWORK } from './config.mjs';
+import { pathToFileURL } from 'node:url';
+import path from 'node:path';
+import { HTTP_BASE, NETWORK } from './config.mjs';
 
 const DEFAULT_URL = process.env.GAME_WS_URL ?? 'ws://127.0.0.1:8108/ws';
 const METRICS_URL = process.env.GAME_METRICS_URL ?? 'http://127.0.0.1:8110/metrics';
 
-// The bundled decoder (lib/proto.mjs) pulls in src/shared/gameConfig.ts and
+// run.sh bundles both the decoder and the client's own movement formula into a per-run
+// directory (GAME_PROTOCOL_DIR); direct invocation without run.sh falls back to lib/.
+const MODULE_DIR = process.env.GAME_PROTOCOL_DIR
+    ? path.resolve(process.env.GAME_PROTOCOL_DIR)
+    : path.dirname(new URL(import.meta.url).pathname);
+
+// The bundled decoder (proto.mjs) pulls in src/shared/gameConfig.ts and
 // src/shared/units.ts, both of which fetch("/api/config") / fetch("/api/units") with a
 // relative URL at module-load time — fine in a browser, meaningless in Node. Rewriting
 // same-origin-style requests onto the running test server is what makes that import work
@@ -28,13 +36,33 @@ const units = await (await fetch(`${HTTP_BASE}/api/units`)).json();
 const defaultUnit = units.find((u) => u.id === 'spearman') ?? units[0];
 
 export const TICK_RATE = NETWORK.tickRate;
-// Mirrors buildUnitTables()'s moveStats in world.go (and milliUnitsPerTick in
-// src/client/utils/movement.ts) for the unit probes connect as (spearman, same as the
-// client's DEFAULT_UNIT_TYPE): movement accumulates in milli-units per tick, not whole
-// units, so SPEED must keep that fractional precision or exact-equality checks like
-// determinism.mjs's `travel === STEPS * SPEED` fail on rounding drift alone.
-const milliPerTick = Math.round((defaultUnit.moveSpeed * MOVEMENT.unitsPerMeter * 1000) / TICK_RATE);
-export const SPEED = milliPerTick / 1000;
+
+let movementModule = null;
+async function loadMovement() {
+    if (!movementModule) {
+        movementModule = await import(pathToFileURL(path.join(MODULE_DIR, 'movement.mjs')).href);
+    }
+    return movementModule;
+}
+
+const { milliRatePerTick, integrateRemainder } = await loadMovement();
+
+/**
+ * The exact client integrator (src/client/utils/movement.ts's milliRatePerTick +
+ * integrateRemainder, as used by playerManager.ts's deadReckon): carries the wire
+ * moveRemainderMilli exactly like the server's GameWorld.updatePlayerPosition, so a
+ * tracked belief stays bit-for-bit in sync with the authoritative position rather than
+ * a rounded approximation of it. `tracked` is mutated: `remainder` is updated in place.
+ */
+export function advanceTracked(tracked, elapsedTicks, unit = defaultUnit) {
+    if (elapsedTicks <= 0 || (tracked.vx === 0 && tracked.vy === 0)) return;
+    const diagonal = tracked.vx !== 0 && tracked.vy !== 0;
+    const milliRate = milliRatePerTick(unit, tracked.sprinting, diagonal);
+    const { distance, remainder } = integrateRemainder(tracked.remainder, milliRate, elapsedTicks);
+    tracked.remainder = remainder;
+    tracked.x += tracked.vx * distance;
+    tracked.y += tracked.vy * distance;
+}
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -46,10 +74,10 @@ export const DIRECTIONS = [
 
 let BinaryProtocol = null;
 
-/** run.sh bundles src/client/network/protocol/binaryProtocol.ts to lib/proto.mjs. */
+/** run.sh bundles src/client/network/protocol/binaryProtocol.ts to <MODULE_DIR>/proto.mjs. */
 export async function loadProtocol() {
     if (!BinaryProtocol) {
-        ({ BinaryProtocol } = await import('./proto.mjs'));
+        ({ BinaryProtocol } = await import(pathToFileURL(path.join(MODULE_DIR, 'proto.mjs')).href));
     }
     return BinaryProtocol;
 }
@@ -77,6 +105,9 @@ export class GameClient {
 
         this.lastWorldTick = null;
         this.tracked = new Map();       // playerId -> { x, y, vx, vy }
+        this.lastAuthoritative = new Map(); // playerId -> { x, y, vx, vy, worldTick }
+        this.moveWindows = new Map();   // playerId -> { startTick, stopTick }
+        this.predictionSamples = [];    // { playerId, worldTick, ticks, error }
         this.deadReckoned = 0;
         this.serverRecords = 0;
         this.decodeFailures = [];
@@ -138,18 +169,53 @@ export class GameClient {
         if (msg.type === 'deltaGameState' && elapsed > 0) {
             for (const [id, p] of this.tracked) {
                 if (msg.players[id]) continue;
-                p.x += p.vx * SPEED * elapsed;
-                p.y += p.vy * SPEED * elapsed;
+                advanceTracked(p, elapsed);
                 this.deadReckoned++;
             }
         }
         for (const [id, record] of Object.entries(msg.players)) {
+            // A record present this frame was skipped by the loop above (it only
+            // advances ids the frame omitted), so `before` is still this id's belief as
+            // of the *previous* frame, one tick stale relative to this record. Extrapolate
+            // it forward by this frame's own elapsed before comparing — otherwise this
+            // would just measure one tick of ordinary travel, not a prediction failure.
+            // A velocity/sprint change is excluded: it is unconditionally resent the
+            // instant it happens, and the old belief was never expected to anticipate a
+            // change nobody had told it about yet.
+            const before = this.tracked.get(id);
             if (this.tracked.has(id)) this.serverRecords++;
+            if (before && before.vx === record.vx && before.vy === record.vy &&
+                before.sprinting === (record.sprinting ?? false) && elapsed > 0) {
+                const projected = { ...before };
+                advanceTracked(projected, elapsed);
+                const error = Math.hypot(projected.x - record.position.x, projected.y - record.position.y);
+                this.predictionSamples.push({ playerId: id, worldTick: msg.worldTick, error });
+            }
+
+            const prevAuth = this.lastAuthoritative.get(id);
+            const wasMoving = prevAuth ? (prevAuth.vx !== 0 || prevAuth.vy !== 0) : false;
+            const nowMoving = record.vx !== 0 || record.vy !== 0;
+            if (!wasMoving && nowMoving) {
+                this.moveWindows.set(id, { startTick: msg.worldTick, stopTick: null });
+            } else if (wasMoving && !nowMoving) {
+                const window = this.moveWindows.get(id);
+                if (window && window.stopTick === null) window.stopTick = msg.worldTick;
+            }
+
+            this.lastAuthoritative.set(id, {
+                x: record.position.x,
+                y: record.position.y,
+                vx: record.vx,
+                vy: record.vy,
+                worldTick: msg.worldTick,
+            });
             this.tracked.set(id, {
                 x: record.position.x,
                 y: record.position.y,
                 vx: record.vx,
                 vy: record.vy,
+                sprinting: record.sprinting ?? false,
+                remainder: record.moveRemainderMilli ?? 0,
             });
         }
     }
@@ -168,6 +234,16 @@ export class GameClient {
 
     belief(playerId) {
         return this.tracked.get(playerId) ?? null;
+    }
+
+    /** Completed START->STOP window observed for a player, in server worldTicks. */
+    moveWindow(playerId) {
+        return this.moveWindows.get(playerId) ?? null;
+    }
+
+    /** Largest mid-movement authoritative-vs-predicted drift observed, in world units. */
+    maxPredictionError() {
+        return this.predictionSamples.reduce((max, s) => Math.max(max, s.error), 0);
     }
 
     /** Frame sequence numbers must advance by exactly one; anything else is a gap. */

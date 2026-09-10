@@ -238,9 +238,9 @@ func TestClassifyDelta(t *testing.T) {
 			want: deltaReason{include: true, unpredictable: true},
 		},
 		{
-			name: "fully pinned at a boundary diverges",
+			name: "position mismatching the prediction diverges",
 			st:   moved(100, 100), exists: true,
-			want: deltaReason{include: true, diverged: true, unpredictable: true},
+			want: deltaReason{include: true, diverged: true},
 		},
 		{
 
@@ -327,15 +327,14 @@ func TestClassifyDeltaBucketsAreExclusive(t *testing.T) {
 	}
 }
 
-// TestClassifyDeltaSprintDivergesFromClientDeadReckoning exercises the P1
-// regression from the 2026-09-10 review: the client's dead reckoning
-// (deadReckon in playerManager.ts) never applies the sprint multiplier, so
-// even though this position is exactly what the server's own fixed-point
-// integrator (with sprint multiplier, diagonal factor and carried
-// MoveRemainderMilli) would produce, the client would have predicted a
-// different position. classifyDelta must therefore treat it as
-// unpredictable rather than a plain position-only delta.
-func TestClassifyDeltaSprintDivergesFromClientDeadReckoning(t *testing.T) {
+// TestClassifyDeltaSprintMatchingServerModelIsPredictable protects the
+// remainder-sync contract added for the 2026-09-10 follow-up review: the
+// client now receives MoveRemainderMilli and replicates this exact
+// fixed-point formula (sprint multiplier, diagonal factor, carried
+// remainder), so a position that matches it exactly must be suppressible
+// even while sprinting — unlike the old naive-rounding client model, sprint
+// alone is no longer a reason to force a send.
+func TestClassifyDeltaSprintMatchingServerModelIsPredictable(t *testing.T) {
 	const milliUnitsPerTick = uint32(3700)
 	const sprintMultiplier = 1.5
 	const prevRemainderMilli = uint32(250)
@@ -355,40 +354,39 @@ func TestClassifyDeltaSprintDivergesFromClientDeadReckoning(t *testing.T) {
 	st.X, st.Y = serverX, serverY
 
 	got := gw.classifyDelta(st, prev, true, elapsed, 0, prevRemainderMilli, velocityRepl)
-	if !got.unpredictable || !got.include {
-		t.Fatalf("sprinting movement must be sent even though it matches the server's own model, got %+v", got)
+	if got.unpredictable || got.diverged || got.include {
+		t.Fatalf("remainder-synced sprinting movement matching the server's own model must be suppressible, got %+v", got)
 	}
 }
 
-// TestClassifyDeltaSprintNearWorldBoundaryIsUnpredictable is the protected
-// regression for the two cases the review reproduced directly: a sprinting
-// player approaching a world edge. The server's model clamps to the
-// boundary; the client's dead reckoning does not clamp and does not apply
-// the sprint multiplier, so it would keep walking the player past X=1000.
-// classifyDelta must not suppress this record.
-func TestClassifyDeltaSprintNearWorldBoundaryIsUnpredictable(t *testing.T) {
+// TestClassifyDeltaSprintNearWorldBoundaryDiverges is the protected
+// regression for a sprinting player approaching a world edge. The client
+// never clamps to world bounds (it has no authority to), so a server-side
+// clamp must still show up as diverged and force a send, even though the
+// client now tracks sprint and remainder exactly.
+func TestClassifyDeltaSprintNearWorldBoundaryDiverges(t *testing.T) {
 	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1.5, 1000, 60000)
 
 	prev := types.PlayerState{ID: 1, X: 995, Y: 100, VX: 1, VY: 0, Sprinting: true}
 	st := types.PlayerState{ID: 1, X: 1000, Y: 100, VX: 1, VY: 0, Sprinting: true}
 
 	got := gw.classifyDelta(st, prev, true, testElapsed, 0, 0, velocityRepl)
-	if !got.unpredictable || !got.include {
-		t.Fatalf("a sprinting player clamped at the world boundary must be classified unpredictable, got %+v", got)
+	if !got.diverged || !got.include {
+		t.Fatalf("a sprinting player clamped at the world boundary must diverge, got %+v", got)
 	}
 }
 
-// TestClassifyDeltaWorldBoundaryClampWithoutSprintIsUnpredictable protects
-// the plain (non-sprint) clamp case: the server clamps to the boundary, but
-// the client's unclamped dead reckoning would walk straight past it.
-func TestClassifyDeltaWorldBoundaryClampWithoutSprintIsUnpredictable(t *testing.T) {
+// TestClassifyDeltaWorldBoundaryClampWithoutSprintDiverges protects the
+// plain (non-sprint) clamp case: the server clamps to the boundary, but the
+// client's unclamped prediction would walk straight past it.
+func TestClassifyDeltaWorldBoundaryClampWithoutSprintDiverges(t *testing.T) {
 	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1, 1000, 60000)
 
 	prev := types.PlayerState{ID: 1, X: 996, Y: 100, VX: 1, VY: 0}
 	st := types.PlayerState{ID: 1, X: 1000, Y: 100, VX: 1, VY: 0}
 
 	got := gw.classifyDelta(st, prev, true, testElapsed, 0, 0, velocityRepl)
-	if !got.unpredictable || !got.include {
-		t.Fatalf("a player clamped at the world boundary must be classified unpredictable, got %+v", got)
+	if !got.diverged || !got.include {
+		t.Fatalf("a player clamped at the world boundary must diverge, got %+v", got)
 	}
 }

@@ -15,9 +15,9 @@ import (
 var ErrUnitNotFound = errors.New("unit not found")
 var ErrInvalidUnit = errors.New("invalid unit")
 
-func (s *Store) LoadGameSettings(ctx context.Context) (*config.GameSettings, error) {
+func loadGameSettings(ctx context.Context, db dbQuerier) (*config.GameSettings, error) {
 	var gs config.GameSettings
-	err := s.pool.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT tick_rate, sync_interval_sec, units_per_meter,
 		       world_width, world_height,
 		       spawn_min_x, spawn_max_x, spawn_min_y, spawn_max_y,
@@ -33,6 +33,10 @@ func (s *Store) LoadGameSettings(ctx context.Context) (*config.GameSettings, err
 		return nil, err
 	}
 	return &gs, nil
+}
+
+func (s *Store) LoadGameSettings(ctx context.Context) (*config.GameSettings, error) {
+	return loadGameSettings(ctx, s.pool)
 }
 
 const unitColumns = `
@@ -199,11 +203,6 @@ func (s *Store) LoadUnitDefinitions(ctx context.Context) ([]units.Definition, er
 		return nil, err
 	}
 	return defs, nil
-}
-
-func (s *Store) getUnitRow(ctx context.Context, typeID uint8) (unitRow, error) {
-	row := s.pool.QueryRow(ctx, `SELECT`+unitColumns+` FROM units WHERE type_id = $1`, typeID)
-	return scanUnitRow(row.Scan)
 }
 
 // getUnitRowForUpdate reads a unit row inside tx, locking it until tx ends so

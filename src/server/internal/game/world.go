@@ -39,6 +39,7 @@ type GameWorld struct {
 	broadcastFn           atomic.Value
 	prevStates            map[uint32]types.PlayerState
 	prevMoveRemainder     map[uint32]uint32
+	prevBaselineTickByID  map[uint32]uint32
 	tickCount             uint32
 	scratchStates         []types.PlayerState
 	scratchChanged        []types.PlayerState
@@ -61,7 +62,6 @@ type GameWorld struct {
 	deltaPositionOnly        int
 	deltaClamped             int
 	deltaKeyframes           int
-	prevBaselineTick         uint32
 	keyframeCursor           uint32
 	deltaWindowVectorChanges int64
 	deltaWindowPositionOnly  int64
@@ -190,6 +190,7 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 		lastDeltaCompositeLog: clock.Now(),
 		prevStates:            make(map[uint32]types.PlayerState, initialCap),
 		prevMoveRemainder:     make(map[uint32]uint32, initialCap),
+		prevBaselineTickByID:  make(map[uint32]uint32, initialCap),
 		scratchStates:         make([]types.PlayerState, 0, initialCap),
 		scratchChanged:        make([]types.PlayerState, 0, changedCap),
 		scratchRemainderByID:  make(map[uint32]uint32, initialCap),
@@ -594,10 +595,6 @@ func (gw *GameWorld) tick() {
 	gw.deltaClamped = 0
 	gw.deltaKeyframes = 0
 
-	elapsedTicks := int32(worldTick - gw.prevBaselineTick)
-	if elapsedTicks < 0 {
-		elapsedTicks = 0
-	}
 	tickLive := gw.live.Load()
 	velocityReplication := tickLive.VelocityReplication
 	keyframeMod := uint32(0)
@@ -613,6 +610,13 @@ func (gw *GameWorld) tick() {
 		if !fullSync {
 			prev, exists := gw.prevStates[st.ID]
 			prevRemainder := gw.prevMoveRemainder[st.ID]
+			var elapsedTicks int32
+			if exists {
+				elapsedTicks = int32(worldTick - gw.prevBaselineTickByID[st.ID])
+				if elapsedTicks < 0 {
+					elapsedTicks = 0
+				}
+			}
 			reason := gw.classifyDelta(st, prev, exists, elapsedTicks, player.GetUnitType(), prevRemainder, velocityReplication)
 
 			keyframe := keyframeMod > 0 && !reason.include && st.ID%keyframeMod == gw.keyframeCursor
@@ -661,7 +665,6 @@ func (gw *GameWorld) tick() {
 		}
 		if broadcasted {
 			gw.reportDeltaComposition()
-			gw.prevBaselineTick = worldTick
 			if mod := tickLive.KeyframeDivisor; mod > 0 {
 				gw.keyframeCursor = (gw.keyframeCursor + 1) % uint32(mod)
 			}
@@ -670,11 +673,17 @@ func (gw *GameWorld) tick() {
 				if _, seen := gw.scratchSeenIDs[id]; !seen {
 					delete(gw.prevStates, id)
 					delete(gw.prevMoveRemainder, id)
+					delete(gw.prevBaselineTickByID, id)
 				}
 			}
-			for _, st := range gw.scratchStates {
+			resetBaseline := gw.scratchStates
+			if !fullSync {
+				resetBaseline = gw.scratchChanged
+			}
+			for _, st := range resetBaseline {
 				gw.prevStates[st.ID] = st
 				gw.prevMoveRemainder[st.ID] = gw.scratchRemainderByID[st.ID]
+				gw.prevBaselineTickByID[st.ID] = worldTick
 			}
 		}
 	}
@@ -691,29 +700,6 @@ type deltaReason struct {
 	positionOnly bool
 }
 
-// clientPredictionEpsilonUnits is the tolerance used when comparing the
-// server's actual position to what the client's dead reckoning
-// (deadReckon in playerManager.ts, unitsPerTick in movement.ts) would have
-// predicted. It absorbs the double-rounding difference between the
-// client's round(unitsPerTick)*elapsedTicks and the server's own
-// round(milliUnitsPerTick)/1000 arithmetic; anything larger means the
-// client would visibly diverge and the record must be sent.
-const clientPredictionEpsilonUnits = 1
-
-// classifyDelta decides whether a player's new state can be safely omitted
-// from a broadcast because the client's own dead reckoning would have
-// arrived at the same result.
-//
-// The client's dead reckoning does not match the server's authoritative
-// integrator: it uses a rounded integer per-tick step, never applies the
-// sprint multiplier, never carries MoveRemainderMilli across ticks, and
-// never clamps to the world bounds. So this classification is not "would
-// the server's own model have predicted this" (that model always agrees
-// with itself); it is "would the client's simpler model have predicted
-// this". Any sprint multiplier, any world-boundary clamp, and any
-// fractional remainder large enough to shift a rounded integer step will
-// all show up as a mismatch against that client-equivalent prediction and
-// force the record to be sent.
 func (gw *GameWorld) classifyDelta(st, prev types.PlayerState, exists bool, elapsedTicks int32, unitType uint8, prevRemainderMilli uint32, velocityReplication bool) deltaReason {
 	if !exists {
 		return deltaReason{include: true, unpredictable: true}
@@ -721,28 +707,15 @@ func (gw *GameWorld) classifyDelta(st, prev types.PlayerState, exists bool, elap
 
 	unpredictable := st.VX != prev.VX || st.VY != prev.VY ||
 		st.State != prev.State || st.Direction != prev.Direction || st.Sprinting != prev.Sprinting ||
-		st.ComboStep != prev.ComboStep
+		st.ComboStep != prev.ComboStep || st.AttackStartTick != prev.AttackStartTick
 
 	predictedX, predictedY := int32(prev.X), int32(prev.Y)
 	if elapsedTicks > 0 && (prev.VX != 0 || prev.VY != 0) {
 		tables := gw.unitTables()
 		stat := tables.staminaStats[unitType]
-		baseMilliRate := tables.moveStats[unitType].milliUnitsPerTick
+		milliRate := tables.moveStats[unitType].milliUnitsPerTick
 		diagonal := prev.VX != 0 && prev.VY != 0
 
-		clientUnitsPerTick := int64(math.Round(float64(baseMilliRate) / 1000))
-		clientStep := clientUnitsPerTick * int64(elapsedTicks)
-		if diagonal {
-			clientStep = int64(math.Round(float64(clientStep) / math.Sqrt2))
-		}
-		clientX := int64(prev.X) + int64(prev.VX)*clientStep
-		clientY := int64(prev.Y) + int64(prev.VY)*clientStep
-		if abs64(clientX-int64(st.X)) > clientPredictionEpsilonUnits ||
-			abs64(clientY-int64(st.Y)) > clientPredictionEpsilonUnits {
-			unpredictable = true
-		}
-
-		milliRate := baseMilliRate
 		rateMultiplier := 1.0
 		if prev.Sprinting {
 			rateMultiplier *= stat.sprintSpeedMultiplier
@@ -756,8 +729,12 @@ func (gw *GameWorld) classifyDelta(st, prev types.PlayerState, exists bool, elap
 
 		totalMilli := uint64(prevRemainderMilli) + uint64(milliRate)*uint64(elapsedTicks)
 		distance := int64(totalMilli / 1000)
-		px, py := gw.integrateMovement(prev.X, prev.Y, prev.VX, prev.VY, distance)
-		predictedX, predictedY = int32(px), int32(py)
+		// Unclamped on purpose: the client never clamps to world bounds (it has no
+		// authoritative bounds to clamp to), so a boundary clamp must show up here as a
+		// mismatch against the real (clamped) st.X/Y and force a send, exactly like any
+		// other divergence.
+		predictedX = int32(int64(prev.X) + int64(prev.VX)*distance)
+		predictedY = int32(int64(prev.Y) + int64(prev.VY)*distance)
 	}
 	diverged := int32(st.X) != predictedX || int32(st.Y) != predictedY
 	positionMoved := st.X != prev.X || st.Y != prev.Y

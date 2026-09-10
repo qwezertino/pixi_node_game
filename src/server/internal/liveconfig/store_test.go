@@ -22,21 +22,47 @@ func baselineLiveNetConfig() *config.LiveNetConfig {
 	}
 }
 
-func TestResolveLiveNetPatchAllowsUnrelatedKeyDespiteInvalidLegacyRow(t *testing.T) {
+func TestResolveLiveNetPatchRejectsUnrelatedKeyWhenLegacyRowStillInvalid(t *testing.T) {
 	raw := map[string]string{
 		"max_connections": "999999999",
 	}
 	patch := map[string]string{"keyframe_divisor": "50"}
 
+	if _, err := resolveLiveNetPatch(baselineLiveNetConfig(), raw, patch); err == nil {
+		t.Fatalf("expected an untouched invalid legacy row to fail validation instead of being silently dropped")
+	}
+}
+
+func TestResolveLiveNetPatchAppliesPatchOnTopOfStoredRelatedKey(t *testing.T) {
+	raw := map[string]string{
+		"fanout_min_recipients_per_tick": "256",
+		"fanout_max_recipients_per_tick": "1000",
+	}
+	patch := map[string]string{"fanout_min_recipients_per_tick": "800"}
+
 	resolved, err := resolveLiveNetPatch(baselineLiveNetConfig(), raw, patch)
 	if err != nil {
-		t.Fatalf("unrelated valid key change should succeed despite invalid legacy max_connections, got %v", err)
+		t.Fatalf("patch valid against the actually-stored max should succeed, got %v", err)
 	}
-	if resolved.KeyframeDivisor != 50 {
-		t.Fatalf("expected keyframe_divisor to be applied, got %d", resolved.KeyframeDivisor)
+	if resolved.FanoutMinRecipientsPerTick != 800 || resolved.FanoutMaxRecipientsPerTick != 1000 {
+		t.Fatalf("expected min=800 max=1000 (the stored max, not baseline), got min=%d max=%d",
+			resolved.FanoutMinRecipientsPerTick, resolved.FanoutMaxRecipientsPerTick)
 	}
-	if resolved.MaxConnections != baselineLiveNetConfig().MaxConnections {
-		t.Fatalf("expected invalid legacy max_connections to fall back to baseline, got %d", resolved.MaxConnections)
+}
+
+func TestResolveLiveNetPatchValidatesAgainstStoredValueNotBaseline(t *testing.T) {
+	raw := map[string]string{
+		"fanout_min_recipients_per_tick": "100",
+	}
+	patch := map[string]string{"fanout_max_recipients_per_tick": "200"}
+
+	resolved, err := resolveLiveNetPatch(baselineLiveNetConfig(), raw, patch)
+	if err != nil {
+		t.Fatalf("patch valid against the actually-stored min should not be rejected against baseline's default min, got %v", err)
+	}
+	if resolved.FanoutMinRecipientsPerTick != 100 || resolved.FanoutMaxRecipientsPerTick != 200 {
+		t.Fatalf("expected min=100 (stored) max=200 (patched), got min=%d max=%d",
+			resolved.FanoutMinRecipientsPerTick, resolved.FanoutMaxRecipientsPerTick)
 	}
 }
 
@@ -76,6 +102,54 @@ func TestResolveLiveNetPatchAppliesMultipleKeysAtomically(t *testing.T) {
 	}
 	if resolved.FanoutMinRecipientsPerTick != 100 || resolved.FanoutMaxRecipientsPerTick != 200 {
 		t.Fatalf("expected both patched keys to apply together, got min=%d max=%d", resolved.FanoutMinRecipientsPerTick, resolved.FanoutMaxRecipientsPerTick)
+	}
+}
+
+func TestPerKeyApplyIsOrderDependentUnlikeSingleSnapshotApply(t *testing.T) {
+	base := baselineLiveNetConfig()
+	base.FanoutMinRecipientsPerTick = 100
+	base.FanoutMaxRecipientsPerTick = 200
+
+	minFirst := *base
+	live := config.NewLiveNet(&minFirst)
+	if err := live.Update(func(c *config.LiveNetConfig) error {
+		return c.ApplyKey("fanout_min_recipients_per_tick", "800")
+	}); err == nil {
+		t.Fatalf("applying min=800 alone against the still-old max=200 should be rejected by the old per-key path")
+	}
+	if err := live.Update(func(c *config.LiveNetConfig) error {
+		return c.ApplyKey("fanout_max_recipients_per_tick", "1000")
+	}); err != nil {
+		t.Fatalf("applying max=1000 alone should succeed: %v", err)
+	}
+	if got := live.Load(); got.FanoutMinRecipientsPerTick != 100 || got.FanoutMaxRecipientsPerTick != 1000 {
+		t.Fatalf("per-key apply got stuck on a stale min: min=%d max=%d", got.FanoutMinRecipientsPerTick, got.FanoutMaxRecipientsPerTick)
+	}
+
+	snapshot := map[string]string{
+		"fanout_min_recipients_per_tick": "800",
+		"fanout_max_recipients_per_tick": "1000",
+	}
+	for _, first := range []string{"fanout_min_recipients_per_tick", "fanout_max_recipients_per_tick"} {
+		second := "fanout_max_recipients_per_tick"
+		if first == second {
+			second = "fanout_min_recipients_per_tick"
+		}
+		copyOfBase := *base
+		one := config.NewLiveNet(&copyOfBase)
+		if err := one.Update(func(c *config.LiveNetConfig) error {
+			if err := c.ApplyKey(first, snapshot[first]); err != nil {
+				return err
+			}
+			return c.ApplyKey(second, snapshot[second])
+		}); err != nil {
+			t.Fatalf("single-snapshot apply (order %s,%s) should succeed, got %v", first, second, err)
+		}
+		got := one.Load()
+		if got.FanoutMinRecipientsPerTick != 800 || got.FanoutMaxRecipientsPerTick != 1000 {
+			t.Fatalf("single-snapshot apply (order %s,%s) gave inconsistent result: min=%d max=%d",
+				first, second, got.FanoutMinRecipientsPerTick, got.FanoutMaxRecipientsPerTick)
+		}
 	}
 }
 

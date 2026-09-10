@@ -105,6 +105,8 @@ type PlayerState struct {
 	ComboStep uint8
 
 	AttackStartTick uint32
+
+	MoveRemainderMilli uint16
 }
 
 type PerformanceMetrics struct {
@@ -367,6 +369,8 @@ func (p *Player) ToState() PlayerState {
 		Sprinting:       p.GetSprintingNow(),
 		ComboStep:       p.GetComboStep(),
 		AttackStartTick: p.GetAttackStartTick(),
+
+		MoveRemainderMilli: uint16(p.GetMoveRemainderMilli()),
 	}
 }
 
