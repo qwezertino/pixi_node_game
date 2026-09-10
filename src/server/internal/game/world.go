@@ -12,7 +12,6 @@ import (
 	"pixi_game_server/internal/clock"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/metrics"
-	"pixi_game_server/internal/systems"
 	"pixi_game_server/internal/types"
 	"pixi_game_server/internal/units"
 )
@@ -38,13 +37,12 @@ type GameWorld struct {
 	playersMu             sync.RWMutex
 	playersMap            map[uint32]*types.Player
 	broadcastFn           atomic.Value
-	visibilityManager     *systems.VisibilityManager
 	prevStates            map[uint32]types.PlayerState
 	prevMoveRemainder     map[uint32]uint32
 	tickCount             uint32
 	scratchStates         []types.PlayerState
 	scratchChanged        []types.PlayerState
-	scratchRemainders     []uint32
+	scratchRemainderByID  map[uint32]uint32
 	scratchSeenIDs        map[uint32]struct{}
 	scratchPtrs           []*types.Player
 	nTickWorkers          int
@@ -52,6 +50,7 @@ type GameWorld struct {
 	tickWorkerWg          sync.WaitGroup
 	tickDuration          int64
 	lastSyncTime          int64
+	lastTickAtNs          int64
 	ticker                atomic.Pointer[time.Ticker]
 	stopChan              chan struct{}
 	nominalTickIntervalNs int64
@@ -193,7 +192,7 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 		prevMoveRemainder:     make(map[uint32]uint32, initialCap),
 		scratchStates:         make([]types.PlayerState, 0, initialCap),
 		scratchChanged:        make([]types.PlayerState, 0, changedCap),
-		scratchRemainders:     make([]uint32, 0, initialCap),
+		scratchRemainderByID:  make(map[uint32]uint32, initialCap),
 		scratchSeenIDs:        make(map[uint32]struct{}, initialCap),
 		scratchPtrs:           make([]*types.Player, 0, initialCap),
 	}
@@ -208,9 +207,6 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 		gw.workersDone.Add(1)
 		go func() { defer gw.workersDone.Done(); gw.runTickWorker(ch) }()
 	}
-
-	gw.visibilityManager = systems.NewVisibilityManager(
-		cfg.World.Width, cfg.World.Height, 100)
 
 	nominalInterval := time.Second / time.Duration(cfg.Game.TickRate)
 	gw.nominalTickIntervalNs = nominalInterval.Nanoseconds()
@@ -258,7 +254,6 @@ func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
 	gw.playersMap[playerID] = player
 	gw.membershipChanged = true
 	gw.playersMu.Unlock()
-	gw.visibilityManager.AddPlayer(playerID, spawnX, spawnY)
 
 	return player
 }
@@ -274,7 +269,6 @@ func (gw *GameWorld) RemovePlayer(playerID uint32) {
 	}
 	gw.playersMu.Unlock()
 	if loaded {
-		gw.visibilityManager.RemovePlayer(playerID)
 		metrics.EventsProcessed.WithLabelValues("disconnect").Inc()
 	}
 }
@@ -307,14 +301,13 @@ func (gw *GameWorld) GetTickCount() uint32 {
 	return atomic.LoadUint32(&gw.tickCount)
 }
 
-func (gw *GameWorld) GetAllPlayers() []types.PlayerState {
-	gw.playersMu.RLock()
-	allPlayers := make([]types.PlayerState, 0, len(gw.playersMap))
-	for _, player := range gw.playersMap {
-		allPlayers = append(allPlayers, player.ToState())
-	}
-	gw.playersMu.RUnlock()
-	return allPlayers
+// TimeSinceLastTick returns how long ago the game loop finished its last
+// completed tick. Before the first tick completes, it returns a duration
+// derived from process start, which is safely below any reasonable health
+// watchdog threshold.
+func (gw *GameWorld) TimeSinceLastTick() time.Duration {
+	last := atomic.LoadInt64(&gw.lastTickAtNs)
+	return time.Duration(clock.Now() - last)
 }
 
 func (gw *GameWorld) GetAllUnitAssignments() []types.UnitAssignment {
@@ -401,10 +394,6 @@ func (gw *GameWorld) GetTickInterval() time.Duration {
 
 func (gw *GameWorld) GetNominalTickInterval() time.Duration {
 	return time.Duration(atomic.LoadInt64(&gw.nominalTickIntervalNs))
-}
-
-func (gw *GameWorld) GetTickDuration() time.Duration {
-	return time.Duration(atomic.LoadInt64(&gw.tickDuration))
 }
 
 func (gw *GameWorld) TryAttack(playerID uint32) (x, y uint16, accepted bool) {
@@ -537,12 +526,13 @@ func (gw *GameWorld) updateBlockDrain(player *types.Player) (drained bool) {
 func (gw *GameWorld) tick() {
 	gw.stepMu.Lock()
 	defer gw.stepMu.Unlock()
+	defer func() { atomic.StoreInt64(&gw.lastTickAtNs, clock.Now()) }()
 
 	tickStart := time.Now()
 
 	gw.scratchStates = gw.scratchStates[:0]
 	gw.scratchChanged = gw.scratchChanged[:0]
-	gw.scratchRemainders = gw.scratchRemainders[:0]
+	clear(gw.scratchRemainderByID)
 	clear(gw.scratchSeenIDs)
 
 	nowNano := clock.Now()
@@ -564,6 +554,8 @@ func (gw *GameWorld) tick() {
 		gw.scratchPtrs = append(gw.scratchPtrs, p)
 	}
 	gw.playersMu.RUnlock()
+	tRange := time.Now()
+	metrics.TickPhaseDuration.WithLabelValues("range").Observe(tRange.Sub(t0).Seconds())
 
 	n := gw.nTickWorkers
 	total := len(gw.scratchPtrs)
@@ -594,9 +586,8 @@ func (gw *GameWorld) tick() {
 		gw.tickWorkerWg.Wait()
 	}
 	t1 := time.Now()
-	metrics.TickPhaseDuration.WithLabelValues("range").Observe(t1.Sub(t0).Seconds())
-	metrics.TickPhaseDuration.WithLabelValues("world_step").Observe(t1.Sub(t0).Seconds())
-	metrics.TickWorldStepDuration.Observe(t1.Sub(t0).Seconds())
+	metrics.TickPhaseDuration.WithLabelValues("world_step").Observe(t1.Sub(tRange).Seconds())
+	metrics.TickWorldStepDuration.Observe(t1.Sub(tRange).Seconds())
 
 	gw.deltaVectorChanges = 0
 	gw.deltaPositionOnly = 0
@@ -616,7 +607,7 @@ func (gw *GameWorld) tick() {
 	for _, player := range gw.scratchPtrs {
 		st := player.ToState()
 		gw.scratchStates = append(gw.scratchStates, st)
-		gw.scratchRemainders = append(gw.scratchRemainders, player.GetMoveRemainderMilli())
+		gw.scratchRemainderByID[st.ID] = player.GetMoveRemainderMilli()
 		gw.scratchSeenIDs[st.ID] = struct{}{}
 
 		if !fullSync {
@@ -646,6 +637,10 @@ func (gw *GameWorld) tick() {
 	metrics.TickPhaseDuration.WithLabelValues("delta").Observe(t2.Sub(t1).Seconds())
 
 	if len(gw.scratchStates) == 0 {
+
+		if holder, ok := gw.broadcastFn.Load().(broadcastFuncHolder); ok {
+			holder.fn(nil, nil, fullSync, worldTick, time.Since(tickStart))
+		}
 		return
 	}
 
@@ -677,9 +672,9 @@ func (gw *GameWorld) tick() {
 					delete(gw.prevMoveRemainder, id)
 				}
 			}
-			for i, st := range gw.scratchStates {
+			for _, st := range gw.scratchStates {
 				gw.prevStates[st.ID] = st
-				gw.prevMoveRemainder[st.ID] = gw.scratchRemainders[i]
+				gw.prevMoveRemainder[st.ID] = gw.scratchRemainderByID[st.ID]
 			}
 		}
 	}
@@ -696,12 +691,29 @@ type deltaReason struct {
 	positionOnly bool
 }
 
-// classifyDelta predicts where st should be, starting from the last
-// broadcast state prev, using the exact same fixed-point speed integration
-// as updatePlayerPosition (per-unit rate, diagonal 1/sqrt2 factor, sprint
-// multiplier and the carried MoveRemainderMilli) for this specific player.
-// A mismatch means the client's own dead-reckoning would have diverged too,
-// so the new state must be sent rather than left to be predicted.
+// clientPredictionEpsilonUnits is the tolerance used when comparing the
+// server's actual position to what the client's dead reckoning
+// (deadReckon in playerManager.ts, unitsPerTick in movement.ts) would have
+// predicted. It absorbs the double-rounding difference between the
+// client's round(unitsPerTick)*elapsedTicks and the server's own
+// round(milliUnitsPerTick)/1000 arithmetic; anything larger means the
+// client would visibly diverge and the record must be sent.
+const clientPredictionEpsilonUnits = 1
+
+// classifyDelta decides whether a player's new state can be safely omitted
+// from a broadcast because the client's own dead reckoning would have
+// arrived at the same result.
+//
+// The client's dead reckoning does not match the server's authoritative
+// integrator: it uses a rounded integer per-tick step, never applies the
+// sprint multiplier, never carries MoveRemainderMilli across ticks, and
+// never clamps to the world bounds. So this classification is not "would
+// the server's own model have predicted this" (that model always agrees
+// with itself); it is "would the client's simpler model have predicted
+// this". Any sprint multiplier, any world-boundary clamp, and any
+// fractional remainder large enough to shift a rounded integer step will
+// all show up as a mismatch against that client-equivalent prediction and
+// force the record to be sent.
 func (gw *GameWorld) classifyDelta(st, prev types.PlayerState, exists bool, elapsedTicks int32, unitType uint8, prevRemainderMilli uint32, velocityReplication bool) deltaReason {
 	if !exists {
 		return deltaReason{include: true, unpredictable: true}
@@ -715,13 +727,27 @@ func (gw *GameWorld) classifyDelta(st, prev types.PlayerState, exists bool, elap
 	if elapsedTicks > 0 && (prev.VX != 0 || prev.VY != 0) {
 		tables := gw.unitTables()
 		stat := tables.staminaStats[unitType]
-		milliRate := tables.moveStats[unitType].milliUnitsPerTick
+		baseMilliRate := tables.moveStats[unitType].milliUnitsPerTick
+		diagonal := prev.VX != 0 && prev.VY != 0
 
+		clientUnitsPerTick := int64(math.Round(float64(baseMilliRate) / 1000))
+		clientStep := clientUnitsPerTick * int64(elapsedTicks)
+		if diagonal {
+			clientStep = int64(math.Round(float64(clientStep) / math.Sqrt2))
+		}
+		clientX := int64(prev.X) + int64(prev.VX)*clientStep
+		clientY := int64(prev.Y) + int64(prev.VY)*clientStep
+		if abs64(clientX-int64(st.X)) > clientPredictionEpsilonUnits ||
+			abs64(clientY-int64(st.Y)) > clientPredictionEpsilonUnits {
+			unpredictable = true
+		}
+
+		milliRate := baseMilliRate
 		rateMultiplier := 1.0
 		if prev.Sprinting {
 			rateMultiplier *= stat.sprintSpeedMultiplier
 		}
-		if prev.VX != 0 && prev.VY != 0 {
+		if diagonal {
 			rateMultiplier *= 1 / math.Sqrt2
 		}
 		if rateMultiplier != 1.0 {
@@ -850,9 +876,6 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) (
 	if appliedInput {
 		player.SetMovementAck(input.Sequence, finalX, finalY)
 	}
-	if finalX != originalX || finalY != originalY {
-		gw.visibilityManager.MovePlayer(player.ID, finalX, finalY)
-	}
 	return sprintDrained
 }
 
@@ -932,6 +955,13 @@ func (gw *GameWorld) regenStamina(player *types.Player) {
 }
 
 func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func abs64(x int64) int64 {
 	if x < 0 {
 		return -x
 	}

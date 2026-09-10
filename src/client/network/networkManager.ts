@@ -3,12 +3,14 @@ import {
     PlayerState,
     PlayerPosition,
     PROTOCOL_VERSION,
+    TICK_RATE,
     type PlayerAttributes
 } from "./protocol/messages";
 import { DEFAULT_UNIT_TYPE, isValidUnitType, type UnitType } from "../../shared/units";
 import type { Direction } from "../utils/animationLayout";
 
 const MAX_DEAD_RECKON_TICKS = 20;
+const MAX_ATTACK_ELAPSED_TICKS = 1000;
 
 export type OnPlayerJoinedCallback = (player: PlayerState) => void;
 export type OnPlayerLeftCallback = (playerId: string) => void;
@@ -37,7 +39,8 @@ export type OnLatencyCallback = (latencyMs: number) => void;
 export type OnPlayerAttackCallback = (
     playerId: string,
     position: PlayerPosition,
-    comboStep: number
+    comboStep: number,
+    elapsedMs: number
 ) => void;
 
 export type OnUnitRosterCallback = (entries: Record<string, PlayerAttributes>) => void;
@@ -261,6 +264,15 @@ export class NetworkManager {
         console.error('WebSocket error');
     }
 
+    private attackElapsedMs(attackStartTick: number | undefined, worldTick: number): number {
+        if (attackStartTick === undefined) return 0;
+
+        const elapsedTicks = (worldTick - attackStartTick) >>> 0;
+        if (elapsedTicks > MAX_ATTACK_ELAPSED_TICKS) return 0;
+
+        return elapsedTicks * (1000 / TICK_RATE);
+    }
+
     private isNewerStateSequence(next: number, current: number): boolean {
         if (current === 0) return true;
         if (next === current) return false;
@@ -399,17 +411,6 @@ export class NetworkManager {
                             }
                         }
 
-                        if (!this.playerId && message.players) {
-                            const playerIds = Object.keys(message.players);
-                            if (playerIds.length > 0) {
-                                this.playerId = playerIds[playerIds.length - 1];
-
-                                if (message.players[this.playerId]) {
-                                    this.initialPosition = message.players[this.playerId].position;
-                                }
-                            }
-                        }
-
                         const worldTick = (message.worldTick ?? 0) >>> 0;
                         let elapsedTicks = 0;
                         if (this.hasWorldTick) {
@@ -443,15 +444,27 @@ export class NetworkManager {
 
                             const comboAdvanced = player.attacking && prev?.attacking &&
                                 player.comboStep !== prev?.comboStep;
-                            if (player.attacking && (!prev?.attacking || comboAdvanced)) {
+                            const attackActionChanged = prev?.attacking &&
+                                player.attackStartTick !== undefined &&
+                                player.attackStartTick !== prev?.attackStartTick;
+                            if (player.attacking && (!prev?.attacking || comboAdvanced || attackActionChanged)) {
+                                const elapsedMs = this.attackElapsedMs(player.attackStartTick, worldTick);
                                 this.onPlayerAttackCallbacks.forEach((cb) =>
-                                    cb(id, player.position, player.comboStep ?? 1)
+                                    cb(id, player.position, player.comboStep ?? 1, elapsedMs)
                                 );
                             }
                         });
 
                         if (fullState) {
                             this.players = incomingPlayers;
+
+                            const retainedAttributes: Record<string, PlayerAttributes> = {};
+                            for (const id of Object.keys(incomingPlayers)) {
+                                if (this.playerAttributes[id]) {
+                                    retainedAttributes[id] = this.playerAttributes[id];
+                                }
+                            }
+                            this.playerAttributes = retainedAttributes;
                         } else {
 
                             for (const [id, player] of Object.entries(incomingPlayers)) {
@@ -488,7 +501,7 @@ export class NetworkManager {
                     case "playerAttack":
 
                         this.onPlayerAttackCallbacks.forEach((callback) =>
-                            callback(message.playerId, message.position, 1)
+                            callback(message.playerId, message.position, 1, 0)
                         );
                         break;
                 }
@@ -646,6 +659,10 @@ export class NetworkManager {
 
     public getPlayers(): Record<string, PlayerState> {
         return this.players;
+    }
+
+    public getWorldTick(): number {
+        return this.lastWorldTick;
     }
 
     public getMyUnitType(): number {

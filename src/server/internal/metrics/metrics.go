@@ -156,6 +156,16 @@ var (
 		Buckets: []float64{1, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000},
 	})
 
+	BroadcastAckBudgetExceeded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_broadcast_ack_budget_exceeded_total",
+		Help: "Total ticks where movement ACK bytes alone exceeded their reserved share of the fanout byte budget",
+	})
+
+	BroadcastRecoveryFrames = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_broadcast_recovery_frames_total",
+		Help: "Total full-recovery (lazy resync) frames sent in place of a delta frame",
+	})
+
 	FanoutRecipientLimit = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "game_fanout_recipient_limit",
 		Help: "Current adaptive recipient limit for world-state fanout per tick (0 means unlimited)",

@@ -6,7 +6,6 @@ import (
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/protocol"
-	"pixi_game_server/internal/systems"
 	"pixi_game_server/internal/types"
 )
 
@@ -15,12 +14,9 @@ func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-
-		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
-	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
 
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
@@ -40,12 +36,9 @@ func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-
-		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
-	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
 
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
@@ -68,12 +61,9 @@ func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-
-		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
-	gw.visibilityManager.AddPlayer(player.ID, 100, 100)
 
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
@@ -104,12 +94,9 @@ func TestUpdatePlayerPositionClampsAtWorldBoundary(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
-
-		visibilityManager: systems.NewVisibilityManager(1000, 1000, 100),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 1000, Y: 100}
-	gw.visibilityManager.AddPlayer(player.ID, 1000, 100)
 
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
@@ -253,7 +240,7 @@ func TestClassifyDelta(t *testing.T) {
 		{
 			name: "fully pinned at a boundary diverges",
 			st:   moved(100, 100), exists: true,
-			want: deltaReason{include: true, diverged: true},
+			want: deltaReason{include: true, diverged: true, unpredictable: true},
 		},
 		{
 
@@ -340,12 +327,15 @@ func TestClassifyDeltaBucketsAreExclusive(t *testing.T) {
 	}
 }
 
-// TestClassifyDeltaMatchesUpdatePlayerPositionForDiagonalSprintAndRemainder
-// exercises the exact scenario item 3 fixes: a sprinting player moving
-// diagonally, with a carried fractional MoveRemainderMilli, must still be
-// classified as predictable (not diverged) once the predictor uses the same
-// per-player fixed-point integration as updatePlayerPosition.
-func TestClassifyDeltaMatchesUpdatePlayerPositionForDiagonalSprintAndRemainder(t *testing.T) {
+// TestClassifyDeltaSprintDivergesFromClientDeadReckoning exercises the P1
+// regression from the 2026-09-10 review: the client's dead reckoning
+// (deadReckon in playerManager.ts) never applies the sprint multiplier, so
+// even though this position is exactly what the server's own fixed-point
+// integrator (with sprint multiplier, diagonal factor and carried
+// MoveRemainderMilli) would produce, the client would have predicted a
+// different position. classifyDelta must therefore treat it as
+// unpredictable rather than a plain position-only delta.
+func TestClassifyDeltaSprintDivergesFromClientDeadReckoning(t *testing.T) {
 	const milliUnitsPerTick = uint32(3700)
 	const sprintMultiplier = 1.5
 	const prevRemainderMilli = uint32(250)
@@ -358,20 +348,47 @@ func TestClassifyDeltaMatchesUpdatePlayerPositionForDiagonalSprintAndRemainder(t
 	rateMultiplier := sprintMultiplier / math.Sqrt2
 	milliRate := uint32(math.Round(float64(milliUnitsPerTick) * rateMultiplier))
 	distance := int64((uint64(prevRemainderMilli) + uint64(milliRate)*uint64(elapsed)) / 1000)
-	wantX := uint16(int64(prev.X) + distance)
-	wantY := uint16(int64(prev.Y) + distance)
+	serverX := uint16(int64(prev.X) + distance)
+	serverY := uint16(int64(prev.Y) + distance)
 
 	st := prev
-	st.X, st.Y = wantX, wantY
+	st.X, st.Y = serverX, serverY
 
 	got := gw.classifyDelta(st, prev, true, elapsed, 0, prevRemainderMilli, velocityRepl)
-	if got.diverged {
-		t.Fatalf("diagonal sprinting movement with a carried remainder must be predictable, got %+v", got)
+	if !got.unpredictable || !got.include {
+		t.Fatalf("sprinting movement must be sent even though it matches the server's own model, got %+v", got)
 	}
-	if !got.positionOnly {
-		t.Fatalf("expected a plain position-only delta, got %+v", got)
+}
+
+// TestClassifyDeltaSprintNearWorldBoundaryIsUnpredictable is the protected
+// regression for the two cases the review reproduced directly: a sprinting
+// player approaching a world edge. The server's model clamps to the
+// boundary; the client's dead reckoning does not clamp and does not apply
+// the sprint multiplier, so it would keep walking the player past X=1000.
+// classifyDelta must not suppress this record.
+func TestClassifyDeltaSprintNearWorldBoundaryIsUnpredictable(t *testing.T) {
+	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1.5, 1000, 60000)
+
+	prev := types.PlayerState{ID: 1, X: 995, Y: 100, VX: 1, VY: 0, Sprinting: true}
+	st := types.PlayerState{ID: 1, X: 1000, Y: 100, VX: 1, VY: 0, Sprinting: true}
+
+	got := gw.classifyDelta(st, prev, true, testElapsed, 0, 0, velocityRepl)
+	if !got.unpredictable || !got.include {
+		t.Fatalf("a sprinting player clamped at the world boundary must be classified unpredictable, got %+v", got)
 	}
-	if got.include {
-		t.Fatal("velocity-replication mode should not resend movement the client can dead-reckon")
+}
+
+// TestClassifyDeltaWorldBoundaryClampWithoutSprintIsUnpredictable protects
+// the plain (non-sprint) clamp case: the server clamps to the boundary, but
+// the client's unclamped dead reckoning would walk straight past it.
+func TestClassifyDeltaWorldBoundaryClampWithoutSprintIsUnpredictable(t *testing.T) {
+	gw := newClassifyTestWorld(testMilliUnitsPerTick, 1, 1000, 60000)
+
+	prev := types.PlayerState{ID: 1, X: 996, Y: 100, VX: 1, VY: 0}
+	st := types.PlayerState{ID: 1, X: 1000, Y: 100, VX: 1, VY: 0}
+
+	got := gw.classifyDelta(st, prev, true, testElapsed, 0, 0, velocityRepl)
+	if !got.unpredictable || !got.include {
+		t.Fatalf("a player clamped at the world boundary must be classified unpredictable, got %+v", got)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/gobwas/ws"
 
 	"pixi_game_server/internal/clock"
+	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/types"
@@ -180,6 +181,18 @@ func (s *Server) sendPong(conn *Connection, nonce uint32) {
 	}
 }
 
+// recordFanoutDrop increments a connection's consecutive-drop streak and,
+// once it reaches live.FanoutDropStreak, triggers the same cleanup path a
+// writeCh-full failure has always used. It must be called from every path
+// that skips a world-state enqueue for this connection (queue-depth shed,
+// pending-broadcast shed, and writeCh full) so a long stretch of shedding
+// alone can still trip the configured drop-streak disconnect policy.
+func (s *Server) recordFanoutDrop(conn *Connection, live *config.LiveNetConfig) {
+	if atomic.AddInt32(&conn.fanoutDrops, 1) >= live.FanoutDropStreak {
+		go s.cleanupConnection(conn)
+	}
+}
+
 func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCreatedNs int64) bool {
 	live := s.live.Load()
 	depth := len(conn.writeCh)
@@ -187,7 +200,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 	if live.FanoutQueueShedDepth > 0 && depth >= live.FanoutQueueShedDepth {
 		frame.release()
 		metrics.BroadcastsShed.Inc()
-		atomic.AddInt32(&conn.fanoutDrops, 1)
+		s.recordFanoutDrop(conn, live)
 		return false
 	}
 
@@ -195,7 +208,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 
 		frame.release()
 		metrics.BroadcastsShed.Inc()
-		atomic.AddInt32(&conn.fanoutDrops, 1)
+		s.recordFanoutDrop(conn, live)
 		return false
 	}
 
@@ -215,9 +228,7 @@ func (s *Server) enqueueBroadcastJob(conn *Connection, frame *tickFrame, stateCr
 		atomic.StoreInt32(&conn.pendingBroadcast, 0)
 		frame.release()
 		metrics.BroadcastsDropped.Inc()
-		if atomic.AddInt32(&conn.fanoutDrops, 1) == live.FanoutDropStreak {
-			go s.cleanupConnection(conn)
-		}
+		s.recordFanoutDrop(conn, live)
 		return false
 	}
 }
@@ -740,7 +751,18 @@ func shouldEmitFrame(fullSync bool, changedCount int, velocityReplication bool) 
 	return fullSync || changedCount > 0 || velocityReplication
 }
 
+// broadcastTick fans out one tick's world state and always tunes the time
+// dilation regulator exactly once, regardless of which path it returns on —
+// an idle world, zero connections, a suppressed empty delta, or every
+// recipient being deferred must still feed the regulator a real computeDur
+// (with zero write pressure/fanout cost when no fanout happened), or a
+// zone that stops sending frames can never recover from a stale slowdown.
 func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32, computeDur time.Duration) bool {
+	var writePressure, fanoutDur time.Duration
+	defer func() {
+		s.tuneTimeDilation(writePressure, fanoutDur, computeDur)
+	}()
+
 	if len(allPlayers) == 0 {
 		return false
 	}
@@ -817,11 +839,26 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		}
 	}
 
+	totalBudget := live.FanoutMaxBroadcastBytesPerTick
+	stateBudget := 0
+	if totalBudget > 0 {
+		ackReserve := totalBudget / 2
+		ackCharge := ackBytesSent
+		if ackCharge > ackReserve {
+			metrics.BroadcastAckBudgetExceeded.Inc()
+			ackCharge = ackReserve
+		}
+		stateBudget = totalBudget - ackCharge
+		if stateBudget < 1 {
+			stateBudget = 1
+		}
+	}
+
 	budgetLimit := 0
-	if budgetBytes := live.FanoutMaxBroadcastBytesPerTick; budgetBytes > 0 {
+	if totalBudget > 0 {
 		frameBytes := len(f.frame)
 		if frameBytes > 0 {
-			budgetRecipients := budgetBytes / frameBytes
+			budgetRecipients := stateBudget / frameBytes
 			if budgetRecipients < 1 {
 				budgetRecipients = 1
 			}
@@ -858,7 +895,8 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 
 	enqueueStart := time.Now()
 	dropped := 0
-	usedBytes := ackBytesSent
+	recoveryFramesSent := 0
+	usedStateBytes := 0
 	for _, conn := range recipients {
 		requested := conn.needsFullState.Swap(false)
 		needFull := fullSync || requested || !conn.hasQueuedState || conn.lastQueuedStateSeq+1 != stateSequence
@@ -866,23 +904,34 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 		if needFull && !fullSync {
 			if recovery == nil {
 				recovery = s.encodeTickFrame(allPlayers, nil, true, stateSequence, worldTick)
+
+				if recovery.payloadSize > 0 {
+					metrics.BroadcastPayloadBytes.Observe(float64(recovery.payloadSize))
+				}
+				metrics.BroadcastRecords.Observe(float64(len(allPlayers)))
 			}
 			frame = recovery
 		}
-		if budget := live.FanoutMaxBroadcastBytesPerTick; budget > 0 && usedBytes > 0 && usedBytes+len(frame.frame) > budget {
+		if totalBudget > 0 && usedStateBytes > 0 && usedStateBytes+len(frame.frame) > stateBudget {
 			conn.needsFullState.Store(true)
 			dropped++
 			continue
 		}
 		atomic.AddInt32(&frame.refs, 1)
 		if s.enqueueBroadcastJob(conn, frame, sentAtNs) {
-			usedBytes += len(frame.frame)
+			usedStateBytes += len(frame.frame)
 			conn.lastQueuedStateSeq = stateSequence
 			conn.hasQueuedState = true
+			if frame == recovery {
+				recoveryFramesSent++
+			}
 		} else {
 			conn.needsFullState.Store(true)
 			dropped++
 		}
+	}
+	if recoveryFramesSent > 0 {
+		metrics.BroadcastRecoveryFrames.Add(float64(recoveryFramesSent))
 	}
 	for _, conn := range conns {
 		if !conn.hasQueuedState || conn.lastQueuedStateSeq != stateSequence {
@@ -896,15 +945,13 @@ func (s *Server) broadcastTick(allPlayers []types.PlayerState, changed []types.P
 	if recipientPtr != nil {
 		releaseRecipientSlice(recipients, recipientPtr)
 	}
-	pressure := populationWritePressure(conns, clock.Now())
+	writePressure = populationWritePressure(conns, clock.Now())
 	releaseConnSlice(conns, buf)
 
-	fanoutDur := time.Since(t1)
+	fanoutDur = time.Since(t1)
 	metrics.TickPhaseDuration.WithLabelValues("fanout_send").Observe(fanoutDur.Seconds())
 	metrics.TickFanoutDuration.Observe(fanoutDur.Seconds())
 	s.tuneRecipientLimit(n, m, overdue, dropped, fanoutDur)
-
-	s.tuneTimeDilation(pressure, fanoutDur, computeDur)
 
 	if fanoutDur > 20*time.Millisecond {
 		nowNano := clock.Now()

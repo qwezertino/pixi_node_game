@@ -6,13 +6,35 @@
 // a mismatched decoder does not fail, it silently yields wrong player IDs. Bundling the
 // real one is what makes a wire-format change verifiable at all.
 
-import { MOVEMENT, NETWORK } from './config.mjs';
+import { HTTP_BASE, MOVEMENT, NETWORK } from './config.mjs';
 
 const DEFAULT_URL = process.env.GAME_WS_URL ?? 'ws://127.0.0.1:8108/ws';
 const METRICS_URL = process.env.GAME_METRICS_URL ?? 'http://127.0.0.1:8110/metrics';
 
-export const SPEED = MOVEMENT.playerSpeedPerTick;
+// The bundled decoder (lib/proto.mjs) pulls in src/shared/gameConfig.ts and
+// src/shared/units.ts, both of which fetch("/api/config") / fetch("/api/units") with a
+// relative URL at module-load time — fine in a browser, meaningless in Node. Rewriting
+// same-origin-style requests onto the running test server is what makes that import work
+// here at all.
+const realFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+    if (typeof input === 'string' && input.startsWith('/')) {
+        return realFetch(`${HTTP_BASE}${input}`, init);
+    }
+    return realFetch(input, init);
+};
+
+const units = await (await fetch(`${HTTP_BASE}/api/units`)).json();
+const defaultUnit = units.find((u) => u.id === 'spearman') ?? units[0];
+
 export const TICK_RATE = NETWORK.tickRate;
+// Mirrors buildUnitTables()'s moveStats in world.go (and milliUnitsPerTick in
+// src/client/utils/movement.ts) for the unit probes connect as (spearman, same as the
+// client's DEFAULT_UNIT_TYPE): movement accumulates in milli-units per tick, not whole
+// units, so SPEED must keep that fractional precision or exact-equality checks like
+// determinism.mjs's `travel === STEPS * SPEED` fail on rounding drift alone.
+const milliPerTick = Math.round((defaultUnit.moveSpeed * MOVEMENT.unitsPerMeter * 1000) / TICK_RATE);
+export const SPEED = milliPerTick / 1000;
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

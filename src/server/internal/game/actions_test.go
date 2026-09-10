@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"pixi_game_server/internal/config"
-	"pixi_game_server/internal/systems"
 	"pixi_game_server/internal/types"
 )
 
@@ -14,7 +13,7 @@ func TestActionsExecuteOnlyDuringTickAndPreserveOrder(t *testing.T) {
 	p.SetX(100)
 	p.SetY(100)
 	p.SetStaminaCenti(1000)
-	gw := &GameWorld{cfg: &config.Config{World: config.WorldConfig{MaxX: 1000, MaxY: 1000}}, playersMap: map[uint32]*types.Player{1: p}, visibilityManager: systems.NewVisibilityManager(1000, 1000, 100)}
+	gw := &GameWorld{cfg: &config.Config{World: config.WorldConfig{MaxX: 1000, MaxY: 1000}}, playersMap: map[uint32]*types.Player{1: p}}
 	gw.unitTablesPtr.Store(&unitTables{attackDurationTicks: map[uint8]uint32{0: 2}, comboSteps: map[uint8]uint8{0: 2}, staminaStats: map[uint8]staminaStat{0: {maxCenti: 1000, canBlock: true, attackStaminaCostCenti: 100}}})
 	ch := make(chan tickWorkerInput)
 	done := make(chan struct{})

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"pixi_game_server/internal/config"
@@ -14,9 +15,10 @@ import (
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `Usage:
-  configctl list                 List every live config key and its current value
-  configctl get <key>             Print one key's current value
-  configctl set <key> <value>     Set a key and notify running servers instantly
+  configctl list                       List every live config key and its current value
+  configctl get <key>                  Print one key's current value
+  configctl set <key> <value>          Set a key and notify running servers instantly
+  configctl set-many k1=v1 k2=v2 ...   Set several related keys in one atomic, consistent change
 
 Keys:`)
 	keys := append([]string(nil), config.LiveConfigKeys...)
@@ -96,6 +98,38 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("%s = %s (all connected servers notified)\n", key, value)
+
+	case "set-many":
+		if len(os.Args) < 3 {
+			usage()
+			os.Exit(1)
+		}
+		patch := make(map[string]string, len(os.Args)-2)
+		for _, arg := range os.Args[2:] {
+			key, value, ok := strings.Cut(arg, "=")
+			if !ok {
+				fmt.Fprintln(os.Stderr, "invalid k=v pair:", arg)
+				os.Exit(1)
+			}
+			patch[key] = value
+		}
+		liveCfg := &config.LiveNetConfig{}
+		for key, value := range patch {
+			if err := liveCfg.ApplyKey(key, value); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid key or value %q: %v\n", key, err)
+				os.Exit(1)
+			}
+		}
+		if err := store.SetKeys(ctx, patch); err != nil {
+			fmt.Fprintln(os.Stderr, "failed to set config:", err)
+			os.Exit(1)
+		}
+		keys := make([]string, 0, len(patch))
+		for k := range patch {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Printf("%s applied atomically (all connected servers notified)\n", strings.Join(keys, ", "))
 
 	default:
 		usage()

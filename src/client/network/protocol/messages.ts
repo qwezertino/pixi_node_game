@@ -155,7 +155,7 @@ export interface UnitRosterMessage extends ServerMessage {
     entries: Record<string, PlayerAttributes>;
 }
 
-export const PROTOCOL_VERSION = 12;
+export const PROTOCOL_VERSION = 13;
 
 export enum MessageType {
     JOIN = 1,

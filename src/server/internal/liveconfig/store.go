@@ -2,7 +2,10 @@ package liveconfig
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"time"
 
@@ -110,7 +113,30 @@ func (s *Store) getKey(ctx context.Context, key string) (string, bool, error) {
 	return value, true, nil
 }
 
+// SetKey sets a single live config key. See SetKeys for the atomicity and
+// recovery guarantees.
 func (s *Store) SetKey(ctx context.Context, key, value string) error {
+	return s.SetKeys(ctx, map[string]string{key: value})
+}
+
+// SetKeys applies patch as one atomic change to the live config: every key
+// in patch is validated and persisted together, so related keys (for
+// example a min/max pair) can be moved from one valid combination to
+// another in a single call instead of racing two separate SetKey calls
+// against each other.
+//
+// Unlike the old SetKey, this does not require every value already stored
+// in the database to be valid on its own: it starts from the raw stored
+// rows, overlays patch on top, and only then validates the resulting
+// snapshot. A row left over from a bad direct SQL edit therefore no longer
+// blocks fixing that very row (or any other key) through this API — any
+// other still-invalid legacy key is simply left out of the validated
+// snapshot and keeps its old on-disk value untouched.
+func (s *Store) SetKeys(ctx context.Context, patch map[string]string) error {
+	if len(patch) == 0 {
+		return nil
+	}
+
 	settings, err := s.LoadGameSettings(ctx)
 	if err != nil {
 		return err
@@ -119,21 +145,72 @@ func (s *Store) SetKey(ctx context.Context, key, value string) error {
 	if err != nil {
 		return err
 	}
-	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
-	if err := s.LoadInto(ctx, live); err != nil {
-		return err
-	}
-	if err := live.Update(func(c *config.LiveNetConfig) error { return c.ApplyKey(key, value) }); err != nil {
-		return err
-	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO `+tableName+` (key, value, updated_at) VALUES ($1, $2, now())
-		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-	`, key, value)
+	raw, err := s.LoadAll(ctx)
 	if err != nil {
 		return err
 	}
-	return s.redis.Publish(ctx, updatesChannel, key).Err()
+	if _, err := resolveLiveNetPatch(config.BuildLiveNetConfig(cfg), raw, patch); err != nil {
+		return err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	for key, value := range patch {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO `+tableName+` (key, value, updated_at) VALUES ($1, $2, now())
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+		`, key, value); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	for key := range patch {
+		if err := s.redis.Publish(ctx, updatesChannel, key).Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveLiveNetPatch validates patch against a snapshot built from raw
+// stored key/value rows: patch is applied first, atomically, as one group
+// (so cross-field invariants between patched keys are enforced together);
+// any other raw key is then layered in best-effort, one at a time, and
+// silently skipped (keeping baseline's value for it) if it no longer
+// validates. This lets a single still-invalid legacy row be fixed, or any
+// other key be changed, without that legacy row blocking every write.
+func resolveLiveNetPatch(baseline *config.LiveNetConfig, raw map[string]string, patch map[string]string) (*config.LiveNetConfig, error) {
+	live := config.NewLiveNet(baseline)
+
+	if err := live.Update(func(c *config.LiveNetConfig) error {
+		for key, value := range patch {
+			if err := c.ApplyKey(key, value); err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	for key, value := range raw {
+		if _, patched := patch[key]; patched {
+			continue
+		}
+		key, value := key, value
+		if err := live.Update(func(c *config.LiveNetConfig) error { return c.ApplyKey(key, value) }); err != nil {
+			slog.Warn("live config: ignoring stored value that no longer validates", "key", key, "value", value, "error", err)
+		}
+	}
+
+	return live.Load(), nil
 }
 
 func (s *Store) LoadInto(ctx context.Context, live *config.LiveNet) error {
@@ -210,7 +287,17 @@ func postgresDSNFromEnv() string {
 	user := getEnv("POSTGRES_USER", "game")
 	password := getEnv("POSTGRES_PASSWORD", "game")
 	db := getEnv("POSTGRES_DB", "game")
-	return "postgres://" + user + ":" + password + "@" + host + ":" + port + "/" + db + "?sslmode=disable"
+
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(user, password),
+		Host:   net.JoinHostPort(host, port),
+		Path:   "/" + db,
+	}
+	q := url.Values{}
+	q.Set("sslmode", "disable")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func redisAddrFromEnv() string {

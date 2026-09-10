@@ -19,6 +19,7 @@ interface PositionSnapshot {
     y: number;
 }
 
+const MAX_ATTACK_JOIN_ELAPSED_TICKS = 1000;
 const MIN_INTERPOLATION_DELAY_MS = 50;
 const MAX_INTERPOLATION_DELAY_MS = 150;
 const SNAPSHOT_EWMA_ALPHA = 0.15;
@@ -262,12 +263,12 @@ class RemotePlayer {
         this.direction = direction;
     }
 
-    performAttack(comboStep: number) {
+    performAttack(comboStep: number, elapsedMs = 0) {
         this.movementVector.dx = 0;
         this.movementVector.dy = 0;
         this.isMoving = false;
 
-        this.animationController.handleAttack(comboStep);
+        this.animationController.handleAttack(comboStep, elapsedMs);
     }
 
     /**
@@ -348,10 +349,10 @@ export class PlayerManager {
             }
         });
 
-        this.networkManager.onPlayerAttack((playerId, _position, comboStep) => {
+        this.networkManager.onPlayerAttack((playerId, _position, comboStep, elapsedMs) => {
             const player = this.remotePlayers.get(playerId);
             if (player) {
-                player.performAttack(comboStep);
+                player.performAttack(comboStep, elapsedMs);
             }
         });
 
@@ -439,6 +440,7 @@ export class PlayerManager {
     }
 
     private async createRemotePlayer(playerState: PlayerState): Promise<void> {
+        const worldTickAtJoin = this.networkManager.getWorldTick();
         const unitDefinition = getUnitDefinitionByTypeId(this.networkManager.getUnitType(playerState.id));
         const characterVisual = await this.loadVisualFor(unitDefinition);
 
@@ -474,6 +476,16 @@ export class PlayerManager {
                 playerState.movementVector.dx,
                 playerState.movementVector.dy
             );
+        }
+
+        if (playerState.attacking) {
+            const elapsedTicks = playerState.attackStartTick !== undefined
+                ? (worldTickAtJoin - playerState.attackStartTick) >>> 0
+                : 0;
+            const elapsedMs = elapsedTicks <= MAX_ATTACK_JOIN_ELAPSED_TICKS
+                ? elapsedTicks * (1000 / TICK_RATE)
+                : 0;
+            remotePlayer.performAttack(playerState.comboStep ?? 1, elapsedMs);
         }
 
         this.playerContainer.addChild(remotePlayer.sprite);

@@ -38,3 +38,24 @@ func TestRejectInvalidDefinitionsWithoutPublishing(t *testing.T) {
 		t.Fatal("accepted duplicate type ID")
 	}
 }
+
+func TestRejectSmallintOverflowingFields(t *testing.T) {
+	base := validDefinition()
+	for _, mutate := range []func(*Definition){
+		func(u *Definition) { u.PositionalBonus = &PositionalBonus{MinNearbyAllies: 32768} },
+		func(u *Definition) { u.RogueQuiver = &RogueQuiver{Charges: 40000} },
+		func(u *Definition) { u.FireArrow = &FireArrow{WoodCostPerShot: 32768} },
+	} {
+		bad := base
+		mutate(&bad)
+		if err := ValidateDefinition(bad); err == nil {
+			t.Fatalf("expected value exceeding SQL smallint range (32767) to be rejected: %+v", bad)
+		}
+	}
+
+	ok := base
+	ok.PositionalBonus = &PositionalBonus{MinNearbyAllies: 32767}
+	if err := ValidateDefinition(ok); err != nil {
+		t.Fatalf("expected 32767 to be within SQL smallint range, got %v", err)
+	}
+}

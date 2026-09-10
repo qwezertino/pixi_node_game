@@ -206,6 +206,14 @@ func (s *Store) getUnitRow(ctx context.Context, typeID uint8) (unitRow, error) {
 	return scanUnitRow(row.Scan)
 }
 
+// getUnitRowForUpdate reads a unit row inside tx, locking it until tx ends so
+// concurrent UpdateUnitStats calls for the same type_id serialize instead of
+// racing a read-merge-write against each other.
+func getUnitRowForUpdate(ctx context.Context, tx pgx.Tx, typeID uint8) (unitRow, error) {
+	row := tx.QueryRow(ctx, `SELECT`+unitColumns+` FROM units WHERE type_id = $1 FOR UPDATE`, typeID)
+	return scanUnitRow(row.Scan)
+}
+
 type BlockPatch struct {
 	MeleeDR         float64
 	RangedDR        float64
@@ -252,6 +260,24 @@ type DashThrustPatch struct {
 	CooldownSeconds  float64
 }
 
+// NullableField represents a PATCH field that a request may leave untouched
+// (Present false), explicitly clear (Present true, Value nil), or set to a
+// new value (Present true, Value non-nil).
+type NullableField[T any] struct {
+	Present bool
+	Value   *T
+}
+
+// Set builds a NullableField that assigns value.
+func Set[T any](value T) NullableField[T] {
+	return NullableField[T]{Present: true, Value: &value}
+}
+
+// Clear builds a NullableField that explicitly clears the field.
+func Clear[T any]() NullableField[T] {
+	return NullableField[T]{Present: true, Value: nil}
+}
+
 type UnitStatsPatch struct {
 	HP                         *float64
 	PassiveDR                  *float64
@@ -274,22 +300,22 @@ type UnitStatsPatch struct {
 	Cleave                     *bool
 	HasBraceStance             *bool
 
-	ComboSteps               *int
-	ComboWindowSeconds       *float64
-	AttackStaminaCost        *float64
-	DrawHoldThresholdSeconds *float64
-	DodgeCostMultiplier      *float64
+	ComboSteps               NullableField[int]
+	ComboWindowSeconds       NullableField[float64]
+	AttackStaminaCost        NullableField[float64]
+	DrawHoldThresholdSeconds NullableField[float64]
+	DodgeCostMultiplier      NullableField[float64]
 
-	AntiShieldMultiplier        *float64
-	AntiWoodStructureMultiplier *float64
+	AntiShieldMultiplier        NullableField[float64]
+	AntiWoodStructureMultiplier NullableField[float64]
 
-	Block           *BlockPatch
-	PositionalBonus *PositionalBonusPatch
-	OpportunistBow  *OpportunistBowPatch
-	RogueQuiver     *RogueQuiverPatch
-	Recon           *ReconPatch
-	FireArrow       *FireArrowPatch
-	DashThrust      *DashThrustPatch
+	Block           NullableField[BlockPatch]
+	PositionalBonus NullableField[PositionalBonusPatch]
+	OpportunistBow  NullableField[OpportunistBowPatch]
+	RogueQuiver     NullableField[RogueQuiverPatch]
+	Recon           NullableField[ReconPatch]
+	FireArrow       NullableField[FireArrowPatch]
+	DashThrust      NullableField[DashThrustPatch]
 }
 
 // mergeUnitStatsPatch applies patch onto current, leaving every field the
@@ -360,11 +386,11 @@ func mergeUnitStatsPatch(current unitRow, patch UnitStatsPatch) unitRow {
 		d.HasBraceStance = *patch.HasBraceStance
 	}
 
-	if patch.ComboSteps != nil {
-		merged.comboSteps = patch.ComboSteps
+	if patch.ComboSteps.Present {
+		merged.comboSteps = patch.ComboSteps.Value
 	}
-	if patch.ComboWindowSeconds != nil {
-		merged.comboWindowSeconds = patch.ComboWindowSeconds
+	if patch.ComboWindowSeconds.Present {
+		merged.comboWindowSeconds = patch.ComboWindowSeconds.Value
 	}
 	if merged.comboSteps != nil {
 		d.ComboSteps = *merged.comboSteps
@@ -377,63 +403,89 @@ func mergeUnitStatsPatch(current unitRow, patch UnitStatsPatch) unitRow {
 		d.ComboWindowSeconds = 0
 	}
 
-	if patch.AttackStaminaCost != nil {
-		d.AttackStaminaCost = patch.AttackStaminaCost
+	if patch.AttackStaminaCost.Present {
+		d.AttackStaminaCost = patch.AttackStaminaCost.Value
 	}
-	if patch.DrawHoldThresholdSeconds != nil {
-		d.DrawHoldThresholdSeconds = patch.DrawHoldThresholdSeconds
+	if patch.DrawHoldThresholdSeconds.Present {
+		d.DrawHoldThresholdSeconds = patch.DrawHoldThresholdSeconds.Value
 	}
-	if patch.DodgeCostMultiplier != nil {
-		d.DodgeCostMultiplier = patch.DodgeCostMultiplier
+	if patch.DodgeCostMultiplier.Present {
+		d.DodgeCostMultiplier = patch.DodgeCostMultiplier.Value
 	}
-	if patch.AntiShieldMultiplier != nil {
-		d.AntiShieldMultiplier = patch.AntiShieldMultiplier
+	if patch.AntiShieldMultiplier.Present {
+		d.AntiShieldMultiplier = patch.AntiShieldMultiplier.Value
 	}
-	if patch.AntiWoodStructureMultiplier != nil {
-		d.AntiWoodStructureMultiplier = patch.AntiWoodStructureMultiplier
+	if patch.AntiWoodStructureMultiplier.Present {
+		d.AntiWoodStructureMultiplier = patch.AntiWoodStructureMultiplier.Value
 	}
 
-	if patch.Block != nil {
-		d.Block = &units.BlockProfile{
-			MeleeDR: patch.Block.MeleeDR, RangedDR: patch.Block.RangedDR,
-			DrainPerSecond: patch.Block.DrainPerSecond, RecoverySeconds: patch.Block.RecoverySeconds,
+	if patch.Block.Present {
+		if patch.Block.Value == nil {
+			d.Block = nil
+		} else {
+			d.Block = &units.BlockProfile{
+				MeleeDR: patch.Block.Value.MeleeDR, RangedDR: patch.Block.Value.RangedDR,
+				DrainPerSecond: patch.Block.Value.DrainPerSecond, RecoverySeconds: patch.Block.Value.RecoverySeconds,
+			}
 		}
 	}
-	if patch.PositionalBonus != nil {
-		d.PositionalBonus = &units.PositionalBonus{
-			StaminaCostReductionPct: patch.PositionalBonus.StaminaCostReductionPct,
-			MinNearbyAllies:         patch.PositionalBonus.MinNearbyAllies,
+	if patch.PositionalBonus.Present {
+		if patch.PositionalBonus.Value == nil {
+			d.PositionalBonus = nil
+		} else {
+			d.PositionalBonus = &units.PositionalBonus{
+				StaminaCostReductionPct: patch.PositionalBonus.Value.StaminaCostReductionPct,
+				MinNearbyAllies:         patch.PositionalBonus.Value.MinNearbyAllies,
+			}
 		}
 	}
-	if patch.OpportunistBow != nil {
-		d.OpportunistBow = &units.OpportunistBow{
-			Damage: patch.OpportunistBow.Damage, Range: patch.OpportunistBow.Range,
-			CooldownSeconds: patch.OpportunistBow.CooldownSeconds,
+	if patch.OpportunistBow.Present {
+		if patch.OpportunistBow.Value == nil {
+			d.OpportunistBow = nil
+		} else {
+			d.OpportunistBow = &units.OpportunistBow{
+				Damage: patch.OpportunistBow.Value.Damage, Range: patch.OpportunistBow.Value.Range,
+				CooldownSeconds: patch.OpportunistBow.Value.CooldownSeconds,
+			}
 		}
 	}
-	if patch.RogueQuiver != nil {
-		d.RogueQuiver = &units.RogueQuiver{
-			Damage: patch.RogueQuiver.Damage, Range: patch.RogueQuiver.Range,
-			Charges: patch.RogueQuiver.Charges, RechargeSeconds: patch.RogueQuiver.RechargeSeconds,
-			ExecuteMultiplier: patch.RogueQuiver.ExecuteMultiplier, ExecuteHpThresholdPct: patch.RogueQuiver.ExecuteHpThresholdPct,
+	if patch.RogueQuiver.Present {
+		if patch.RogueQuiver.Value == nil {
+			d.RogueQuiver = nil
+		} else {
+			d.RogueQuiver = &units.RogueQuiver{
+				Damage: patch.RogueQuiver.Value.Damage, Range: patch.RogueQuiver.Value.Range,
+				Charges: patch.RogueQuiver.Value.Charges, RechargeSeconds: patch.RogueQuiver.Value.RechargeSeconds,
+				ExecuteMultiplier: patch.RogueQuiver.Value.ExecuteMultiplier, ExecuteHpThresholdPct: patch.RogueQuiver.Value.ExecuteHpThresholdPct,
+			}
 		}
 	}
-	if patch.Recon != nil {
-		d.Recon = &units.Recon{
-			ViewRadiusBonusPct: patch.Recon.ViewRadiusBonusPct, DetectionRadiusMeters: patch.Recon.DetectionRadiusMeters,
+	if patch.Recon.Present {
+		if patch.Recon.Value == nil {
+			d.Recon = nil
+		} else {
+			d.Recon = &units.Recon{
+				ViewRadiusBonusPct: patch.Recon.Value.ViewRadiusBonusPct, DetectionRadiusMeters: patch.Recon.Value.DetectionRadiusMeters,
+			}
 		}
 	}
-	if patch.FireArrow != nil {
-		d.FireArrow = &units.FireArrow{
-			Damage: patch.FireArrow.Damage, StructureDamageMultiplier: patch.FireArrow.StructureDamageMultiplier,
-			WoodCostPerShot: patch.FireArrow.WoodCostPerShot,
+	if patch.FireArrow.Present {
+		if patch.FireArrow.Value == nil {
+			d.FireArrow = nil
+		} else {
+			d.FireArrow = &units.FireArrow{
+				Damage: patch.FireArrow.Value.Damage, StructureDamageMultiplier: patch.FireArrow.Value.StructureDamageMultiplier,
+				WoodCostPerShot: patch.FireArrow.Value.WoodCostPerShot,
+			}
 		}
 	}
-	if patch.DashThrust != nil {
+	if patch.DashThrust.Present && patch.DashThrust.Value == nil {
+		d.DashThrust = nil
+	} else if patch.DashThrust.Present {
 		d.DashThrust = &units.DashThrust{
-			DistanceMeters: patch.DashThrust.DistanceMeters, WindupSeconds: patch.DashThrust.WindupSeconds,
-			RecoverySeconds: patch.DashThrust.RecoverySeconds, DamageMultiplier: patch.DashThrust.DamageMultiplier,
-			CooldownSeconds: patch.DashThrust.CooldownSeconds,
+			DistanceMeters: patch.DashThrust.Value.DistanceMeters, WindupSeconds: patch.DashThrust.Value.WindupSeconds,
+			RecoverySeconds: patch.DashThrust.Value.RecoverySeconds, DamageMultiplier: patch.DashThrust.Value.DamageMultiplier,
+			CooldownSeconds: patch.DashThrust.Value.CooldownSeconds,
 		}
 	}
 
@@ -441,7 +493,13 @@ func mergeUnitStatsPatch(current unitRow, patch UnitStatsPatch) unitRow {
 }
 
 func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitStatsPatch) error {
-	current, err := s.getUnitRow(ctx, typeID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	current, err := getUnitRowForUpdate(ctx, tx, typeID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrUnitNotFound
@@ -512,7 +570,7 @@ func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitSta
 		dashCooldown = &d.DashThrust.CooldownSeconds
 	}
 
-	tag, err := s.pool.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE units SET
 			hp = $2, passive_dr = $3, move_speed = $4, range_type = $5, range = $6, damage = $7,
 			windup_seconds = $8, active_seconds = $9, recovery_seconds = $10,
@@ -567,6 +625,9 @@ func (s *Store) UpdateUnitStats(ctx context.Context, typeID uint8, patch UnitSta
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrUnitNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 	return s.PublishUnitsChanged(ctx)
 }

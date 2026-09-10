@@ -594,6 +594,8 @@ func (s *Server) getOrCreateRateLimiter(ip string) *rate.Limiter {
 	return newLimiter
 }
 
+var minTickWatchdogThreshold = 5 * time.Second
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.lifecycleMu.Lock()
 	stopping := s.stopping
@@ -602,6 +604,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Server draining", http.StatusServiceUnavailable)
 		return
 	}
+
+	threshold := 20 * s.gameWorld.GetNominalTickInterval()
+	if threshold < minTickWatchdogThreshold {
+		threshold = minTickWatchdogThreshold
+	}
+	if age := s.gameWorld.TimeSinceLastTick(); age > threshold {
+		http.Error(w, "Game tick loop stalled", http.StatusServiceUnavailable)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"healthy","uptime_seconds":%d,"players":%d}`,

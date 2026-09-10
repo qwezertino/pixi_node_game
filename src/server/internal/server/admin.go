@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -12,50 +14,6 @@ import (
 
 func (s *Server) EnableUnitAdminAPI(store *liveconfig.Store) {
 	s.adminStore = store
-}
-
-type unitCostPatchRequest struct {
-	Wood  *int `json:"wood"`
-	Stone *int `json:"stone"`
-	Iron  *int `json:"iron"`
-}
-
-type unitStatsPatchRequest struct {
-	HP                         *float64              `json:"hp"`
-	PassiveDR                  *float64              `json:"passiveDR"`
-	MoveSpeed                  *float64              `json:"moveSpeed"`
-	RangeType                  *string               `json:"rangeType"`
-	Range                      *float64              `json:"range"`
-	Damage                     *float64              `json:"damage"`
-	WindupSeconds              *float64              `json:"windupSeconds"`
-	ActiveSeconds              *float64              `json:"activeSeconds"`
-	RecoverySeconds            *float64              `json:"recoverySeconds"`
-	Stamina                    *float64              `json:"stamina"`
-	StaminaRegenPerSecond      *float64              `json:"staminaRegenPerSecond"`
-	SprintSpeedMultiplier      *float64              `json:"sprintSpeedMultiplier"`
-	SprintStaminaCostPerSecond *float64              `json:"sprintStaminaCostPerSecond"`
-	AnimationSpeed             *float64              `json:"animationSpeed"`
-	Cost                       *unitCostPatchRequest `json:"cost"`
-	RequiresRoyalGuard         *bool                 `json:"requiresRoyalGuard"`
-	Cleave                     *bool                 `json:"cleave"`
-	HasBraceStance             *bool                 `json:"hasBraceStance"`
-
-	ComboSteps               *int     `json:"comboSteps"`
-	ComboWindowSeconds       *float64 `json:"comboWindowSeconds"`
-	AttackStaminaCost        *float64 `json:"attackStaminaCost"`
-	DrawHoldThresholdSeconds *float64 `json:"drawHoldThresholdSeconds"`
-	DodgeCostMultiplier      *float64 `json:"dodgeCostMultiplier"`
-
-	AntiShieldMultiplier        *float64 `json:"antiShieldMultiplier"`
-	AntiWoodStructureMultiplier *float64 `json:"antiWoodStructureMultiplier"`
-
-	Block           *blockPatchRequest           `json:"block"`
-	PositionalBonus *positionalBonusPatchRequest `json:"positionalBonus"`
-	OpportunistBow  *opportunistBowPatchRequest  `json:"opportunistBow"`
-	RogueQuiver     *rogueQuiverPatchRequest     `json:"rogueQuiver"`
-	Recon           *reconPatchRequest           `json:"recon"`
-	FireArrow       *fireArrowPatchRequest       `json:"fireArrow"`
-	DashThrust      *dashThrustPatchRequest      `json:"dashThrust"`
 }
 
 type blockPatchRequest struct {
@@ -104,6 +62,154 @@ type dashThrustPatchRequest struct {
 	CooldownSeconds  float64 `json:"cooldownSeconds"`
 }
 
+func isJSONNull(raw json.RawMessage) bool {
+	return string(raw) == "null"
+}
+
+// decodeRequiredField sets *dst when key is present with a non-null value.
+// A key present with an explicit null is rejected: the underlying column is
+// NOT NULL, so there is no way to "clear" it, only to leave it untouched
+// (key absent) or set it (key present, non-null).
+func decodeRequiredField[T any](raw map[string]json.RawMessage, key string, dst **T) error {
+	v, ok := raw[key]
+	if !ok {
+		return nil
+	}
+	if isJSONNull(v) {
+		return fmt.Errorf("%s cannot be null", key)
+	}
+	var val T
+	if err := json.Unmarshal(v, &val); err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	*dst = &val
+	return nil
+}
+
+// decodeNullableField distinguishes absent (dst left as its zero value, i.e.
+// not present), explicit null (dst.Present = true, dst.Value = nil, meaning
+// "clear this field"), and a provided value (dst.Present = true, dst.Value
+// set).
+func decodeNullableField[T any](raw map[string]json.RawMessage, key string, dst *liveconfig.NullableField[T]) error {
+	v, ok := raw[key]
+	if !ok {
+		return nil
+	}
+	dst.Present = true
+	if isJSONNull(v) {
+		dst.Value = nil
+		return nil
+	}
+	var val T
+	if err := json.Unmarshal(v, &val); err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	dst.Value = &val
+	return nil
+}
+
+func decodeUnitStatsPatch(body []byte) (liveconfig.UnitStatsPatch, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return liveconfig.UnitStatsPatch{}, err
+	}
+
+	var patch liveconfig.UnitStatsPatch
+
+	type requiredFloat struct {
+		key string
+		dst **float64
+	}
+	for _, f := range []requiredFloat{
+		{"hp", &patch.HP}, {"passiveDR", &patch.PassiveDR}, {"moveSpeed", &patch.MoveSpeed},
+		{"range", &patch.Range}, {"damage", &patch.Damage},
+		{"windupSeconds", &patch.WindupSeconds}, {"activeSeconds", &patch.ActiveSeconds}, {"recoverySeconds", &patch.RecoverySeconds},
+		{"stamina", &patch.Stamina}, {"staminaRegenPerSecond", &patch.StaminaRegenPerSecond},
+		{"sprintSpeedMultiplier", &patch.SprintSpeedMultiplier}, {"sprintStaminaCostPerSecond", &patch.SprintStaminaCostPerSecond},
+		{"animationSpeed", &patch.AnimationSpeed},
+	} {
+		if err := decodeRequiredField(raw, f.key, f.dst); err != nil {
+			return patch, err
+		}
+	}
+	if err := decodeRequiredField(raw, "rangeType", &patch.RangeType); err != nil {
+		return patch, err
+	}
+
+	if costRaw, ok := raw["cost"]; ok {
+		if isJSONNull(costRaw) {
+			return patch, fmt.Errorf("cost cannot be null")
+		}
+		var cost struct {
+			Wood  *int `json:"wood"`
+			Stone *int `json:"stone"`
+			Iron  *int `json:"iron"`
+		}
+		if err := json.Unmarshal(costRaw, &cost); err != nil {
+			return patch, fmt.Errorf("cost: %w", err)
+		}
+		patch.CostWood, patch.CostStone, patch.CostIron = cost.Wood, cost.Stone, cost.Iron
+	}
+
+	type requiredBool struct {
+		key string
+		dst **bool
+	}
+	for _, f := range []requiredBool{
+		{"requiresRoyalGuard", &patch.RequiresRoyalGuard}, {"cleave", &patch.Cleave}, {"hasBraceStance", &patch.HasBraceStance},
+	} {
+		if err := decodeRequiredField(raw, f.key, f.dst); err != nil {
+			return patch, err
+		}
+	}
+
+	if err := decodeNullableField(raw, "comboSteps", &patch.ComboSteps); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "comboWindowSeconds", &patch.ComboWindowSeconds); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "attackStaminaCost", &patch.AttackStaminaCost); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "drawHoldThresholdSeconds", &patch.DrawHoldThresholdSeconds); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "dodgeCostMultiplier", &patch.DodgeCostMultiplier); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "antiShieldMultiplier", &patch.AntiShieldMultiplier); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "antiWoodStructureMultiplier", &patch.AntiWoodStructureMultiplier); err != nil {
+		return patch, err
+	}
+
+	if err := decodeNullableField(raw, "block", &patch.Block); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "positionalBonus", &patch.PositionalBonus); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "opportunistBow", &patch.OpportunistBow); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "rogueQuiver", &patch.RogueQuiver); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "recon", &patch.Recon); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "fireArrow", &patch.FireArrow); err != nil {
+		return patch, err
+	}
+	if err := decodeNullableField(raw, "dashThrust", &patch.DashThrust); err != nil {
+		return patch, err
+	}
+
+	return patch, nil
+}
+
 func (s *Server) handleAdminUpdateUnit(w http.ResponseWriter, r *http.Request) {
 	typeID64, err := strconv.ParseUint(r.PathValue("typeId"), 10, 8)
 	if err != nil {
@@ -111,79 +217,16 @@ func (s *Server) handleAdminUpdateUnit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body unitStatsPatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	patch := liveconfig.UnitStatsPatch{
-		HP: body.HP, PassiveDR: body.PassiveDR, MoveSpeed: body.MoveSpeed,
-		RangeType: body.RangeType, Range: body.Range, Damage: body.Damage,
-		WindupSeconds: body.WindupSeconds, ActiveSeconds: body.ActiveSeconds, RecoverySeconds: body.RecoverySeconds,
-		Stamina: body.Stamina, StaminaRegenPerSecond: body.StaminaRegenPerSecond,
-		SprintSpeedMultiplier: body.SprintSpeedMultiplier, SprintStaminaCostPerSecond: body.SprintStaminaCostPerSecond,
-		AnimationSpeed:     body.AnimationSpeed,
-		RequiresRoyalGuard: body.RequiresRoyalGuard, Cleave: body.Cleave, HasBraceStance: body.HasBraceStance,
-
-		ComboSteps:               body.ComboSteps,
-		ComboWindowSeconds:       body.ComboWindowSeconds,
-		AttackStaminaCost:        body.AttackStaminaCost,
-		DrawHoldThresholdSeconds: body.DrawHoldThresholdSeconds,
-		DodgeCostMultiplier:      body.DodgeCostMultiplier,
-
-		AntiShieldMultiplier:        body.AntiShieldMultiplier,
-		AntiWoodStructureMultiplier: body.AntiWoodStructureMultiplier,
-	}
-
-	if body.Cost != nil {
-		patch.CostWood = body.Cost.Wood
-		patch.CostStone = body.Cost.Stone
-		patch.CostIron = body.Cost.Iron
-	}
-
-	if body.Block != nil {
-		patch.Block = &liveconfig.BlockPatch{
-			MeleeDR: body.Block.MeleeDR, RangedDR: body.Block.RangedDR,
-			DrainPerSecond: body.Block.DrainPerSecond, RecoverySeconds: body.Block.RecoverySeconds,
-		}
-	}
-	if body.PositionalBonus != nil {
-		patch.PositionalBonus = &liveconfig.PositionalBonusPatch{
-			StaminaCostReductionPct: body.PositionalBonus.StaminaCostReductionPct,
-			MinNearbyAllies:         body.PositionalBonus.MinNearbyAllies,
-		}
-	}
-	if body.OpportunistBow != nil {
-		patch.OpportunistBow = &liveconfig.OpportunistBowPatch{
-			Damage: body.OpportunistBow.Damage, Range: body.OpportunistBow.Range,
-			CooldownSeconds: body.OpportunistBow.CooldownSeconds,
-		}
-	}
-	if body.RogueQuiver != nil {
-		patch.RogueQuiver = &liveconfig.RogueQuiverPatch{
-			Damage: body.RogueQuiver.Damage, Range: body.RogueQuiver.Range,
-			Charges: body.RogueQuiver.Charges, RechargeSeconds: body.RogueQuiver.RechargeSeconds,
-			ExecuteMultiplier: body.RogueQuiver.ExecuteMultiplier, ExecuteHpThresholdPct: body.RogueQuiver.ExecuteHpThresholdPct,
-		}
-	}
-	if body.Recon != nil {
-		patch.Recon = &liveconfig.ReconPatch{
-			ViewRadiusBonusPct: body.Recon.ViewRadiusBonusPct, DetectionRadiusMeters: body.Recon.DetectionRadiusMeters,
-		}
-	}
-	if body.FireArrow != nil {
-		patch.FireArrow = &liveconfig.FireArrowPatch{
-			Damage: body.FireArrow.Damage, StructureDamageMultiplier: body.FireArrow.StructureDamageMultiplier,
-			WoodCostPerShot: body.FireArrow.WoodCostPerShot,
-		}
-	}
-	if body.DashThrust != nil {
-		patch.DashThrust = &liveconfig.DashThrustPatch{
-			DistanceMeters: body.DashThrust.DistanceMeters, WindupSeconds: body.DashThrust.WindupSeconds,
-			RecoverySeconds: body.DashThrust.RecoverySeconds, DamageMultiplier: body.DashThrust.DamageMultiplier,
-			CooldownSeconds: body.DashThrust.CooldownSeconds,
-		}
+	patch, err := decodeUnitStatsPatch(body)
+	if err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	if err := s.adminStore.UpdateUnitStats(r.Context(), uint8(typeID64), patch); err != nil {
@@ -191,7 +234,7 @@ func (s *Server) handleAdminUpdateUnit(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err == liveconfig.ErrUnitNotFound {
+		if errors.Is(err, liveconfig.ErrUnitNotFound) {
 			http.Error(w, "unit not found", http.StatusNotFound)
 			return
 		}

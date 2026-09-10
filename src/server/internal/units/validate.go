@@ -45,6 +45,28 @@ func ValidateDefinition(u Definition) error {
 			return fmt.Errorf("%s: invalid block profile", u.ID)
 		}
 	}
+
+	// These map to Postgres SMALLINT columns (int2, range -32768..32767); the
+	// generic 0..65535 check in validateNumbers is too wide for them.
+	type smallintField struct {
+		name string
+		v    int
+	}
+	var smallints []smallintField
+	if u.PositionalBonus != nil {
+		smallints = append(smallints, smallintField{"positionalBonus.minNearbyAllies", u.PositionalBonus.MinNearbyAllies})
+	}
+	if u.RogueQuiver != nil {
+		smallints = append(smallints, smallintField{"rogueQuiver.charges", u.RogueQuiver.Charges})
+	}
+	if u.FireArrow != nil {
+		smallints = append(smallints, smallintField{"fireArrow.woodCostPerShot", u.FireArrow.WoodCostPerShot})
+	}
+	for _, si := range smallints {
+		if si.v < 0 || si.v > 32767 {
+			return fmt.Errorf("%s.%s must be between 0 and 32767 (stored as SQL smallint)", u.ID, si.name)
+		}
+	}
 	return nil
 }
 

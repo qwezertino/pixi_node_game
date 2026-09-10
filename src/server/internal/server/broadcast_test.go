@@ -2,15 +2,29 @@ package server
 
 import (
 	"encoding/binary"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gobwas/ws"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/game"
+	"pixi_game_server/internal/metrics"
+	"pixi_game_server/internal/types"
 )
+
+func histogramSampleCount(t *testing.T, h prometheus.Histogram) uint64 {
+	t.Helper()
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		t.Fatalf("write histogram: %v", err)
+	}
+	return m.GetHistogram().GetSampleCount()
+}
 
 func TestWriteJobFrameEncodesMovementAck(t *testing.T) {
 	job := writeJob{ack: true, ackID: 99, ackX: 123, ackY: 456, ackSeq: 789}
@@ -248,6 +262,172 @@ func TestTuneTimeDilationModerateDebounceIsIndependentOfSevere(t *testing.T) {
 	if got := atomic.LoadInt64(&s.dilationBps); got != dilationBpsFull-500 {
 		t.Fatalf("dilationBps = %d, want %d (one moderate step down)", got, dilationBpsFull-500)
 	}
+}
+
+// TestBroadcastTickReservesStateBudgetFromAcks is the P1 regression from
+// the 2026-09-10 review: movement ACKs were enqueued before the fanout
+// byte budget was known, and usedBytes started already charged with their
+// size, so a single ACK per tick could permanently starve a recipient
+// whose needsFullState never gets cheap enough to fit in what budget was
+// left. With a budget sized for exactly one full-recovery frame and one
+// ACK enqueued every tick, world state must still get through at least
+// once across ten ticks.
+func TestBroadcastTickReservesStateBudgetFromAcks(t *testing.T) {
+	s := reliabilityServer(t)
+	s.gameWorld.Stop()
+	player := s.gameWorld.AddPlayer("")
+	raw, peer := net.Pipe()
+	t.Cleanup(func() { raw.Close(); peer.Close() })
+	c := s.createConnection(player, raw)
+	s.connections[player.ID] = c
+	s.admissions = 1
+
+	st := player.ToState()
+	frame := s.encodeTickFrame([]types.PlayerState{st}, nil, true, 1, 1)
+	oneRecipientRecoveryBytes := len(frame.frame)
+	frame.release()
+
+	if err := s.live.Update(func(cfg *config.LiveNetConfig) error {
+		cfg.FanoutMaxBroadcastBytesPerTick = oneRecipientRecoveryBytes
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sawWorldState := false
+	for tick := uint32(1); tick <= 10; tick++ {
+		c.needsFullState.Store(true)
+		player.SetMovementAck(tick, uint16(tick), 0)
+
+		s.broadcastTick([]types.PlayerState{st}, nil, false, tick, time.Millisecond)
+		got, _ := drainState(t, c)
+		if got != nil {
+			sawWorldState = true
+		}
+	}
+
+	if !sawWorldState {
+		t.Fatal("world state starved for 10 consecutive ticks by ACK byte-budget usage")
+	}
+}
+
+// TestEnqueueBroadcastJobSheddingTripsDropStreak is the P2 regression from
+// the 2026-09-10 review: the queue-depth shed and pending-broadcast shed
+// branches incremented fanoutDrops but never checked FanoutDropStreak, and
+// the one branch that did check used `==` — so a streak that jumped past
+// the threshold via shedding (now that shedding also increments the
+// counter) could sail past it forever. A long stretch of pure shedding
+// must still trigger the same disconnect cleanup a writeCh-full failure
+// does.
+func TestEnqueueBroadcastJobSheddingTripsDropStreak(t *testing.T) {
+	s := reliabilityServer(t)
+	s.gameWorld.Stop()
+	player := s.gameWorld.AddPlayer("")
+	raw, peer := net.Pipe()
+	t.Cleanup(func() { raw.Close(); peer.Close() })
+	c := s.createConnection(player, raw)
+	s.connections[player.ID] = c
+
+	if err := s.live.Update(func(cfg *config.LiveNetConfig) error {
+		cfg.FanoutQueueShedDepth = 1
+		cfg.FanoutDropStreak = 2
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeCh <- writeJob{direct: []byte{0}}
+
+	for i := 0; i < 2; i++ {
+		frame := &tickFrame{frame: []byte{0x82, 0}, refs: 1}
+		if s.enqueueBroadcastJob(c, frame, 0) {
+			t.Fatalf("enqueue %d: expected shed while queue depth >= FanoutQueueShedDepth", i)
+		}
+	}
+
+	select {
+	case <-c.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("drop streak reached via shedding alone did not trigger cleanup")
+	}
+}
+
+// TestBroadcastTickTunesDilationEvenWithoutFanout is the P2 regression from
+// the 2026-09-10 review: tuneTimeDilation used to run only on the path that
+// actually sent a world-state frame, so an empty world (or, more broadly,
+// any tick that suppresses fanout) could never recover from a stale
+// slowdown. broadcastTick must now tune the regulator exactly once per
+// call regardless of whether it reports a fanout.
+func TestBroadcastTickTunesDilationEvenWithoutFanout(t *testing.T) {
+	s := newDilationTestServer(t)
+	atomic.StoreInt64(&s.dilationBps, dilationBpsFull-2000)
+	s.gameWorld.SetTickInterval(s.gameWorld.GetNominalTickInterval() * 10000 / (dilationBpsFull - 2000))
+
+	broadcasted := s.broadcastTick(nil, nil, false, 1, 0)
+	if broadcasted {
+		t.Fatal("an empty-world tick must not report a fanout")
+	}
+
+	got := atomic.LoadInt64(&s.dilationBps)
+	if got != dilationBpsFull-1800 {
+		t.Fatalf("dilationBps = %d, want %d — the regulator must still run (and recover) on a tick with no players to fan out to", got, dilationBpsFull-1800)
+	}
+}
+
+// TestBroadcastTickRecordsLazyRecoveryCost is the P2 regression from the
+// 2026-09-10 review: BroadcastPayloadBytes/BroadcastRecords used to be
+// observed once, right after encoding the base (possibly empty) delta
+// frame, before any lazy per-recipient full-recovery frame existed. A tick
+// with an empty `changed` slice that still forces a full recovery for a
+// recipient (e.g. one that just requested resync) reported zero records
+// even though a full roster of records was actually sent. The recovery
+// frame's real record count/bytes must also be observed, and
+// BroadcastRecoveryFrames must count the recovery sends.
+func TestBroadcastTickRecordsLazyRecoveryCost(t *testing.T) {
+	s := reliabilityServer(t)
+	s.gameWorld.Stop()
+	players := []*types.Player{s.gameWorld.AddPlayer(""), s.gameWorld.AddPlayer("")}
+	for _, p := range players {
+		raw, peer := net.Pipe()
+		t.Cleanup(func() { raw.Close(); peer.Close() })
+		c := s.createConnection(p, raw)
+		s.connections[p.ID] = c
+	}
+	s.admissions = len(players)
+	states := []types.PlayerState{players[0].ToState(), players[1].ToState()}
+
+	s.broadcastTick(states, states, true, 1, time.Millisecond)
+	for _, p := range players {
+		drainState(t, s.connections[p.ID])
+	}
+
+	s.connections[players[0].ID].needsFullState.Store(true)
+
+	recordsBefore := histogramSampleCount(t, metrics.BroadcastRecords)
+	recoveryBefore := testutilCounterValue(t, metrics.BroadcastRecoveryFrames)
+
+	if !s.broadcastTick(states, nil, false, 2, time.Millisecond) {
+		t.Fatal("expected a fanout for the recipient forced into recovery")
+	}
+
+	recordsAfter := histogramSampleCount(t, metrics.BroadcastRecords)
+	recoveryAfter := testutilCounterValue(t, metrics.BroadcastRecoveryFrames)
+
+	if recordsAfter <= recordsBefore {
+		t.Fatal("recovery frame's real record count was not observed")
+	}
+	if recoveryAfter <= recoveryBefore {
+		t.Fatal("BroadcastRecoveryFrames did not count the lazy recovery send")
+	}
+}
+
+func testutilCounterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("write counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 func TestShouldEmitFrame(t *testing.T) {

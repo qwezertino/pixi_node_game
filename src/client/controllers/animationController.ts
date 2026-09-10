@@ -42,7 +42,7 @@ export class AnimationController {
         this.playerSprite.currentAnimation = this.resolveKey(this.currentBase);
     }
 
-    public setState(state: PlayerState, sprinting = false) {
+    public setState(state: PlayerState, sprinting = false, elapsedMs = 0) {
         if (this.attackAnimationPlaying && state !== PlayerState.ATTACKING) {
             return;
         }
@@ -59,7 +59,7 @@ export class AnimationController {
                 break;
             }
             case PlayerState.ATTACKING:
-                this.startAttackAnimation();
+                this.startAttackAnimation(elapsedMs);
                 break;
             case PlayerState.BLOCKING:
                 this.setAnimation("ready");
@@ -99,7 +99,7 @@ export class AnimationController {
         this.playerSprite.play();
         this.playerSprite.currentAnimation = key;
     }
-    private startAttackAnimation() {
+    private startAttackAnimation(elapsedMs = 0) {
         this.attackAnimationPlaying = true;
         const variant = `attack${this.attackStep}`;
         const base = this.characterVisual.directional
@@ -116,6 +116,20 @@ export class AnimationController {
                 this.onAttackEndCallback();
             }
         };
+
+        if (elapsedMs > 0) {
+            const totalFrames = this.playerSprite.totalFrames;
+            const fps = 60 * (this.playerSprite.animationSpeed || 1);
+            const totalDurationMs = (totalFrames / fps) * 1000;
+
+            if (elapsedMs >= totalDurationMs) {
+                this.playerSprite.onComplete?.();
+                return;
+            }
+
+            const frame = Math.min(totalFrames - 1, Math.floor((elapsedMs / totalDurationMs) * totalFrames));
+            this.playerSprite.gotoAndPlay(frame);
+        }
     }
 
     public onAttackEnd(callback: () => void) {
@@ -126,14 +140,14 @@ export class AnimationController {
         this.onAttackStartCallback = callback;
     }
 
-    handleAttack(step: number) {
+    handleAttack(step: number, elapsedMs = 0) {
         this.attackStep = step;
 
         if (this.onAttackStartCallback) {
             this.onAttackStartCallback();
         }
 
-        this.setState(PlayerState.ATTACKING);
+        this.setState(PlayerState.ATTACKING, false, elapsedMs);
         return true;
     }
 }
