@@ -312,4 +312,24 @@ var (
 		Name: "game_delta_predictable_ratio",
 		Help: "Fraction of the last broadcast delta a dead-reckoning client could have predicted (0.0–1.0)",
 	})
+
+	CollisionSpawnRelocationsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_collision_spawn_relocations_total",
+		Help: "Spawns where the random position was occupied and the expanding-ring search found a nearby free one",
+	})
+
+	CollisionSpawnFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "game_collision_spawn_failures_total",
+		Help: "Spawns rejected because no free position was found within the search limit",
+	})
+
+	CollisionStructureRevision = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "game_structure_collision_revision",
+		Help: "Currently published structure collision mutation revision",
+	})
+
+	CollisionStructureResyncTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "game_structure_collision_resync_total",
+		Help: "Structure collision resyncs served, by reason",
+	}, []string{"reason"})
 )

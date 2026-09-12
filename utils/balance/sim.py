@@ -482,8 +482,8 @@ def cmd_map(args):
     else:
         print(f"\nFits inside a single uint16 region at this resolution — no uint32 widening needed.")
 
-    print(f"\nCurrent gameConfig.json world (6000x3000 units) is a movement-netcode test arena,")
-    print(f"not sized for the campaign map — treat these numbers as the starting point instead.")
+    print(f"\nCurrent PostgreSQL game_settings world is 32000x32000 units (3.2x3.2 km),")
+    print(f"the fixed target bounding square for the procedural campaign map.")
 
 
 def cmd_distances(args):

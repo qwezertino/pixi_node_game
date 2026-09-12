@@ -134,6 +134,7 @@ type ClientMessage struct {
 	Direction      uint8
 	InputSequence  uint32
 	Nonce          uint32
+	LastRevision   uint64
 }
 
 const MoveSprintBit = 0x10
@@ -214,6 +215,12 @@ func (bp *BinaryProtocol) DecodeClientMessage(data []byte) (ClientMessage, error
 		if len(data) != 5 {
 			return ClientMessage{}, fmt.Errorf("viewport message has invalid length")
 		}
+
+	case MessageStructureCollisionResyncRequest:
+		if len(data) != 9 {
+			return ClientMessage{}, fmt.Errorf("structure collision resync request has invalid length")
+		}
+		msg.LastRevision = binary.LittleEndian.Uint64(data[1:9])
 
 	default:
 		return ClientMessage{}, fmt.Errorf("unknown message type: %d", msg.Type)

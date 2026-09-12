@@ -1,6 +1,7 @@
 package game
 
 import (
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"pixi_game_server/internal/clock"
+	"pixi_game_server/internal/collision"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/types"
@@ -20,6 +22,10 @@ type broadcastFuncHolder struct {
 	fn func(all []types.PlayerState, changed []types.PlayerState, fullSync bool, worldTick uint32, computeDur time.Duration) bool
 }
 
+type structureDeltaFuncHolder struct {
+	fn func(batch collision.StructureMutationBatch)
+}
+
 type tickWorkerInput struct {
 	ptrs      []*types.Player
 	nowNano   int64
@@ -27,35 +33,42 @@ type tickWorkerInput struct {
 }
 
 type GameWorld struct {
-	stepMu                sync.Mutex
-	stopOnce              sync.Once
-	loopDone              chan struct{}
-	workersDone           sync.WaitGroup
-	membershipChanged     bool
-	cfg                   *config.Config
-	live                  *config.LiveNet
-	playersMu             sync.RWMutex
-	playersMap            map[uint32]*types.Player
-	broadcastFn           atomic.Value
-	prevStates            map[uint32]types.PlayerState
-	prevMoveRemainder     map[uint32]uint32
-	prevBaselineTickByID  map[uint32]uint32
-	tickCount             uint32
-	scratchStates         []types.PlayerState
-	scratchChanged        []types.PlayerState
-	scratchRemainderByID  map[uint32]uint32
-	scratchSeenIDs        map[uint32]struct{}
-	scratchPtrs           []*types.Player
-	nTickWorkers          int
-	tickWorkerChs         []chan tickWorkerInput
-	tickWorkerWg          sync.WaitGroup
-	tickDuration          int64
-	lastSyncTime          int64
-	lastTickAtNs          int64
-	ticker                atomic.Pointer[time.Ticker]
-	stopChan              chan struct{}
-	nominalTickIntervalNs int64
-	currentTickIntervalNs int64
+	stepMu                  sync.Mutex
+	stopOnce                sync.Once
+	loopDone                chan struct{}
+	workersDone             sync.WaitGroup
+	membershipChanged       bool
+	cfg                     *config.Config
+	live                    *config.LiveNet
+	playersMu               sync.RWMutex
+	playersMap              map[uint32]*types.Player
+	broadcastFn             atomic.Value
+	prevStates              map[uint32]types.PlayerState
+	prevMoveRemainder       map[uint32]uint32
+	prevBaselineTickByID    map[uint32]uint32
+	tickCount               uint32
+	scratchStates           []types.PlayerState
+	scratchChanged          []types.PlayerState
+	scratchRemainderByID    map[uint32]uint32
+	scratchSeenIDs          map[uint32]struct{}
+	scratchPtrs             []*types.Player
+	collisionWorld          *collision.CollisionWorld
+	dynamicGrid             *collision.DynamicGrid
+	scratchDynamicSnapshots []collision.PlayerSnapshot
+	pendingStructureMu      sync.Mutex
+	pendingStructureBatches [][]collision.StructureMutation
+	structureDeltaFn        atomic.Value
+	nTickWorkers            int
+	tickWorkerChs           []chan tickWorkerInput
+	moveScratches           []*collision.MoveScratch
+	tickWorkerWg            sync.WaitGroup
+	tickDuration            int64
+	lastSyncTime            int64
+	lastTickAtNs            int64
+	ticker                  atomic.Pointer[time.Ticker]
+	stopChan                chan struct{}
+	nominalTickIntervalNs   int64
+	currentTickIntervalNs   int64
 
 	nextPlayerID             uint32
 	deltaVectorChanges       int
@@ -167,7 +180,7 @@ func (gw *GameWorld) RecomputeUnitTables() {
 	gw.unitTablesPtr.Store(buildUnitTables(gw.cfg.Game.TickRate, gw.cfg.Game.UnitsPerMeter))
 }
 
-func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
+func NewGameWorld(cfg *config.Config, live *config.LiveNet, collisionWorld *collision.CollisionWorld) *GameWorld {
 	initialCap := cfg.Net.MaxConnections
 	if initialCap < 256 {
 		initialCap = 256
@@ -179,13 +192,18 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 		changedCap = 64
 	}
 
+	dynamicGrid := collision.NewDynamicGrid(int32(cfg.World.Width), int32(cfg.World.Height))
+	collisionWorld.SetDynamic(dynamicGrid)
+
 	gw := &GameWorld{
-		cfg:          cfg,
-		live:         live,
-		playersMap:   make(map[uint32]*types.Player, 256),
-		stopChan:     make(chan struct{}),
-		loopDone:     make(chan struct{}),
-		nextPlayerID: 1000,
+		cfg:            cfg,
+		live:           live,
+		collisionWorld: collisionWorld,
+		dynamicGrid:    dynamicGrid,
+		playersMap:     make(map[uint32]*types.Player, 256),
+		stopChan:       make(chan struct{}),
+		loopDone:       make(chan struct{}),
+		nextPlayerID:   1000,
 
 		lastDeltaCompositeLog: clock.Now(),
 		prevStates:            make(map[uint32]types.PlayerState, initialCap),
@@ -202,11 +220,14 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 	n := runtime.GOMAXPROCS(0)
 	gw.nTickWorkers = n
 	gw.tickWorkerChs = make([]chan tickWorkerInput, n)
+	gw.moveScratches = make([]*collision.MoveScratch, n)
 	for i := range gw.tickWorkerChs {
 		ch := make(chan tickWorkerInput, 1)
 		gw.tickWorkerChs[i] = ch
+		scratch := &collision.MoveScratch{}
+		gw.moveScratches[i] = scratch
 		gw.workersDone.Add(1)
-		go func() { defer gw.workersDone.Done(); gw.runTickWorker(ch) }()
+		go func() { defer gw.workersDone.Done(); gw.runTickWorker(ch, scratch) }()
 	}
 
 	nominalInterval := time.Second / time.Duration(cfg.Game.TickRate)
@@ -222,10 +243,14 @@ func NewGameWorld(cfg *config.Config, live *config.LiveNet) *GameWorld {
 	return gw
 }
 
-func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
+// spawnSearchLimitUnits bounds the deterministic expanding-ring search for a
+// free spawn position, per docs/collisions_plan.md ("Восстановление
+// невалидной позиции и spawn").
+const spawnSearchLimitUnits int32 = 128
+
+func (gw *GameWorld) AddPlayer(requestedUnitType string) (*types.Player, error) {
 	gw.stepMu.Lock()
 	defer gw.stepMu.Unlock()
-	playerID := atomic.AddUint32(&gw.nextPlayerID, 1)
 
 	live := gw.live.Load()
 	spawnRangeX := live.SpawnMaxX - live.SpawnMinX
@@ -234,6 +259,16 @@ func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
 	spawnX := live.SpawnMinX + uint16(rand.Intn(int(spawnRangeX)))
 	spawnY := live.SpawnMinY + uint16(rand.Intn(int(spawnRangeY)))
 
+	freeX, freeY, ok := gw.collisionWorld.FindNearestFree(spawnX, spawnY, collision.PlayerRadius, spawnSearchLimitUnits, &collision.MoveScratch{})
+	if !ok {
+		metrics.CollisionSpawnFailuresTotal.Inc()
+		return nil, fmt.Errorf("no free spawn position found within %d units of (%d,%d)", spawnSearchLimitUnits, spawnX, spawnY)
+	}
+	if freeX != spawnX || freeY != spawnY {
+		metrics.CollisionSpawnRelocationsTotal.Inc()
+	}
+
+	playerID := atomic.AddUint32(&gw.nextPlayerID, 1)
 	player := &types.Player{
 		ID:       playerID,
 		JoinTime: time.Now(),
@@ -241,8 +276,8 @@ func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
 
 	unitDef := units.Get(requestedUnitType)
 
-	player.SetX(spawnX)
-	player.SetY(spawnY)
+	player.SetX(freeX)
+	player.SetY(freeY)
 	player.SetDirection(0)
 	player.SetState(types.StateIdle)
 	player.SetUnitType(unitDef.TypeID)
@@ -256,7 +291,99 @@ func (gw *GameWorld) AddPlayer(requestedUnitType string) *types.Player {
 	gw.membershipChanged = true
 	gw.playersMu.Unlock()
 
-	return player
+	return player, nil
+}
+
+// QueueStructureMutation enqueues one atomically-applied set of structure
+// collider changes (e.g. every part of one building activating together)
+// to be validated for footprint clearance and applied at the next tick's
+// dedicated mutation phase, before movement workers run. See
+// docs/collisions_plan.md, "Порядок simulation tick" and "Collision
+// lifecycle постройки". There is no building gameplay system calling this
+// yet; it exists as the contract that one can plug into later.
+func (gw *GameWorld) QueueStructureMutation(mutations []collision.StructureMutation) {
+	if len(mutations) == 0 {
+		return
+	}
+	gw.pendingStructureMu.Lock()
+	gw.pendingStructureBatches = append(gw.pendingStructureBatches, mutations)
+	gw.pendingStructureMu.Unlock()
+}
+
+// applyPendingStructureMutations is the tick-boundary structure mutation
+// phase: it runs once per tick, before movement workers start, drains
+// queued batches, checks footprint clearance for every part transitioning
+// to solid against the DynamicGrid front snapshot from the end of the
+// previous tick, defers any batch that isn't clear (preserving order for a
+// later tick), and applies the rest as one StructureGrid revision.
+func (gw *GameWorld) applyPendingStructureMutations(worldTick uint32) {
+	gw.pendingStructureMu.Lock()
+	pending := gw.pendingStructureBatches
+	gw.pendingStructureBatches = nil
+	gw.pendingStructureMu.Unlock()
+
+	if len(pending) == 0 {
+		return
+	}
+
+	scratch := &collision.QueryScratch{}
+	var deferred [][]collision.StructureMutation
+	var combined []collision.StructureMutation
+
+	for _, batch := range pending {
+		if gw.structureBatchClear(batch, scratch) {
+			combined = append(combined, batch...)
+		} else {
+			deferred = append(deferred, batch)
+		}
+	}
+
+	if len(deferred) > 0 {
+		gw.pendingStructureMu.Lock()
+		gw.pendingStructureBatches = append(deferred, gw.pendingStructureBatches...)
+		gw.pendingStructureMu.Unlock()
+	}
+
+	if len(combined) == 0 {
+		return
+	}
+
+	structures := gw.collisionWorld.Structures()
+	batch := collision.StructureMutationBatch{
+		Revision:      structures.Revision() + 1,
+		EffectiveTick: uint64(worldTick),
+		Mutations:     combined,
+	}
+	if err := structures.ApplyMutationBatch(batch); err != nil {
+		slog.Error("collision: rejected structure mutation batch", "error", err, "tick", worldTick)
+		return
+	}
+	metrics.CollisionStructureRevision.Set(float64(structures.Revision()))
+	if holder, ok := gw.structureDeltaFn.Load().(structureDeltaFuncHolder); ok {
+		holder.fn(batch)
+	}
+}
+
+// structureBatchClear checks FootprintClear over the union of every part a
+// batch is trying to make solid (StructureOpUpsert, or StructureOpSetSolid
+// with Solid=true). Parts that only remove or disable a collider never
+// need clearance.
+func (gw *GameWorld) structureBatchClear(batch []collision.StructureMutation, scratch *collision.QueryScratch) bool {
+	var activating []collision.StructureAABB
+	for _, m := range batch {
+		switch m.Operation {
+		case collision.StructureOpUpsert:
+			activating = append(activating, m.Collider)
+		case collision.StructureOpSetSolid:
+			if m.Solid {
+				activating = append(activating, m.Collider)
+			}
+		}
+	}
+	if len(activating) == 0 {
+		return true
+	}
+	return gw.collisionWorld.FootprintClear(activating, scratch)
 }
 
 func (gw *GameWorld) RemovePlayer(playerID uint32) {
@@ -507,7 +634,7 @@ func (gw *GameWorld) updateBlockDrain(player *types.Player) (drained bool) {
 	if player.GetState() != types.StateBlocking {
 		return false
 	}
-	if player.GetVX() != 0 || player.GetVY() != 0 {
+	if player.GetDesiredVX() != 0 || player.GetDesiredVY() != 0 {
 		player.SetState(types.StateIdle)
 		return false
 	}
@@ -539,6 +666,8 @@ func (gw *GameWorld) tick() {
 	nowNano := clock.Now()
 
 	worldTick := atomic.AddUint32(&gw.tickCount, 1)
+
+	gw.applyPendingStructureMutations(worldTick)
 
 	lastSync := atomic.LoadInt64(&gw.lastSyncTime)
 	fullSync := gw.membershipChanged || lastSync == 0 || time.Duration(nowNano-lastSync) >= gw.cfg.Game.SyncInterval
@@ -601,11 +730,13 @@ func (gw *GameWorld) tick() {
 	if tickLive.KeyframeDivisor > 0 {
 		keyframeMod = uint32(tickLive.KeyframeDivisor)
 	}
+	gw.scratchDynamicSnapshots = gw.scratchDynamicSnapshots[:0]
 	for _, player := range gw.scratchPtrs {
 		st := player.ToState()
 		gw.scratchStates = append(gw.scratchStates, st)
 		gw.scratchRemainderByID[st.ID] = player.GetMoveRemainderMilli()
 		gw.scratchSeenIDs[st.ID] = struct{}{}
+		gw.scratchDynamicSnapshots = append(gw.scratchDynamicSnapshots, collision.PlayerSnapshot{ID: st.ID, X: st.X, Y: st.Y})
 
 		if !fullSync {
 			prev, exists := gw.prevStates[st.ID]
@@ -639,6 +770,10 @@ func (gw *GameWorld) tick() {
 	}
 	t2 := time.Now()
 	metrics.TickPhaseDuration.WithLabelValues("delta").Observe(t2.Sub(t1).Seconds())
+
+	gw.dynamicGrid.Rebuild(gw.scratchDynamicSnapshots)
+	gw.dynamicGrid.Swap()
+	metrics.TickPhaseDuration.WithLabelValues("dynamic_grid_rebuild").Observe(time.Since(t2).Seconds())
 
 	if len(gw.scratchStates) == 0 {
 
@@ -803,50 +938,82 @@ func (gw *GameWorld) reportDeltaComposition() {
 	gw.deltaWindowBroadcasts = 0
 }
 
-func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) (sprintDrained bool) {
+// updatePlayerPosition re-attempts movement along the player's held desired
+// vector every tick (even if a previous tick was fully blocked), then
+// resolves it against the collision world. VX/VY are set from the result
+// and reflect only movement actually performed; DesiredVX/DesiredVY keep
+// the held input independent of collision outcome. See
+// docs/collisions_plan.md, "Player movement state".
+func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64, scratch *collision.MoveScratch) (sprintDrained bool) {
 	originalX := player.GetX()
 	originalY := player.GetY()
 	input, appliedInput := player.ConsumeLatestMovementInput()
 	if appliedInput {
-		player.SetVX(input.DX)
-		player.SetVY(input.DY)
+		player.SetDesiredVX(input.DX)
+		player.SetDesiredVY(input.DY)
 		player.SetSprint(input.Sprint)
 	}
 
-	vx, vy := player.GetVX(), player.GetVY()
-	sprinting := false
-	if vx != 0 || vy != 0 {
-		tables := gw.unitTables()
-		stat := tables.staminaStats[player.GetUnitType()]
-
-		sprinting = player.GetSprint() && player.GetStaminaCenti() > 0
-		if sprinting {
-			player.SpendStaminaUpTo(stat.sprintDrainPerTickCenti)
-			sprintDrained = true
-		}
-
-		milliRate := tables.moveStats[player.GetUnitType()].milliUnitsPerTick
-		rateMultiplier := 1.0
-		if sprinting {
-			rateMultiplier *= stat.sprintSpeedMultiplier
-		}
-
-		if vx != 0 && vy != 0 {
-			rateMultiplier *= 1 / math.Sqrt2
-		}
-		if rateMultiplier != 1.0 {
-			milliRate = uint32(math.Round(float64(milliRate) * rateMultiplier))
-		}
-		remainder := player.GetMoveRemainderMilli() + milliRate
-		distance := int64(remainder / 1000)
-		player.SetMoveRemainderMilli(remainder % 1000)
-
-		newX, newY := gw.integrateMovement(originalX, originalY, vx, vy, distance)
-		player.SetX(newX)
-		player.SetY(newY)
-		player.SetLastUpdate(nowNano)
+	allowedDX, allowedDY := player.GetDesiredVX(), player.GetDesiredVY()
+	if state := player.GetState(); state == types.StateAttacking || state == types.StateBlocking {
+		allowedDX, allowedDY = 0, 0
 	}
 
+	if allowedDX == 0 && allowedDY == 0 {
+		player.SetVX(0)
+		player.SetVY(0)
+		player.SetSprintingNow(false)
+		if appliedInput {
+			player.SetMovementAck(input.Sequence, originalX, originalY)
+		}
+		return false
+	}
+
+	tables := gw.unitTables()
+	stat := tables.staminaStats[player.GetUnitType()]
+
+	sprinting := player.GetSprint() && player.GetStaminaCenti() > 0
+	milliRate := tables.moveStats[player.GetUnitType()].milliUnitsPerTick
+	rateMultiplier := 1.0
+	if sprinting {
+		rateMultiplier *= stat.sprintSpeedMultiplier
+	}
+	if allowedDX != 0 && allowedDY != 0 {
+		rateMultiplier *= 1 / math.Sqrt2
+	}
+	if rateMultiplier != 1.0 {
+		milliRate = uint32(math.Round(float64(milliRate) * rateMultiplier))
+	}
+
+	remainder := player.GetMoveRemainderMilli() + milliRate
+	distance := int64(remainder / 1000)
+	player.SetMoveRemainderMilli(remainder % 1000)
+
+	if distance > int64(collision.MaxMoveSteps) {
+		slog.Warn("collision: distance exceeds MaxMoveSteps, skipping movement this tick",
+			"player_id", player.ID, "distance", distance)
+		player.SetVX(0)
+		player.SetVY(0)
+		player.SetSprintingNow(false)
+		if appliedInput {
+			player.SetMovementAck(input.Sequence, originalX, originalY)
+		}
+		return false
+	}
+
+	result := gw.collisionWorld.MoveCircle(originalX, originalY, allowedDX, allowedDY, int32(distance), scratch)
+
+	moved := result.X != originalX || result.Y != originalY
+	if sprinting && moved {
+		player.SpendStaminaUpTo(stat.sprintDrainPerTickCenti)
+		sprintDrained = true
+	}
+
+	player.SetX(result.X)
+	player.SetY(result.Y)
+	player.SetVX(result.EffectiveDX)
+	player.SetVY(result.EffectiveDY)
+	player.SetLastUpdate(nowNano)
 	player.SetSprintingNow(sprinting)
 
 	finalX, finalY := player.GetX(), player.GetY()
@@ -856,12 +1023,20 @@ func (gw *GameWorld) updatePlayerPosition(player *types.Player, nowNano int64) (
 	return sprintDrained
 }
 
-func (gw *GameWorld) integrateMovement(x, y uint16, vx, vy int8, distance int64) (uint16, uint16) {
-	newX := int64(x) + int64(vx)*distance
-	newY := int64(y) + int64(vy)*distance
-	newX = max(int64(gw.cfg.World.MinX), min(newX, int64(gw.cfg.World.MaxX)))
-	newY = max(int64(gw.cfg.World.MinY), min(newY, int64(gw.cfg.World.MaxY)))
-	return uint16(newX), uint16(newY)
+// StructureSnapshot returns the current revision and every active solid
+// structure collider, for sending a fresh structure_collision_snapshot
+// (initial connect, or client-requested resync).
+func (gw *GameWorld) StructureSnapshot() (revision uint64, colliders []collision.StructureAABB) {
+	structures := gw.collisionWorld.Structures()
+	return structures.Revision(), structures.Colliders(nil)
+}
+
+// SetStructureDeltaBroadcaster registers the callback invoked once per
+// successfully applied structure mutation batch, immediately after commit,
+// so the server can fan the same batch out to clients as an ordered
+// structure_collision_delta.
+func (gw *GameWorld) SetStructureDeltaBroadcaster(fn func(batch collision.StructureMutationBatch)) {
+	gw.structureDeltaFn.Store(structureDeltaFuncHolder{fn: fn})
 }
 
 func (gw *GameWorld) GetMetrics() types.PerformanceMetrics {
@@ -882,7 +1057,7 @@ func (gw *GameWorld) Stop() {
 	})
 }
 
-func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
+func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput, scratch *collision.MoveScratch) {
 	for input := range ch {
 		tables := gw.unitTables()
 		for _, player := range input.ptrs {
@@ -912,7 +1087,7 @@ func (gw *GameWorld) runTickWorker(ch chan tickWorkerInput) {
 					player.SetDirection(action.Direction)
 				}
 			}
-			sprintDrained := gw.updatePlayerPosition(player, input.nowNano)
+			sprintDrained := gw.updatePlayerPosition(player, input.nowNano, scratch)
 			blockDrained := gw.updateBlockDrain(player)
 
 			if !sprintDrained && !blockDrained {

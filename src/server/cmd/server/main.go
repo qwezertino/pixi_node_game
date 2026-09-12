@@ -12,11 +12,17 @@ import (
 	"syscall"
 	"time"
 
+	"pixi_game_server/internal/collision"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/liveconfig"
 	"pixi_game_server/internal/server"
 	"pixi_game_server/internal/units"
 )
+
+// activeCampaignID is fixed until a campaign generator/world-transition
+// system exists (see docs/collisions_plan.md); there is exactly one
+// campaign row (id=1) seeded in docker/postgres/init/001_init.sql.
+const activeCampaignID uint64 = 1
 
 func main() {
 
@@ -65,19 +71,59 @@ func main() {
 		os.Exit(1)
 	}
 
+	mapSnapshot, err := liveStore.LoadCampaignMapSnapshot(liveConfigCtx, activeCampaignID)
+	if err != nil {
+		slog.Error("failed to load campaign map colliders from database — did the migration in docker/postgres/init run?", "error", err)
+		os.Exit(1)
+	}
+	if err := collision.ValidateMapColliders(int32(cfg.World.Width), int32(cfg.World.Height), mapSnapshot.Colliders); err != nil {
+		slog.Error("campaign map colliders are invalid", "error", err)
+		os.Exit(1)
+	}
+	mapStaticGrid, err := collision.BuildMapStaticGrid(int32(cfg.World.Width), int32(cfg.World.Height), mapSnapshot.Colliders)
+	if err != nil {
+		slog.Error("failed to build MapStaticGrid", "error", err)
+		os.Exit(1)
+	}
+	mapVersion := collision.ComputeMapVersion(mapSnapshot.CampaignID, mapSnapshot.GeneratorVersion, mapSnapshot.Colliders)
+	mapCollidersJSON, err := server.BuildMapCollidersJSON(mapSnapshot.CampaignID, mapSnapshot.GeneratorVersion, mapVersion, mapSnapshot.Colliders)
+	if err != nil {
+		slog.Error("failed to build client-facing map-colliders JSON", "error", err)
+		os.Exit(1)
+	}
+
+	structureSnapshot, err := liveStore.LoadStructureSnapshot(liveConfigCtx, activeCampaignID)
+	if err != nil {
+		slog.Error("failed to load structure colliders from database — did the migration in docker/postgres/init run?", "error", err)
+		os.Exit(1)
+	}
+	structureGrid, err := collision.BuildStructureGrid(int32(cfg.World.Width), int32(cfg.World.Height), structureSnapshot.Colliders, structureSnapshot.Revision)
+	if err != nil {
+		slog.Error("failed to build StructureGrid", "error", err)
+		os.Exit(1)
+	}
+	collisionWorld := collision.NewCollisionWorld(int32(cfg.World.Width), int32(cfg.World.Height), mapStaticGrid, structureGrid)
+
 	slog.Info("server starting",
 		"port", cfg.Server.Port,
 		"tick_rate_hz", cfg.Game.TickRate,
 		"max_connections", cfg.Net.MaxConnections,
 		"unit_count", len(unitDefs),
+		"campaign_id", mapSnapshot.CampaignID,
+		"map_collider_count", len(mapSnapshot.Colliders),
+		"map_version", mapVersion,
+		"structure_collider_count", len(structureSnapshot.Colliders),
+		"structure_collision_revision", structureSnapshot.Revision,
 	)
 
-	gameServer, err := server.New(cfg)
+	gameServer, err := server.New(cfg, collisionWorld)
 	if err != nil {
 		slog.Error("invalid server config", "error", err)
 		os.Exit(1)
 	}
 	gameServer.SetStaticBlobs(gameConfigJSON, unitsJSON)
+	gameServer.SetMapColliderSnapshot(mapCollidersJSON, `"`+mapVersion+`"`)
+	gameServer.SetCampaignID(mapSnapshot.CampaignID)
 
 	if os.Getenv("ENABLE_UNIT_ADMIN_API") == "true" {
 		gameServer.EnableUnitAdminAPI(liveStore)

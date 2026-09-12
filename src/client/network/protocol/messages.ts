@@ -112,6 +112,40 @@ export interface PlayerAttackMessage extends ServerMessage {
     position: PlayerPosition;
 }
 
+export interface StructureCollisionSnapshotMessage extends ServerMessage {
+    type: 'structureCollisionSnapshot';
+    campaignId: number;
+    revision: number;
+    colliders: {
+        structureId: number;
+        partId: number;
+        minX: number;
+        minY: number;
+        maxX: number;
+        maxY: number;
+        renderKind: string;
+    }[];
+}
+
+export interface StructureCollisionDeltaMutation {
+    operation: 'upsert' | 'remove' | 'set_solid';
+    structureId: number;
+    partId: number;
+    solid: boolean;
+    minX?: number;
+    minY?: number;
+    maxX?: number;
+    maxY?: number;
+    renderKind?: string;
+}
+
+export interface StructureCollisionDeltaMessage extends ServerMessage {
+    type: 'structureCollisionDelta';
+    revision: number;
+    effectiveTick: number;
+    mutations: StructureCollisionDeltaMutation[];
+}
+
 export interface GameStateMessage extends ServerMessage {
     type: 'gameState';
     players: Record<string, PlayerState>;
@@ -179,4 +213,7 @@ export enum MessageType {
     UNIT_ROSTER = 19,
     BLOCK_START = 20,
     BLOCK_END = 21,
+    STRUCTURE_COLLISION_SNAPSHOT = 22,
+    STRUCTURE_COLLISION_DELTA = 23,
+    STRUCTURE_COLLISION_RESYNC_REQUEST = 24,
 }

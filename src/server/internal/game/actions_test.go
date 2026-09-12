@@ -4,6 +4,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"pixi_game_server/internal/collision"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/types"
 )
@@ -17,7 +18,7 @@ func TestActionsExecuteOnlyDuringTickAndPreserveOrder(t *testing.T) {
 	gw.unitTablesPtr.Store(&unitTables{attackDurationTicks: map[uint8]uint32{0: 2}, comboSteps: map[uint8]uint8{0: 2}, staminaStats: map[uint8]staminaStat{0: {maxCenti: 1000, canBlock: true, attackStaminaCostCenti: 100}}})
 	ch := make(chan tickWorkerInput)
 	done := make(chan struct{})
-	go func() { gw.runTickWorker(ch); close(done) }()
+	go func() { gw.runTickWorker(ch, &collision.MoveScratch{}); close(done) }()
 	defer func() { close(ch); <-done }()
 	step := func(tick uint32) {
 		atomic.StoreUint32(&gw.tickCount, tick)

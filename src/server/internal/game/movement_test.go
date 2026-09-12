@@ -4,16 +4,31 @@ import (
 	"math"
 	"testing"
 
+	"pixi_game_server/internal/collision"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/protocol"
 	"pixi_game_server/internal/types"
 )
+
+func newTestCollisionWorld(t *testing.T, width, height int32) *collision.CollisionWorld {
+	t.Helper()
+	mapGrid, err := collision.BuildMapStaticGrid(width, height, nil)
+	if err != nil {
+		t.Fatalf("BuildMapStaticGrid: %v", err)
+	}
+	structGrid, err := collision.BuildStructureGrid(width, height, nil, 0)
+	if err != nil {
+		t.Fatalf("BuildStructureGrid: %v", err)
+	}
+	return collision.NewCollisionWorld(width, height, mapGrid, structGrid)
+}
 
 func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 	gw := &GameWorld{
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		collisionWorld: newTestCollisionWorld(t, 1000, 1000),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
@@ -21,7 +36,7 @@ func TestUpdatePlayerPositionAppliesInputAndAcks(t *testing.T) {
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
 	}
-	gw.updatePlayerPosition(player, 1)
+	gw.updatePlayerPosition(player, 1, &collision.MoveScratch{})
 	if player.GetX() != 104 || player.GetVX() != 1 {
 		t.Fatalf("after start x=%d vx=%d", player.GetX(), player.GetVX())
 	}
@@ -36,6 +51,7 @@ func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		collisionWorld: newTestCollisionWorld(t, 1000, 1000),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
@@ -43,9 +59,9 @@ func TestUpdatePlayerPositionKeepsMovingWithoutNewInput(t *testing.T) {
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
 	}
-	gw.updatePlayerPosition(player, 1)
-	gw.updatePlayerPosition(player, 2)
-	gw.updatePlayerPosition(player, 3)
+	gw.updatePlayerPosition(player, 1, &collision.MoveScratch{})
+	gw.updatePlayerPosition(player, 2, &collision.MoveScratch{})
+	gw.updatePlayerPosition(player, 3, &collision.MoveScratch{})
 	if player.GetX() != 112 {
 		t.Fatalf("persisted velocity did not keep integrating: x=%d", player.GetX())
 	}
@@ -61,6 +77,7 @@ func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		collisionWorld: newTestCollisionWorld(t, 1000, 1000),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 100, Y: 100}
@@ -68,18 +85,18 @@ func TestUpdatePlayerPositionStopsAndHoldsPosition(t *testing.T) {
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
 	}
-	gw.updatePlayerPosition(player, 1)
-	gw.updatePlayerPosition(player, 2)
+	gw.updatePlayerPosition(player, 1, &collision.MoveScratch{})
+	gw.updatePlayerPosition(player, 2, &collision.MoveScratch{})
 
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 2}); got != types.InputAccepted {
 		t.Fatalf("offer stop = %s", got)
 	}
-	gw.updatePlayerPosition(player, 3)
+	gw.updatePlayerPosition(player, 3, &collision.MoveScratch{})
 	stopped := player.GetX()
 	if player.GetVX() != 0 {
 		t.Fatalf("velocity did not clear on stop: vx=%d", player.GetVX())
 	}
-	gw.updatePlayerPosition(player, 4)
+	gw.updatePlayerPosition(player, 4, &collision.MoveScratch{})
 	if player.GetX() != stopped {
 		t.Fatalf("player drifted after stop: before=%d after=%d", stopped, player.GetX())
 	}
@@ -94,6 +111,7 @@ func TestUpdatePlayerPositionClampsAtWorldBoundary(t *testing.T) {
 		cfg: &config.Config{
 			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
 		},
+		collisionWorld: newTestCollisionWorld(t, 1000, 1000),
 	}
 	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
 	player := &types.Player{ID: 1, X: 1000, Y: 100}
@@ -101,15 +119,76 @@ func TestUpdatePlayerPositionClampsAtWorldBoundary(t *testing.T) {
 	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
 		t.Fatalf("offer start = %s", got)
 	}
-	gw.updatePlayerPosition(player, 1)
+	gw.updatePlayerPosition(player, 1, &collision.MoveScratch{})
 	baseline := player.ToState()
 
 	for tick := int64(2); tick <= 3; tick++ {
-		gw.updatePlayerPosition(player, tick)
+		gw.updatePlayerPosition(player, tick, &collision.MoveScratch{})
 		st := player.ToState()
 		if st.X != baseline.X || st.Y != baseline.Y || st.VX != baseline.VX || st.VY != baseline.VY {
 			t.Fatalf("clamped player changed a replicated field at tick %d: %+v vs %+v", tick, st, baseline)
 		}
+	}
+}
+
+func TestUpdatePlayerPositionStopsAtMapCollider(t *testing.T) {
+	mapGrid, err := collision.BuildMapStaticGrid(1000, 1000, []collision.MapAABB{
+		{ID: 1, MinX: 190, MinY: 90, MaxX: 210, MaxY: 110, RenderKind: "stone_wall"},
+	})
+	if err != nil {
+		t.Fatalf("BuildMapStaticGrid: %v", err)
+	}
+	structGrid, err := collision.BuildStructureGrid(1000, 1000, nil, 0)
+	if err != nil {
+		t.Fatalf("BuildStructureGrid: %v", err)
+	}
+	gw := &GameWorld{
+		cfg: &config.Config{
+			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
+		},
+		collisionWorld: collision.NewCollisionWorld(1000, 1000, mapGrid, structGrid),
+	}
+	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 64000}}})
+	player := &types.Player{ID: 1, X: 170, Y: 100}
+
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
+		t.Fatalf("offer start = %s", got)
+	}
+	gw.updatePlayerPosition(player, 1, &collision.MoveScratch{})
+	if int32(player.GetX()) >= 190-collision.PlayerRadius+1 {
+		t.Fatalf("expected player to stop before the map collider, got x=%d", player.GetX())
+	}
+	if player.GetVX() != 0 {
+		t.Fatalf("expected effective VX=0 once blocked by a wall, got %d", player.GetVX())
+	}
+	if player.GetDesiredVX() != 1 {
+		t.Fatalf("expected desired input to remain held even though blocked, got %d", player.GetDesiredVX())
+	}
+}
+
+func TestUpdatePlayerPositionSuppressesMovementWhileAttacking(t *testing.T) {
+	gw := &GameWorld{
+		cfg: &config.Config{
+			World: config.WorldConfig{Width: 1000, Height: 1000, MaxX: 1000, MaxY: 1000},
+		},
+		collisionWorld: newTestCollisionWorld(t, 1000, 1000),
+	}
+	gw.unitTablesPtr.Store(&unitTables{moveStats: map[uint8]moveStat{0: {milliUnitsPerTick: 4000}}})
+	player := &types.Player{ID: 1, X: 100, Y: 100}
+	player.SetState(types.StateAttacking)
+
+	if got := player.OfferMovementInput(types.MovementInput{Sequence: 1, DX: 1}); got != types.InputAccepted {
+		t.Fatalf("offer start = %s", got)
+	}
+	gw.updatePlayerPosition(player, 1, &collision.MoveScratch{})
+	if player.GetX() != 100 {
+		t.Fatalf("expected no movement while attacking, got x=%d", player.GetX())
+	}
+	if player.GetVX() != 0 {
+		t.Fatalf("expected effective VX=0 while attacking, got %d", player.GetVX())
+	}
+	if player.GetDesiredVX() != 1 {
+		t.Fatalf("expected desired input to remain held while attacking, got %d", player.GetDesiredVX())
 	}
 }
 

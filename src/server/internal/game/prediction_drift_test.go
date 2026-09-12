@@ -41,11 +41,14 @@ func TestSuppressedDeltasStayExactlySyncedViaRemainder(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
-	gw := NewGameWorld(cfg, live)
+	gw := NewGameWorld(cfg, live, newTestCollisionWorld(t, 60000, 60000))
 	t.Cleanup(gw.Stop)
 	gw.SetTickInterval(time.Hour)
 
-	p := gw.AddPlayer("spearman")
+	p, err := gw.AddPlayer("spearman")
+	if err != nil {
+		t.Fatalf("AddPlayer: %v", err)
+	}
 
 	var lastAll, lastChanged []types.PlayerState
 	var lastFullSync bool

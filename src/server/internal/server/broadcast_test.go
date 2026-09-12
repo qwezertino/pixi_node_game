@@ -159,7 +159,7 @@ func newDilationTestServer(t *testing.T) *Server {
 		Net: config.NetworkConfig{MaxConnections: 64},
 	}
 	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
-	gw := game.NewGameWorld(cfg, live)
+	gw := game.NewGameWorld(cfg, live, newEmptyCollisionWorld(t, cfg))
 	t.Cleanup(gw.Stop)
 
 	time.Sleep(10 * time.Millisecond)
@@ -275,7 +275,7 @@ func TestTuneTimeDilationModerateDebounceIsIndependentOfSevere(t *testing.T) {
 func TestBroadcastTickReservesStateBudgetFromAcks(t *testing.T) {
 	s := reliabilityServer(t)
 	s.gameWorld.Stop()
-	player := s.gameWorld.AddPlayer("")
+	player := mustAddPlayer(t, s.gameWorld, "")
 	raw, peer := net.Pipe()
 	t.Cleanup(func() { raw.Close(); peer.Close() })
 	c := s.createConnection(player, raw)
@@ -322,7 +322,7 @@ func TestBroadcastTickReservesStateBudgetFromAcks(t *testing.T) {
 func TestEnqueueBroadcastJobSheddingTripsDropStreak(t *testing.T) {
 	s := reliabilityServer(t)
 	s.gameWorld.Stop()
-	player := s.gameWorld.AddPlayer("")
+	player := mustAddPlayer(t, s.gameWorld, "")
 	raw, peer := net.Pipe()
 	t.Cleanup(func() { raw.Close(); peer.Close() })
 	c := s.createConnection(player, raw)
@@ -386,7 +386,7 @@ func TestBroadcastTickTunesDilationEvenWithoutFanout(t *testing.T) {
 func TestBroadcastTickRecordsLazyRecoveryCost(t *testing.T) {
 	s := reliabilityServer(t)
 	s.gameWorld.Stop()
-	players := []*types.Player{s.gameWorld.AddPlayer(""), s.gameWorld.AddPlayer("")}
+	players := []*types.Player{mustAddPlayer(t, s.gameWorld, ""), mustAddPlayer(t, s.gameWorld, "")}
 	for _, p := range players {
 		raw, peer := net.Pipe()
 		t.Cleanup(func() { raw.Close(); peer.Close() })

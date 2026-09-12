@@ -43,7 +43,7 @@ func TestHandleHealthReportsUnhealthyWhenTickLoopStalls(t *testing.T) {
 	cfg.Net.IPConnRate = 0
 	cfg.Server.Port = 0
 	cfg.Server.ManagementAddr = "127.0.0.1:0"
-	s, err := New(cfg)
+	s, err := New(cfg, newEmptyCollisionWorld(t, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -62,6 +62,8 @@ type Player struct {
 	Y                    uint32
 	VX                   uint32
 	VY                   uint32
+	DesiredVX            uint32
+	DesiredVY            uint32
 	Direction            uint32
 	State                uint32
 	UnitType             uint32
@@ -232,6 +234,26 @@ func (p *Player) GetVY() int8 {
 
 func (p *Player) SetVY(vy int8) {
 	atomic.StoreUint32(&p.VY, uint32(vy))
+}
+
+// GetDesiredVX/VY report the player's held movement input, independent of
+// GetVX/GetVY (which reflect only movement actually performed after
+// collision resolution). See docs/collisions_plan.md, "Player movement
+// state".
+func (p *Player) GetDesiredVX() int8 {
+	return int8(atomic.LoadUint32(&p.DesiredVX))
+}
+
+func (p *Player) SetDesiredVX(vx int8) {
+	atomic.StoreUint32(&p.DesiredVX, uint32(vx))
+}
+
+func (p *Player) GetDesiredVY() int8 {
+	return int8(atomic.LoadUint32(&p.DesiredVY))
+}
+
+func (p *Player) SetDesiredVY(vy int8) {
+	atomic.StoreUint32(&p.DesiredVY, uint32(vy))
 }
 
 func (p *Player) GetSprint() bool {

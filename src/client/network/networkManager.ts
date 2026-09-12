@@ -8,6 +8,7 @@ import {
 } from "./protocol/messages";
 import { DEFAULT_UNIT_TYPE, isValidUnitType, type UnitType } from "../../shared/units";
 import type { Direction } from "../utils/animationLayout";
+import { applyStructureCollisionDelta, applyStructureSnapshot, currentStructureRevision } from "../collision/collisionState";
 
 const MAX_DEAD_RECKON_TICKS = 20;
 const MAX_ATTACK_ELAPSED_TICKS = 1000;
@@ -504,6 +505,16 @@ export class NetworkManager {
                             callback(message.playerId, message.position, 1, 0)
                         );
                         break;
+
+                    case "structureCollisionSnapshot":
+                        applyStructureSnapshot(message);
+                        break;
+
+                    case "structureCollisionDelta":
+                        if (!applyStructureCollisionDelta(message)) {
+                            this.requestStructureCollisionResync();
+                        }
+                        break;
                 }
             }
         } catch {
@@ -619,6 +630,22 @@ export class NetworkManager {
         } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
             this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
         }
+    }
+
+    private sendRaw(binaryData: Uint8Array): void {
+        if (this.worker) {
+            this.worker.postMessage({ type: 'send', data: binaryData });
+        } else if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(binaryData as Uint8Array<ArrayBuffer>);
+        }
+    }
+
+    /**
+     * Requests a fresh structure_collision_snapshot after a duplicate, gap,
+     * or unknown-entity delta. See docs/collisions_plan.md, "Клиент и API".
+     */
+    private requestStructureCollisionResync(): void {
+        this.sendRaw(BinaryProtocol.encodeStructureCollisionResyncRequest(currentStructureRevision()));
     }
 
     private requestFullState(): void {

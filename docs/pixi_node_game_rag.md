@@ -20,7 +20,7 @@
 
 ## 2. Текущие значения по умолчанию
 
-Источник игровых значений: `src/shared/gameConfig.json`.
+Источник игровых значений: таблица `game_settings` в PostgreSQL; клиент получает их через `/api/config`.
 
 | Параметр | Значение |
 |---|---:|
@@ -28,7 +28,7 @@
 | Base replication interval | 50 ms (20 Hz) |
 | Full sync interval | 30 s |
 | Player speed | 4 world units/tick |
-| World | 6000 × 3000 |
+| World | 32000 × 32000 (3.2 × 3.2 км) |
 | Spawn X | 1500–3000 |
 | Spawn Y | 500–1500 |
 | Attack duration | 1000 ms |
@@ -424,7 +424,7 @@ Artillery client:
 - attack probabilistic;
 - не декодирует/валидирует server state;
 - не измеряет browser render/decode cost;
-- его local spawn/bounds comments/values устарели относительно world 6000×3000.
+- его local spawn/bounds comments/values необходимо сверять с world 32000×32000.
 
 Таким тестом можно нагружать connection/fanout path, но нельзя доказать playable experience для 2000 реальных клиентов.
 

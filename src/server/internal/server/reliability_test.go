@@ -39,7 +39,7 @@ func reliabilityServer(t *testing.T) *Server {
 	cfg.Net.IPConnRate = 0
 	cfg.Server.Port = 0
 	cfg.Server.ManagementAddr = "127.0.0.1:0"
-	s, err := New(cfg)
+	s, err := New(cfg, newEmptyCollisionWorld(t, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func drainState(t *testing.T, c *Connection) ([]byte, *tickFrame) {
 func TestMissedStopRecoversWithSharedFullSnapshot(t *testing.T) {
 	s := reliabilityServer(t)
 	s.gameWorld.Stop()
-	players := []*types.Player{s.gameWorld.AddPlayer(""), s.gameWorld.AddPlayer("")}
+	players := []*types.Player{mustAddPlayer(t, s.gameWorld, ""), mustAddPlayer(t, s.gameWorld, "")}
 	conns := []*Connection{}
 	for _, p := range players {
 		raw, peer := net.Pipe()

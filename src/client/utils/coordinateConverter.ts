@@ -28,8 +28,8 @@ export class CoordinateConverter {
     /**
      * Конвертировать виртуальные координаты в экранные пиксели
      * Мир заполняет весь экран, поэтому смещение не нужно
-     * @param virtualX - X координата в виртуальном мире (0-6000)
-     * @param virtualY - Y координата в виртуальном мире (0-6000)
+     * @param virtualX - X координата в виртуальном мире (0-32000)
+     * @param virtualY - Y координата в виртуальном мире (0-32000)
      * @returns Экранные координаты в пикселях
      */
     virtualToScreen(virtualX: number, virtualY: number): { x: number, y: number } {
@@ -103,6 +103,15 @@ export class CoordinateConverter {
             this.screenHeight = screenHeight;
             this.calculateScales();
         }
+    }
+
+    /**
+     * Текущий коэффициент масштабирования по осям (screen / virtual) —
+     * нужен, чтобы перевести размеры (ширину/высоту прямоугольника), а не
+     * только точки, из виртуальных координат в экранные.
+     */
+    getScale(): { x: number, y: number } {
+        return { x: this.scaleX, y: this.scaleY };
     }
 
     /**

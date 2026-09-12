@@ -10,6 +10,9 @@ import {
     PlayerLeftMessage,
     AttackMessage,
     PlayerAttackMessage,
+    StructureCollisionSnapshotMessage,
+    StructureCollisionDeltaMessage,
+    StructureCollisionDeltaMutation,
 } from "./messages";
 import { DIRECTIONS, type Direction } from "../../utils/animationLayout";
 
@@ -122,6 +125,11 @@ export class BinaryProtocol {
             case MessageType.PONG:
                 if (data.length !== 5) return null;
                 return { type: "pong", nonce: view.getUint32(1, true) };
+
+            case MessageType.STRUCTURE_COLLISION_SNAPSHOT:
+                return this.decodeStructureCollisionSnapshot(data, view);
+            case MessageType.STRUCTURE_COLLISION_DELTA:
+                return this.decodeStructureCollisionDelta(data, view);
 
             case 255: return this.decodePlayerMovementBroadcast(data, view);
             case 254: return this.decodePlayerDirectionBroadcast(data, view);
@@ -449,6 +457,110 @@ export class BinaryProtocol {
             playerId,
             direction
         };
+    }
+
+    static encodeStructureCollisionResyncRequest(lastRevision: number): Uint8Array {
+        const buffer = new ArrayBuffer(9);
+        const view = new DataView(buffer);
+        view.setUint8(0, MessageType.STRUCTURE_COLLISION_RESYNC_REQUEST);
+        // Revisions fit comfortably below 2^53; split into low/high 32-bit
+        // halves rather than using DataView.setBigUint64 to avoid a BigInt
+        // dependency for a value that never needs one.
+        view.setUint32(1, lastRevision >>> 0, true);
+        view.setUint32(5, Math.floor(lastRevision / 2 ** 32), true);
+        return new Uint8Array(buffer);
+    }
+
+    private static readUvarint(data: Uint8Array, offset: number): { value: number; offset: number } {
+        let value = 0;
+        let shift = 0;
+        let byte: number;
+        do {
+            byte = data[offset++];
+            value += (byte & 0x7f) * 2 ** shift;
+            shift += 7;
+        } while (byte & 0x80);
+        return { value, offset };
+    }
+
+    private static readUint64(view: DataView, offset: number): number {
+        const low = view.getUint32(offset, true);
+        const high = view.getUint32(offset + 4, true);
+        return high * 2 ** 32 + low;
+    }
+
+    private static readRenderKind(data: Uint8Array, offset: number): { value: string; offset: number } {
+        const length = data[offset];
+        offset += 1;
+        const decoder = new TextDecoder();
+        const value = decoder.decode(data.subarray(offset, offset + length));
+        return { value, offset: offset + length };
+    }
+
+    private static decodeStructureCollisionSnapshot(data: Uint8Array, view: DataView): StructureCollisionSnapshotMessage {
+        const campaignId = this.readUint64(view, 1);
+        const revision = this.readUint64(view, 9);
+
+        let { value: count, offset } = this.readUvarint(data, 17);
+        const colliders: StructureCollisionSnapshotMessage['colliders'] = [];
+        let structureId = 0;
+        for (let i = 0; i < count; i++) {
+            const delta = this.readUvarint(data, offset);
+            structureId += delta.value;
+            offset = delta.offset;
+
+            const partId = this.readUvarint(data, offset);
+            offset = partId.offset;
+
+            const minX = view.getInt32(offset, true); offset += 4;
+            const minY = view.getInt32(offset, true); offset += 4;
+            const maxX = view.getInt32(offset, true); offset += 4;
+            const maxY = view.getInt32(offset, true); offset += 4;
+
+            const renderKind = this.readRenderKind(data, offset);
+            offset = renderKind.offset;
+
+            colliders.push({ structureId, partId: partId.value, minX, minY, maxX, maxY, renderKind: renderKind.value });
+        }
+
+        return { type: 'structureCollisionSnapshot', campaignId, revision, colliders };
+    }
+
+    private static decodeStructureCollisionDelta(data: Uint8Array, view: DataView): StructureCollisionDeltaMessage {
+        const revision = this.readUint64(view, 1);
+        const effectiveTick = this.readUint64(view, 9);
+
+        let { value: count, offset } = this.readUvarint(data, 17);
+        const mutations: StructureCollisionDeltaMutation[] = [];
+        const operations: StructureCollisionDeltaMutation['operation'][] = ['upsert', 'remove', 'set_solid'];
+
+        for (let i = 0; i < count; i++) {
+            const op = operations[data[offset]];
+            offset += 1;
+
+            const structureId = this.readUint64(view, offset);
+            offset += 8;
+
+            const partIdResult = this.readUvarint(data, offset);
+            offset = partIdResult.offset;
+
+            const solid = data[offset] === 1;
+            offset += 1;
+
+            const mutation: StructureCollisionDeltaMutation = { operation: op, structureId, partId: partIdResult.value, solid };
+            if (solid) {
+                mutation.minX = view.getInt32(offset, true); offset += 4;
+                mutation.minY = view.getInt32(offset, true); offset += 4;
+                mutation.maxX = view.getInt32(offset, true); offset += 4;
+                mutation.maxY = view.getInt32(offset, true); offset += 4;
+                const renderKind = this.readRenderKind(data, offset);
+                mutation.renderKind = renderKind.value;
+                offset = renderKind.offset;
+            }
+            mutations.push(mutation);
+        }
+
+        return { type: 'structureCollisionDelta', revision, effectiveTick, mutations };
     }
 
     private static decodePlayerAttackBroadcast(_data: Uint8Array, view: DataView): PlayerAttackMessage {

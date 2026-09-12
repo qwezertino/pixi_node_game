@@ -40,7 +40,7 @@ func TestTickPreservesPerPlayerRemainderAcrossSnapshotSort(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := config.NewLiveNet(config.BuildLiveNetConfig(cfg))
-	gw := NewGameWorld(cfg, live)
+	gw := NewGameWorld(cfg, live, newTestCollisionWorld(t, 1000, 1000))
 	t.Cleanup(gw.Stop)
 
 	gw.SetTickInterval(time.Hour)
@@ -49,7 +49,10 @@ func TestTickPreservesPerPlayerRemainderAcrossSnapshotSort(t *testing.T) {
 	wantRemainder := make(map[uint32]uint32, numPlayers)
 	players := make([]*types.Player, 0, numPlayers)
 	for i := 0; i < numPlayers; i++ {
-		p := gw.AddPlayer("")
+		p, err := gw.AddPlayer("")
+		if err != nil {
+			t.Fatalf("AddPlayer: %v", err)
+		}
 
 		p.SetVX(0)
 		p.SetVY(0)

@@ -79,7 +79,7 @@ INSERT INTO game_settings (
     player_base_scale, debug_mode, world_background_color
 ) VALUES (
     1, 20, 30, 10,
-    6000, 3000,
+    32000, 32000,
     1500, 3000, 500, 1500,
     2, false, '#808080'
 ) ON CONFLICT (id) DO NOTHING;
@@ -363,3 +363,85 @@ INSERT INTO units (
     1.5, 10,
     0, 2, 10, 'actual/knights/Paladin.png', 'actual/knights/Paladin_Combat.png', 'actual/knights/Paladin_Combat_Thrust_Dash.png'
 ) ON CONFLICT (type_id) DO NOTHING;
+
+-- ─── campaigns / campaign_map_colliders: immutable map collision snapshot ──
+-- One row per campaign identifies the seed/generator version used to build
+-- its map; campaign_map_colliders holds the resulting static AABBs. There is
+-- no campaign lifecycle yet (see internal/collision), so a single fixed
+-- campaign_id=1 row stands in until a campaign generator/world-transition
+-- system exists. Runtime structures (walls, gates, mines) that can appear,
+-- disappear or change solid-state during play live separately in
+-- structure_colliders, not here.
+CREATE TABLE IF NOT EXISTS campaigns (
+    campaign_id       BIGINT PRIMARY KEY,
+    seed              BIGINT NOT NULL,
+    generator_version TEXT NOT NULL,
+    CHECK (campaign_id > 0)
+);
+
+INSERT INTO campaigns (campaign_id, seed, generator_version) VALUES
+    (1, 0, 'mapgen-v1')
+ON CONFLICT (campaign_id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS campaign_map_colliders (
+    campaign_id BIGINT NOT NULL REFERENCES campaigns (campaign_id),
+    collider_id BIGINT NOT NULL,
+    min_x       INTEGER NOT NULL,
+    min_y       INTEGER NOT NULL,
+    max_x       INTEGER NOT NULL,
+    max_y       INTEGER NOT NULL,
+    render_kind TEXT NOT NULL DEFAULT 'stone_wall',
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (campaign_id, collider_id),
+    CHECK (campaign_id > 0 AND collider_id > 0),
+    CHECK (min_x >= 0 AND min_y >= 0),
+    CHECK (max_x > min_x AND max_y > min_y)
+);
+
+-- ─── structure_collision_state / structure_colliders: runtime structures ──
+-- Solid geometry of walls, gates, towers, mines etc. that can appear,
+-- disappear or change solid-state during a campaign (see internal/collision
+-- StructureGrid). structure_collision_state tracks the current mutation
+-- revision per campaign so ApplyMutationBatch can require exactly
+-- revision+1 and restart can restore the same revision it last published.
+-- There is no "structures" gameplay entity table yet (owner/HP/production);
+-- that belongs to a future building system and can reuse this collider
+-- table via the same (structure_id, part_id) key.
+CREATE TABLE IF NOT EXISTS structure_collision_state (
+    campaign_id BIGINT PRIMARY KEY REFERENCES campaigns (campaign_id),
+    revision    BIGINT NOT NULL DEFAULT 0,
+    CHECK (campaign_id > 0 AND revision >= 0)
+);
+
+INSERT INTO structure_collision_state (campaign_id, revision) VALUES
+    (1, 1)
+ON CONFLICT (campaign_id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS structure_colliders (
+    campaign_id      BIGINT NOT NULL REFERENCES campaigns (campaign_id),
+    structure_id     BIGINT NOT NULL,
+    part_id          INTEGER NOT NULL,
+    min_x            INTEGER NOT NULL,
+    min_y            INTEGER NOT NULL,
+    max_x            INTEGER NOT NULL,
+    max_y            INTEGER NOT NULL,
+    render_kind      TEXT NOT NULL,
+    solid            BOOLEAN NOT NULL,
+    updated_revision BIGINT NOT NULL,
+    PRIMARY KEY (campaign_id, structure_id, part_id),
+    CHECK (campaign_id > 0 AND structure_id > 0 AND part_id > 0),
+    CHECK (min_x >= 0 AND min_y >= 0),
+    CHECK (max_x > min_x AND max_y > min_y),
+    CHECK (updated_revision >= 0)
+);
+
+-- Three completed test walls outside the spawn area, as structure records
+-- rather than part of the map (docs/collisions_plan.md), for exercising
+-- StructureGrid restore/query and client rendering end-to-end.
+INSERT INTO structure_colliders
+    (campaign_id, structure_id, part_id, min_x, min_y, max_x, max_y, render_kind, solid, updated_revision)
+VALUES
+    (1, 9001, 1, 3300, 700,  3340, 1800, 'stone_wall', TRUE, 1),
+    (1, 9002, 1, 3300, 1760, 4300, 1800, 'stone_wall', TRUE, 1),
+    (1, 9003, 1, 4200, 600,  4500, 900,  'stone_wall', TRUE, 1)
+ON CONFLICT (campaign_id, structure_id, part_id) DO NOTHING;

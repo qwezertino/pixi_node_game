@@ -6,6 +6,7 @@ import { MovementController } from "./controllers/movementController";
 import { AnimationController, PlayerState } from "./controllers/animationController";
 import { NetworkManager } from "./network/networkManager";
 import { PlayerManager } from "./game/playerManager";
+import { StructureRenderer } from "./game/structureRenderer";
 import { TICK_RATE } from "./network/protocol/messages";
 import { COLORS } from "../shared/gameConfig";
 import { hideLoadingScreen } from "../shared/loadingScreen";
@@ -13,10 +14,12 @@ import { BinaryProtocol } from "./network/protocol/binaryProtocol";
 import { CoordinateConverter } from "./utils/coordinateConverter";
 import { mountUnitViewerToggle } from "./debug/unitViewerPanel";
 import { mountRespawnButton } from "./debug/respawnButton";
+import { ColliderDebugOverlay, mountColliderOverlayButton } from "./debug/colliderDebugOverlay";
 import { showUnitSelectScreen } from "./ui/unitSelectScreen";
 import { StatusBarWidget } from "./ui/statusBar";
 import { StaminaPredictor } from "./utils/staminaPredictor";
 import type { UnitDefinition } from "../shared/units";
+import { isReady as collisionReady } from "./collision/collisionState";
 
 interface Session {
     localUnit: UnitDefinition;
@@ -92,10 +95,22 @@ interface Session {
     worldBackground.fill(parseInt(COLORS.worldBackground.replace('#', ''), 16));
     app.stage.addChild(worldBackground);
 
+    const coordinateConverter = new CoordinateConverter(app.screen.width, app.screen.height);
+
+    const structureContainer = new Container();
+    structureContainer.eventMode = "none";
+    app.stage.addChild(structureContainer);
+    const structureRenderer = new StructureRenderer(structureContainer, coordinateConverter);
+
     const playerContainer = new Container();
     playerContainer.eventMode = "none";
     playerContainer.interactiveChildren = false;
     app.stage.addChild(playerContainer);
+
+    const colliderOverlayContainer = new Container();
+    colliderOverlayContainer.eventMode = "none";
+    app.stage.addChild(colliderOverlayContainer);
+    const colliderOverlay = new ColliderDebugOverlay(colliderOverlayContainer, coordinateConverter);
 
     const input = new InputManager(app.canvas);
 
@@ -106,8 +121,6 @@ interface Session {
     input.setF3Callback(() => {
         fpsDisplay.toggleDetailedStats();
     });
-
-    const coordinateConverter = new CoordinateConverter(app.screen.width, app.screen.height);
 
     const playerManager = new PlayerManager(playerContainer, networkManager, coordinateConverter);
 
@@ -170,7 +183,7 @@ interface Session {
             const checkInterval = setInterval(() => {
 
                 const playerId = networkManager.getPlayerId();
-                if (playerId) {
+                if (playerId && collisionReady()) {
                     clearInterval(checkInterval);
 
                     const initialPosition = networkManager.getInitialPosition();
@@ -223,6 +236,8 @@ interface Session {
         worldBackground.rect(0, 0, newWidth, newHeight);
         worldBackground.fill(parseInt(COLORS.worldBackground.replace('#', ''), 16));
 
+        structureRenderer.redraw();
+        colliderOverlay.onResize();
         playerManager.updateAllPlayerPositions();
     };
 
@@ -303,6 +318,17 @@ interface Session {
 
         playerManager.update(deltaTime);
 
+        if (colliderOverlay.visible) {
+            const localId = networkManager.getPlayerId();
+            const localPos = movementController.getVirtualPosition();
+            const players = [{ id: localId, x: localPos.x, y: localPos.y }];
+            for (const [id, p] of Object.entries(networkManager.getPlayers())) {
+                if (id === localId) continue;
+                players.push({ id, x: p.position.x, y: p.position.y });
+            }
+            colliderOverlay.drawPlayers(players);
+        }
+
         animationController.playerRef.scale.copyFrom(movementController.scale);
 
         localStatusBar.update(
@@ -318,6 +344,7 @@ interface Session {
     if (import.meta.env.DEV) {
         mountUnitViewerToggle();
         mountRespawnButton(startSession);
+        mountColliderOverlayButton(colliderOverlay);
     }
 
     await startSession();

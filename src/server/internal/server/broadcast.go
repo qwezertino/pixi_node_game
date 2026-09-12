@@ -13,6 +13,7 @@ import (
 	"github.com/gobwas/ws"
 
 	"pixi_game_server/internal/clock"
+	"pixi_game_server/internal/collision"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/metrics"
 	"pixi_game_server/internal/protocol"
@@ -1043,6 +1044,35 @@ func (s *Server) enqueueAuthoritativeMovementAcks(conns []*Connection) int {
 func (s *Server) sendWelcome(conn *Connection) {
 	data := s.protocol.EncodeWelcome(conn.player.ID, uint16(s.cfg.Game.TickRate), conn.player.GetUnitType())
 	s.sendDirect(conn, data)
+}
+
+// sendStructureCollisionSnapshot sends the full current structure collision
+// state: sent once right after MessageWelcome for a new connection, and
+// again whenever a client requests a resync. See docs/collisions_plan.md,
+// "Клиент и API".
+func (s *Server) sendStructureCollisionSnapshot(conn *Connection) {
+	revision, colliders := s.gameWorld.StructureSnapshot()
+	data, err := s.protocol.EncodeStructureCollisionSnapshot(s.campaignID, revision, colliders)
+	if err != nil {
+		slog.Error("collision: failed to encode structure collision snapshot", "error", err)
+		return
+	}
+	s.sendDirect(conn, data)
+}
+
+// broadcastStructureDelta fans one just-applied StructureMutationBatch out
+// to every connection as a reliable, ordered structure_collision_delta.
+func (s *Server) broadcastStructureDelta(batch collision.StructureMutationBatch) {
+	data, err := s.protocol.EncodeStructureCollisionDelta(batch)
+	if err != nil {
+		slog.Error("collision: failed to encode structure collision delta", "error", err, "revision", batch.Revision)
+		return
+	}
+	s.connectionsMu.RLock()
+	defer s.connectionsMu.RUnlock()
+	for _, conn := range s.connections {
+		s.sendDirect(conn, data)
+	}
 }
 
 func (s *Server) runPingLoop() {

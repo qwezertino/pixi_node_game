@@ -21,6 +21,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"pixi_game_server/internal/clock"
+	"pixi_game_server/internal/collision"
 	"pixi_game_server/internal/config"
 	"pixi_game_server/internal/game"
 	"pixi_game_server/internal/liveconfig"
@@ -36,9 +37,12 @@ type Server struct {
 	gameWorld *game.GameWorld
 	protocol  *protocol.BinaryProtocol
 
-	gameConfigJSON []byte
-	unitsJSON      atomic.Pointer[[]byte]
-	adminStore     *liveconfig.Store
+	gameConfigJSON   []byte
+	unitsJSON        atomic.Pointer[[]byte]
+	mapCollidersJSON []byte
+	mapCollidersETag string
+	campaignID       uint64
+	adminStore       *liveconfig.Store
 
 	connectionsMu    sync.RWMutex
 	connections      map[uint32]*Connection
@@ -104,12 +108,15 @@ type Connection struct {
 	cancel               context.CancelFunc
 }
 
-func New(cfg *config.Config) (*Server, error) {
+func New(cfg *config.Config, collisionWorld *collision.CollisionWorld) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("config is required")
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if collisionWorld == nil {
+		return nil, errors.New("collision world is required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -118,7 +125,7 @@ func New(cfg *config.Config) (*Server, error) {
 	server := &Server{
 		cfg:          cfg,
 		live:         live,
-		gameWorld:    game.NewGameWorld(cfg, live),
+		gameWorld:    game.NewGameWorld(cfg, live, collisionWorld),
 		protocol:     &protocol.BinaryProtocol{},
 		connections:  make(map[uint32]*Connection, 4096),
 		ctx:          ctx,
@@ -142,6 +149,7 @@ func New(cfg *config.Config) (*Server, error) {
 	go func() { defer server.workers.Done(); server.runPingLoop() }()
 
 	server.gameWorld.SetTickBroadcaster(server.broadcastTick)
+	server.gameWorld.SetStructureDeltaBroadcaster(server.broadcastStructureDelta)
 	server.workers.Add(1)
 	go func() {
 		defer server.workers.Done()
@@ -173,6 +181,21 @@ func (s *Server) UpdateUnitsJSON(unitsJSON []byte) {
 	s.unitsJSON.Store(&unitsJSON)
 }
 
+// SetCampaignID sets the active campaign ID stamped on structure collision
+// snapshot/delta messages, until a real campaign lifecycle exists.
+func (s *Server) SetCampaignID(campaignID uint64) {
+	s.campaignID = campaignID
+}
+
+// SetMapColliderSnapshot installs the immutable /api/map-colliders payload
+// and its ETag. The map snapshot is built once at startup from the active
+// campaign's map (see internal/collision) and never changes for the
+// lifetime of the campaign.
+func (s *Server) SetMapColliderSnapshot(mapCollidersJSON []byte, etag string) {
+	s.mapCollidersJSON = mapCollidersJSON
+	s.mapCollidersETag = etag
+}
+
 func (s *Server) RecomputeUnitTables() {
 	s.gameWorld.RecomputeUnitTables()
 }
@@ -187,6 +210,17 @@ func (s *Server) handleStaticUnits(w http.ResponseWriter, r *http.Request) {
 	w.Write(*s.unitsJSON.Load())
 }
 
+func (s *Server) handleMapColliders(w http.ResponseWriter, r *http.Request) {
+	etag := s.mapCollidersETag
+	w.Header().Set("ETag", etag)
+	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(s.mapCollidersJSON)
+}
+
 func (s *Server) publicHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWebSocket)
@@ -194,6 +228,7 @@ func (s *Server) publicHandler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/config", s.handleStaticConfig)
 	mux.HandleFunc("/api/units", s.handleStaticUnits)
+	mux.HandleFunc("/api/map-colliders", s.handleMapColliders)
 	for _, path := range []string{"/metrics", "/metrics/", "/debug/", "/api/admin/"} {
 		mux.HandleFunc(path, http.NotFound)
 	}
@@ -399,9 +434,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		metrics.WSUpgradeErrors.Inc()
 		return
 	}
-	player := s.gameWorld.AddPlayer(requestedUnitType)
+	player, err := s.gameWorld.AddPlayer(requestedUnitType)
+	if err != nil {
+		slog.Warn("spawn rejected", "error", err)
+		rawConn.Close()
+		return
+	}
 	connection := s.createConnection(player, rawConn)
 	s.sendWelcome(connection)
+	s.sendStructureCollisionSnapshot(connection)
 	connection.needsFullState.Store(true)
 	s.connectionsMu.Lock()
 	s.connections[player.ID] = connection
@@ -517,6 +558,11 @@ func (s *Server) processMessage(connection *Connection, message []byte) {
 	case protocol.MessagePing:
 		metrics.MessagesReceived.WithLabelValues("ping").Inc()
 		s.sendPong(connection, clientMsg.Nonce)
+
+	case protocol.MessageStructureCollisionResyncRequest:
+		metrics.MessagesReceived.WithLabelValues("structure_collision_resync_request").Inc()
+		metrics.CollisionStructureResyncTotal.WithLabelValues("client_requested").Inc()
+		s.sendStructureCollisionSnapshot(connection)
 	}
 }
 

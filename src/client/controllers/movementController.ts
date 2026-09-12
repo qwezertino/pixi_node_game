@@ -7,6 +7,8 @@ import type { Direction } from "../utils/animationLayout";
 import { directionFromDelta } from "../utils/facing";
 import { milliUnitsPerTick } from "../utils/movement";
 import type { UnitDefinition } from "../../shared/units";
+import { getCollisionWorld } from "../collision/collisionState";
+import { MoveScratch } from "../collision/world";
 
 const MAX_PENDING_INPUTS = 256;
 
@@ -42,6 +44,7 @@ export class MovementController {
     private _sprintSpeedMultiplier = 1;
 
     private _moveRemainderMilli = 0;
+    private readonly _moveScratch = new MoveScratch();
 
     private _inputSequence = 0;
     private _pendingInputs: InputTransition[] = [];
@@ -133,6 +136,18 @@ export class MovementController {
         const remainder = this._moveRemainderMilli + milliRate;
         const moveDistance = Math.floor(remainder / 1000);
         this._moveRemainderMilli = remainder % 1000;
+
+        const world = getCollisionWorld();
+        if (world) {
+            // Same discrete swept solver the server runs: X-then-Y
+            // micro-steps, sliding on a blocked axis. See
+            // docs/collisions_plan.md and src/client/collision/world.ts.
+            const result = world.moveCircle(position.x, position.y, dx, dy, moveDistance, this._moveScratch);
+            position.x = result.x;
+            position.y = result.y;
+            return;
+        }
+
         position.x += dx * moveDistance;
         position.y += dy * moveDistance;
 
